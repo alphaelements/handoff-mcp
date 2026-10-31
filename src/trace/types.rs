@@ -173,6 +173,11 @@ pub enum WaiverAxis {
 pub struct EffectiveProfile {
     pub name: String,
     pub layers: Vec<String>,
+    /// The resolved profile's `default_needs` (`<layer id> -> [required layer
+    /// id, ...]`). Only the `missing_profile_layer` lint (wiki/430 §3.2)
+    /// reads it, to check coverage against the *document's own* profile; the
+    /// engine's `needs` gating still uses [`TraceInput::project_default_needs`].
+    pub default_needs: BTreeMap<String, Vec<String>>,
 }
 
 /// A task's relationship to a `link_type: "requirement"` target (wiki/220
@@ -294,6 +299,14 @@ pub struct TraceInput {
     /// still empty — document of that layer, and pick a `doc_save` slug no
     /// document already uses. Empty when a caller does not supply documents.
     pub docs: Vec<DocRefInput>,
+    /// stable_ids whose `impl_refs`/`test_refs` name a file whose current
+    /// SHA-256 no longer matches the `CodeRef.content_hash` recorded when
+    /// the ref was set (wiki/430 §3.1, REQ-LAG-002). A *side channel*
+    /// computed once at load time (`load_trace_input_from_docs`), because
+    /// `trace_lint`/`trace_suspect` are pure functions (D1) and must never
+    /// read the filesystem themselves. Empty = no drift (and the default for
+    /// every caller that builds a `TraceInput` by hand).
+    pub code_drift_items: std::collections::HashSet<String>,
 }
 
 /// One document's identity as [`TraceInput::docs`] carries it.
@@ -336,6 +349,7 @@ impl Default for TraceInput {
             project_default_needs: BTreeMap::new(),
             task_status: HashMap::new(),
             docs: Vec::new(),
+            code_drift_items: std::collections::HashSet::new(),
         }
     }
 }
@@ -458,10 +472,20 @@ pub struct SuspectCounts {
     pub links: usize,
     pub tasks: usize,
     pub results: usize,
+    /// Additive key (wiki/430 §3.1): omitted while zero so the persisted
+    /// report stays byte-identical for projects without code drift — the same
+    /// convention `trace_suspect list` `counts` and `suspect_counts` use.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub code: usize,
     pub items: usize,
 }
 
-/// One of the 3 suspect kinds (wiki/260 §3.2, M2-05).
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// One of the 4 suspect kinds (wiki/260 §3.2, M2-05; `code` from wiki/430
+/// §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, std::hash::Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuspectKind {
@@ -476,6 +500,13 @@ pub enum SuspectKind {
     /// `def_hash` (or, absent that, `body_hash`) no longer matches the
     /// item's current value.
     Result,
+    /// A file referenced by the item's `impl_refs`/`test_refs` changed since
+    /// its `CodeRef.content_hash` was recorded
+    /// ([`TraceInput::code_drift_items`]). Carries no hash pair — the hashes
+    /// live on the `CodeRef`, so `baseline_hash`/`current_hash` are empty —
+    /// and is resolved by re-setting the refs (which re-records the hash),
+    /// never by `trace_suspect(action="clear")`.
+    Code,
 }
 
 /// One suspect entry (wiki/260 §4.1's `trace_suspect(action="list")` output
@@ -658,5 +689,20 @@ mod gap_kind_tests {
             (0..VARIANT_COUNT).collect::<Vec<_>>(),
             "GapKind::ALL must list every variant exactly once"
         );
+    }
+
+    #[test]
+    fn suspect_counts_omits_code_key_while_zero_and_emits_it_when_nonzero() {
+        let zero = serde_json::to_value(super::SuspectCounts::default()).unwrap();
+        assert!(
+            zero.get("code").is_none(),
+            "zero code must be omitted: {zero}"
+        );
+        let some = serde_json::to_value(super::SuspectCounts {
+            code: 2,
+            ..super::SuspectCounts::default()
+        })
+        .unwrap();
+        assert_eq!(some["code"], 2);
     }
 }

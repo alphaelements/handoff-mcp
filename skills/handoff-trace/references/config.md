@@ -120,7 +120,7 @@ coverage and state (lint `layer_outside_profile`, info).
 | `[trace.id_prefixes]` `<layer> = [...]` | table of string arrays | `{}` | extra heading-ID prefixes for a layer. **Added to** the defaults, never replaces them | `requirement = ["UC", "SYS"]` |
 | `[[trace.layer]]` | array of tables | none | declares a custom layer (§4.2) | see §4.2 |
 | `[trace] profile` | string | unset (auto) | project default profile: a built-in name or a `[trace.profiles.<name>]` key | `profile = "standard"` |
-| `[trace] done_guard` | `"warn"` \| `"block"` \| `"off"` | `"warn"` | what happens when a task with outstanding verification moves to review/done (§5) | `done_guard = "block"` |
+| `[trace] done_guard` | `"warn"` \| `"block"` \| `"off"`, or a `[trace.done_guard]` table (`mode`, `check_suspects`, `check_profile_layers`, `check_code_drift`) | `"warn"` | what happens when a task with outstanding verification moves to review/done (§5) | `done_guard = "block"` |
 | `[trace.profiles.<name>]` | table | none | custom profile (§4.4) | `[trace.profiles.web]` |
 | `[trace.lint.rules]` `<rule> = "<sev>"` | table of strings | `{}` | per-rule severity override (§7) | `unverified = "error"` |
 | `[[trace.lint.require]]` | array of tables | none | project policy rules (§7) | see §7 |
@@ -352,7 +352,23 @@ list and how to clear each: `verification.md` → done guard.
 | `off` | no check |
 
 Any other value is treated as `warn`. Tasks without requirement links are
-never affected. `handoff_bulk_update_tasks` applies the same guard to every
+never affected.
+
+`done_guard` also accepts a table that switches individual checks off
+(each defaults to `true`; the bare-string form keeps them all on):
+
+```toml
+[trace.done_guard]
+mode = "block"               # warn | block | off
+check_suspects = true        # stale task-link suspects count as blockers
+check_profile_layers = true  # a layer the profile requires but nobody provides
+                             # (missing_profile_layer) for the linked items
+check_code_drift = true      # impl_refs/test_refs file changed since its
+                             # content_hash (code_drift) for the linked items
+```
+
+The two spec-sync checks look only at the task's linked items (and their
+decomposition descendants). `handoff_bulk_update_tasks` applies the same guard to every
 update that moves a task into `review`/`done`: in `block` mode the update is
 rejected into `errors[]` (the others still apply) unless the call carries
 `force: true`; in `warn` mode it is applied and a `warnings[]` entry

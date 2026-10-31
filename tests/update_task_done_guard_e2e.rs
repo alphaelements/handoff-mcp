@@ -290,7 +290,7 @@ fn update_task_done_guard_block_mode_rejects_unless_forced() {
 
     let config_path = tmp.path().join("proj").join(".handoff").join("config.toml");
     let mut config = read_config(&config_path).expect("read config");
-    config.trace.done_guard = "block".to_string();
+    config.trace.done_guard.mode = "block".to_string();
     write_config(&config_path, &config).expect("write config");
 
     let (is_error, text) = server.call_raw(
@@ -347,7 +347,7 @@ fn update_task_done_guard_block_mode_rejects_create_straight_into_done_with_a_bl
 
     let config_path = tmp.path().join("proj").join(".handoff").join("config.toml");
     let mut config = read_config(&config_path).expect("read config");
-    config.trace.done_guard = "block".to_string();
+    config.trace.done_guard.mode = "block".to_string();
     write_config(&config_path, &config).expect("write config");
 
     // REQ-900 (from `setup_project`) has a `not_run` blocker (its only
@@ -408,7 +408,7 @@ fn update_task_done_guard_invalid_value_falls_back_to_warn_mode() {
 
     let config_path = tmp.path().join("proj").join(".handoff").join("config.toml");
     let mut config = read_config(&config_path).expect("read config");
-    config.trace.done_guard = "bogus-value".to_string();
+    config.trace.done_guard.mode = "bogus-value".to_string();
     write_config(&config_path, &config).expect("write config");
 
     let (is_error, text) = server.call_raw(
@@ -473,7 +473,7 @@ fn update_task_done_guard_approval_draft_blocker_warns_then_blocks_then_clears()
 
     let config_path = tmp_config_path(&pd);
     let mut config = read_config(&config_path).expect("read config");
-    config.trace.done_guard = "block".to_string();
+    config.trace.done_guard.mode = "block".to_string();
     write_config(&config_path, &config).expect("write config");
 
     // Revert the task to `todo` so the next call is a fresh guarded
@@ -531,7 +531,7 @@ fn update_task_done_guard_off_mode_never_warns_or_blocks() {
 
     let config_path = tmp.path().join("proj").join(".handoff").join("config.toml");
     let mut config = read_config(&config_path).expect("read config");
-    config.trace.done_guard = "off".to_string();
+    config.trace.done_guard.mode = "off".to_string();
     write_config(&config_path, &config).expect("write config");
 
     let (is_error, text) = server.call_raw(
@@ -556,7 +556,7 @@ fn bulk_update_tasks_block_mode_rejects_review_and_done_unless_forced() {
 
     let config_path = tmp.path().join("proj").join(".handoff").join("config.toml");
     let mut config = read_config(&config_path).expect("read config");
-    config.trace.done_guard = "block".to_string();
+    config.trace.done_guard.mode = "block".to_string();
     write_config(&config_path, &config).expect("write config");
 
     for status in ["review", "done"] {

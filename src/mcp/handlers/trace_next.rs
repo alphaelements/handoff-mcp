@@ -14,10 +14,13 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
+use super::plan_links::{linked_stable_ids, resolve_plan_sub_items};
 use super::trace_readonly::load_trace_input_fully_read_only;
 use super::HandlerContext;
+use crate::storage::docs::model::UNSET_DEV_STAGE;
 use crate::storage::docs::DocMetadata;
-use crate::trace::next::{derive_next_actions, ItemNextMeta, NextActionKind};
+use crate::storage::tasks::TaskData;
+use crate::trace::next::{derive_next_actions, ItemNextMeta, NextActionKind, PlanUpdateRef};
 use crate::trace::TraceGraph;
 
 /// stable_id -> `{priority, dev_stage}` from `docs` — [`crate::trace::next`]
@@ -41,11 +44,54 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
                     priority: sub.priority.clone(),
                     dev_stage: sub.dev_stage.clone(),
                     assignee: sub.assignee.clone(),
+                    ..Default::default()
                 });
             }
         }
     }
     out
+}
+
+/// t-layergen.9 (REQ-LAG-006): for every code-drifted item, the plan-document
+/// `SubItem`s reachable through a (non-`executes`) task that links the drifted
+/// item — the same task -> plan `SubItem` lookup `handoff_update_task`'s
+/// `plan_update_needed` uses (`plan_links`). Stored on the item's
+/// [`ItemNextMeta::plan_updates`], which `derive_next_actions` attaches to its
+/// `update_drifted_spec` action as `plan_update_needed`.
+fn attach_plan_updates(
+    meta: &mut HashMap<String, ItemNextMeta>,
+    drifted: &HashSet<String>,
+    tasks: &[TaskData],
+    docs: &[DocMetadata],
+) {
+    for id in drifted {
+        let mut sibling_ids: Vec<String> = Vec::new();
+        for task in tasks {
+            let linked = linked_stable_ids(&task.task_links, false);
+            if !linked.contains(id) {
+                continue;
+            }
+            for other in linked {
+                if &other != id && !sibling_ids.contains(&other) {
+                    sibling_ids.push(other);
+                }
+            }
+        }
+        if sibling_ids.is_empty() {
+            continue;
+        }
+        let refs: Vec<PlanUpdateRef> = resolve_plan_sub_items(docs, &sibling_ids)
+            .into_iter()
+            .map(|p| PlanUpdateRef {
+                doc_id: p.doc_id,
+                stable_id: p.stable_id,
+                current_dev_stage: p.dev_stage.unwrap_or_else(|| UNSET_DEV_STAGE.to_string()),
+            })
+            .collect();
+        if !refs.is_empty() {
+            meta.entry(id.clone()).or_default().plan_updates = refs;
+        }
+    }
 }
 
 /// `pub(super)`: also used by `trace_test_run.rs`'s `scope.kinds` parsing
@@ -56,6 +102,7 @@ pub(super) fn parse_kind(s: &str) -> Option<NextActionKind> {
     match s {
         "fix_failing" => Some(NextActionKind::FixFailing),
         "review_suspect" => Some(NextActionKind::ReviewSuspect),
+        "update_drifted_spec" => Some(NextActionKind::UpdateDriftedSpec),
         "rerun" => Some(NextActionKind::Rerun),
         "manual_pending" => Some(NextActionKind::ManualPending),
         "write_verification" => Some(NextActionKind::WriteVerification),
@@ -107,7 +154,7 @@ pub fn handle_trace_next(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 let kind = parse_kind(s).ok_or_else(|| {
                     anyhow::anyhow!(
                         "kinds: unknown kind {s:?}; expected one of fix_failing, review_suspect, \
-                         rerun, manual_pending, write_verification, refine, create_task, \
+                         update_drifted_spec, rerun, manual_pending, write_verification, refine, create_task, \
                          fix_link, baseline, relink_candidate"
                     )
                 })?;
@@ -131,7 +178,13 @@ pub fn handle_trace_next(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // `.handoff/`.
     let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
     let graph = TraceGraph::build(&read_only.loaded.trace_input);
-    let meta = collect_item_next_meta(&read_only.loaded.docs);
+    let mut meta = collect_item_next_meta(&read_only.loaded.docs);
+    attach_plan_updates(
+        &mut meta,
+        &read_only.loaded.trace_input.code_drift_items,
+        &read_only.loaded.tasks,
+        &read_only.loaded.docs,
+    );
 
     let scope_ids: Option<HashSet<String>> = match task_id {
         None => None,

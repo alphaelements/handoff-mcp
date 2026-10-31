@@ -3187,6 +3187,33 @@ pub(super) fn git_diff_changed_files(project_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Like [`git_diff_changed_files`], but a git failure (git missing, not a
+/// repository, no commit yet) is an error instead of an empty list, and paths
+/// are relative to `project_dir` (`--relative`) so they line up with
+/// `impl_refs` even when the project sits below the repo root. For gates
+/// (`trace lint --changed-only`) that must not pass when they cannot see the
+/// diff.
+pub(super) fn git_diff_changed_files_strict(project_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "HEAD", "--name-only", "--relative"])
+        .current_dir(project_dir)
+        .output()
+        .map_err(|e| anyhow::anyhow!("changed_only: cannot run git: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "changed_only: `git diff HEAD --name-only` failed in {} (not a git repository, or \
+             no commit yet?): {}",
+            project_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// One requirement affected by a change to a target file
 /// (`handoff_doc_req_impact`, P2 §5.2). `match_type` is `"impl_ref"` /
 /// `"test_ref"` (direct — the target file is one of the SubItem's own
@@ -3984,11 +4011,13 @@ mod doc_req_list_tests {
                             path: "src/a.rs".to_string(),
                             lines: None,
                             label: None,
+                            content_hash: None,
                         }],
                         vec![CodeRef {
                             path: "tests/a.rs".to_string(),
                             lines: None,
                             label: None,
+                            content_hash: None,
                         }],
                     ),
                 ],
@@ -5054,6 +5083,7 @@ Some preamble text.
                         path: "src/board.rs".to_string(),
                         lines: None,
                         label: None,
+                        content_hash: None,
                     }],
                     ..Default::default()
                 }],
@@ -6505,6 +6535,7 @@ mod doc_req_impact_tests {
                 path: impl_ref_path.to_string(),
                 lines: None,
                 label: None,
+                content_hash: None,
             }],
             ..Default::default()
         };

@@ -19,10 +19,8 @@ use crate::storage::tasks::*;
 /// `handoff_bulk_update_tasks` so both entry points read the same mode.
 pub(super) fn resolve_done_guard(handoff_dir: &std::path::Path) -> String {
     read_config(&handoff_dir.join("config.toml"))
-        .map(|c| c.trace.done_guard)
-        .ok()
-        .filter(|v| v == "block" || v == "off")
-        .unwrap_or_else(|| "warn".to_string())
+        .map(|c| super::done_guard::effective_mode(&c.trace.done_guard).to_string())
+        .unwrap_or_else(|_| "warn".to_string())
 }
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -631,15 +629,16 @@ fn check_create_done_guard_blockers(
         .unwrap_or_default();
     let registry = crate::storage::docs::layer::LayerRegistry::build(&trace_config.layer);
     let runs_cache = crate::storage::runs::load_latest_readonly(handoff_dir)?;
-    let view = crate::trace::compute_task_blockers_for_task(
+    let findings = super::done_guard::compute_findings(
         doc_set.docs(),
         &registry,
         &trace_config,
         &runs_cache,
+        handoff_dir,
         task_id_for_check,
         &effective_links,
     );
-    Ok(view.and_then(|v| done_guard_blocker_message(task_id_for_check, &v.blockers)))
+    Ok(findings.and_then(|f| done_guard_blocker_message(task_id_for_check, &f)))
 }
 
 /// M2-16 (wiki/260-vmodel-m2-design.md §4.9, FR-605): `pub(super)` (rather
@@ -1333,7 +1332,7 @@ fn handle_update_locked(
             &data.task_links,
             diff_for_block_check.as_ref(),
         )? {
-            if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view.blockers) {
+            if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view) {
                 anyhow::bail!(
                     "{blocker_msg} [trace] done_guard = \"block\" rejects this status change; \
                      pass force: true to override, fix the blockers first, or change \
@@ -1516,7 +1515,12 @@ pub(super) fn load_done_guard_block_check(
     task_id: &str,
     existing_task_links: &[TaskLink],
     diff: Option<&RequirementDiff>,
-) -> Result<Option<(crate::storage::docs::DocSet, crate::trace::TaskTraceView)>> {
+) -> Result<
+    Option<(
+        crate::storage::docs::DocSet,
+        super::done_guard::DoneGuardFindings,
+    )>,
+> {
     let has_existing_requirement_link = existing_task_links
         .iter()
         .any(|l| l.link_type == "requirement");
@@ -1538,43 +1542,26 @@ pub(super) fn load_done_guard_block_check(
         Some(d) => effective_requirement_links_after_diff(existing_task_links, d, doc_set.docs()),
         None => existing_task_links.to_vec(),
     };
-    let view = crate::trace::compute_task_blockers_for_task(
+    let findings = super::done_guard::compute_findings(
         doc_set.docs(),
         &registry,
         &trace_config,
         &runs_cache,
+        handoff_dir,
         task_id,
         &effective_links,
     );
-    Ok(view.map(|v| (doc_set, v)))
+    Ok(findings.map(|f| (doc_set, f)))
 }
 
-/// Renders a human-readable one-line summary of `blockers` when at least one
-/// field is nonzero, else `None` (no message — the task has no outstanding
-/// blocker, the common case every `review`/`done` transition takes).
+/// Renders a human-readable one-line summary of `findings` when anything
+/// blocks, else `None` (no message — the task has no outstanding blocker, the
+/// common case every `review`/`done` transition takes).
 pub(super) fn done_guard_blocker_message(
     task_id: &str,
-    blockers: &crate::trace::TaskBlockerCounts,
+    findings: &super::done_guard::DoneGuardFindings,
 ) -> Option<String> {
-    let total = blockers.not_run
-        + blockers.failing
-        + blockers.blocked
-        + blockers.reverify
-        + blockers.suspect
-        + blockers.approval_draft;
-    if total == 0 {
-        return None;
-    }
-    Some(format!(
-        "done_guard: task {task_id} has {total} outstanding blocker(s) among its requirement \
-         links (not_run={}, failing={}, blocked={}, reverify={}, suspect={}, approval_draft={}).",
-        blockers.not_run,
-        blockers.failing,
-        blockers.blocked,
-        blockers.reverify,
-        blockers.suspect,
-        blockers.approval_draft
-    ))
+    super::done_guard::blocker_message(task_id, findings)
 }
 
 /// M2-13 (wiki/260 §3.4 `warn` mode): appends a done-guard warning to `msg`
@@ -1608,17 +1595,18 @@ fn append_done_guard_warning(
         .unwrap_or_default();
     let registry = crate::storage::docs::layer::LayerRegistry::build(&trace_config.layer);
     let runs_cache = crate::storage::runs::load_latest_readonly(handoff_dir)?;
-    let Some(view) = crate::trace::compute_task_blockers_for_task(
+    let Some(findings) = super::done_guard::compute_findings(
         docs,
         &registry,
         &trace_config,
         &runs_cache,
+        handoff_dir,
         task_id,
         task_links,
     ) else {
         return Ok(());
     };
-    if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view.blockers) {
+    if let Some(blocker_msg) = done_guard_blocker_message(task_id, &findings) {
         msg.push_str(&format!("\n{blocker_msg}"));
     }
     Ok(())
@@ -3485,6 +3473,233 @@ mod done_guard_tests {
             Some("implemented"),
             "block mode's reused preloaded DocSet must still propagate dev_stage"
         );
+    }
+
+    // --- wiki/430 §3.6: check_suspects / check_profile_layers /
+    // check_code_drift -------------------------------------------------
+
+    fn write_trace_config(handoff: &std::path::Path, trace_toml: &str) {
+        std::fs::write(
+            handoff.join("config.toml"),
+            format!("[project]\nname = \"t\"\n{trace_toml}"),
+        )
+        .unwrap();
+    }
+
+    fn approved_item(id: &str) -> SubItem {
+        SubItem {
+            index: 0,
+            description: id.to_string(),
+            stable_id: Some(id.to_string()),
+            approval: Some("approved".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// `t1` `implements` `REQ-001` (approved, no verifier -> no
+    /// not_run/approval blocker) with a stale `baseline_hash` on the link,
+    /// i.e. exactly one `suspect` blocker.
+    fn setup_project_with_one_suspect_blocker(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        let mut item = approved_item("REQ-001");
+        item.def_hash = Some("current-def-hash".to_string());
+        make_layer_doc(&handoff, "req-doc", "requirement", item);
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        make_task_with_requirement_link(&task_dir, "t1", "todo", "REQ-001");
+        let (mut data, status) = read_task(&task_dir).unwrap().unwrap();
+        data.task_links[0].baseline_hash = Some("stale-baseline".to_string());
+        write_task(&task_dir, &status, &data).unwrap();
+        (tmp, tasks_dir, handoff)
+    }
+
+    /// `t1` -> `REQ-001` (approved, no `refines` child). Under `profile =
+    /// "standard"` its `basic_spec` coverage is missing (LINT-W030).
+    fn setup_project_with_missing_profile_layer(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        make_layer_doc(&handoff, "req-doc", "requirement", approved_item("REQ-001"));
+        let tasks_dir = handoff.join("tasks");
+        make_task_with_requirement_link(&tasks_dir.join("t1"), "t1", "todo", "REQ-001");
+        write_trace_config(&handoff, "[trace]\nprofile = \"standard\"\n");
+        (tmp, tasks_dir, handoff)
+    }
+
+    /// `t1` -> `REQ-001` (approved) whose `impl_refs` entry recorded a
+    /// `content_hash` that no longer matches `src/lib.rs`.
+    fn setup_project_with_code_drift() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "fn changed() {}").unwrap();
+        let mut item = approved_item("REQ-001");
+        item.impl_refs = vec![crate::storage::docs::CodeRef {
+            path: "src/lib.rs".to_string(),
+            lines: None,
+            label: None,
+            content_hash: Some("0".repeat(64)),
+        }];
+        make_layer_doc(&handoff, "req-doc", "requirement", item);
+        let tasks_dir = handoff.join("tasks");
+        make_task_with_requirement_link(&tasks_dir.join("t1"), "t1", "todo", "REQ-001");
+        (tmp, tasks_dir, handoff)
+    }
+
+    fn move_to_review(
+        tasks_dir: &std::path::Path,
+        handoff: &std::path::Path,
+        mode: &str,
+    ) -> Result<String> {
+        handle_update(
+            tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            handoff,
+            mode,
+            false,
+        )
+    }
+
+    #[test]
+    fn check_suspects_true_blocks_a_task_with_a_remaining_suspect() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_suspect_blocker();
+        write_trace_config(
+            &handoff,
+            "[trace.done_guard]\nmode = \"block\"\ncheck_suspects = true\n",
+        );
+        let err = move_to_review(&tasks_dir, &handoff, "block").unwrap_err();
+        assert!(err.to_string().contains("suspect=1"), "{err}");
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    #[test]
+    fn check_suspects_false_lets_a_remaining_suspect_through() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_suspect_blocker();
+        write_trace_config(
+            &handoff,
+            "[trace.done_guard]\nmode = \"block\"\ncheck_suspects = false\n",
+        );
+        let out = move_to_review(&tasks_dir, &handoff, "block").unwrap();
+        assert!(!out.contains("done_guard"), "{out}");
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review");
+    }
+
+    #[test]
+    fn legacy_string_form_keeps_every_check_on() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_suspect_blocker();
+        write_trace_config(&handoff, "[trace]\ndone_guard = \"block\"\n");
+        let err = move_to_review(&tasks_dir, &handoff, "block").unwrap_err();
+        assert!(err.to_string().contains("suspect=1"), "{err}");
+    }
+
+    #[test]
+    fn check_profile_layers_true_blocks_when_a_required_layer_is_absent() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_missing_profile_layer();
+        write_trace_config(
+            &handoff,
+            "[trace]\nprofile = \"standard\"\n[trace.done_guard]\nmode = \"block\"\n",
+        );
+        let err = move_to_review(&tasks_dir, &handoff, "block").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing_profile_layer=1") && msg.contains("REQ-001"),
+            "{msg}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    #[test]
+    fn check_profile_layers_false_ignores_an_absent_layer() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_missing_profile_layer();
+        write_trace_config(
+            &handoff,
+            "[trace]\nprofile = \"standard\"\n[trace.done_guard]\nmode = \"block\"\ncheck_profile_layers = false\n",
+        );
+        let out = move_to_review(&tasks_dir, &handoff, "block").unwrap();
+        assert!(!out.contains("done_guard"), "{out}");
+    }
+
+    #[test]
+    fn profile_layer_check_is_quiet_without_any_profile_requirement() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_missing_profile_layer();
+        write_trace_config(&handoff, "[trace.done_guard]\nmode = \"block\"\n");
+        let out = move_to_review(&tasks_dir, &handoff, "block").unwrap();
+        assert!(!out.contains("done_guard"), "{out}");
+    }
+
+    #[test]
+    fn profile_layer_warn_mode_names_the_item() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_missing_profile_layer();
+        let out = move_to_review(&tasks_dir, &handoff, "warn").unwrap();
+        assert!(
+            out.contains("missing_profile_layer=1") && out.contains("REQ-001"),
+            "{out}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review", "warn mode must not block");
+    }
+
+    #[test]
+    fn check_code_drift_true_blocks_on_a_hash_mismatch() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_code_drift();
+        write_trace_config(&handoff, "[trace.done_guard]\nmode = \"block\"\n");
+        let err = move_to_review(&tasks_dir, &handoff, "block").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("code_drift=1") && msg.contains("REQ-001"),
+            "{msg}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    #[test]
+    fn check_code_drift_false_ignores_a_hash_mismatch() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_code_drift();
+        write_trace_config(
+            &handoff,
+            "[trace.done_guard]\nmode = \"block\"\ncheck_code_drift = false\n",
+        );
+        let out = move_to_review(&tasks_dir, &handoff, "block").unwrap();
+        assert!(!out.contains("done_guard"), "{out}");
+    }
+
+    #[test]
+    fn code_drift_of_an_unlinked_item_does_not_block() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_code_drift();
+        // A second task links only to an item with no refs.
+        make_layer_doc(
+            &handoff,
+            "req-doc-2",
+            "requirement",
+            approved_item("REQ-002"),
+        );
+        make_task_with_requirement_link(&tasks_dir.join("t2"), "t2", "todo", "REQ-002");
+        write_trace_config(&handoff, "[trace.done_guard]\nmode = \"block\"\n");
+        let out = handle_update(
+            &tasks_dir,
+            "t2",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap();
+        assert!(!out.contains("done_guard"), "{out}");
     }
 }
 

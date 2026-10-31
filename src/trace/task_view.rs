@@ -425,7 +425,7 @@ pub fn compute_task_blockers_for_task(
 
 /// `ids` plus every decomposition descendant of any of them (by `parent`
 /// declarations), so a composite's leaves are part of the mini graph.
-fn with_tree_descendants<'a>(
+pub fn with_tree_descendants<'a>(
     all_items: &'a [TraceItemInput],
     ids: &HashSet<&'a str>,
 ) -> HashSet<&'a str> {

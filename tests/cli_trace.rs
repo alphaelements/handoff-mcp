@@ -1586,3 +1586,322 @@ fn cli_trace_tree_text_format_shows_the_branch_label_per_emission() {
         "{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `trace lint --changed-only` (wiki/430 §3.6, REQ-LAG-005): lint only the items
+// whose impl_refs / test_refs name a file in `git diff HEAD --name-only`, and
+// exit non-zero on any code_drift / missing_profile_layer finding.
+// ---------------------------------------------------------------------------
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("git must be installed");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+/// A git repo with `src/a.rs` / `src/b.rs` committed and two requirements
+/// (REQ-001 -> a.rs, REQ-002 -> b.rs) whose `impl_refs` hashes were recorded
+/// against that committed content. `.handoff` is committed too.
+fn changed_only_project(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(dir.join("src/b.rs"), "fn b() {}\n").unwrap();
+    git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["add", "src"]);
+    git(dir, &["commit", "-q", "-m", "init"]);
+
+    let dir_str = dir.to_str().unwrap();
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-changed-only" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "requirements-changed-only",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 First\n\nBody.\n\n### REQ-002 Second\n\nBody.\n",
+        }),
+    );
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": dir_str,
+            "ops": [
+                { "op": "set", "item": "REQ-001", "impl_refs": [{ "path": "src/a.rs" }] },
+                { "op": "set", "item": "REQ-002", "impl_refs": [{ "path": "src/b.rs" }] },
+            ],
+        }),
+    );
+    drop(server);
+    // .handoff is deliberately left untracked-but-ignored: only source edits
+    // should show up in `git diff HEAD`.
+    std::fs::write(dir.join(".gitignore"), "/.handoff/\n").unwrap();
+    git(dir, &["add", ".gitignore"]);
+    git(dir, &["commit", "-q", "-m", "ignore handoff"]);
+}
+
+fn finding_items(parsed: &Value) -> Vec<String> {
+    let mut v: Vec<String> = parsed["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["item"].as_str().map(str::to_string))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn cli_trace_lint_changed_only_follows_git_diff_and_exits_nonzero_on_code_drift() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    changed_only_project(&dir);
+    let dir_str = dir.to_str().unwrap();
+
+    // Both files drift from their recorded hashes, but b.rs's edit is
+    // committed (so it is not in `git diff HEAD`); only a.rs is changed.
+    std::fs::write(dir.join("src/b.rs"), "fn b() { 1 }\n").unwrap();
+    git(&dir, &["add", "src/b.rs"]);
+    git(&dir, &["commit", "-q", "-m", "edit b"]);
+    std::fs::write(dir.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
+
+    // Baseline: a whole-graph drift lint sees both items.
+    let (stdout, stderr, _code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--rules",
+        "code_drift",
+    ]);
+    let all: Value = serde_json::from_str(&stdout).expect(&stderr);
+    assert_eq!(finding_items(&all), vec!["REQ-001", "REQ-002"], "{all}");
+
+    // --changed-only narrows to REQ-001 and fails the gate (warning severity
+    // by default, yet exit 1).
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("JSON output");
+    assert_eq!(finding_items(&parsed), vec!["REQ-001"], "{parsed}");
+    assert_eq!(parsed["findings"][0]["rule"], "code_drift", "{parsed}");
+    assert_eq!(parsed["changed_files"], json!(["src/a.rs"]), "{parsed}");
+}
+
+#[test]
+fn cli_trace_lint_changed_only_exits_zero_when_nothing_changed() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    changed_only_project(&dir);
+    let dir_str = dir.to_str().unwrap();
+
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("JSON output");
+    assert!(
+        parsed["findings"].as_array().unwrap().is_empty(),
+        "{parsed}"
+    );
+    assert_eq!(parsed["changed_files"], json!([]), "{parsed}");
+}
+
+#[test]
+fn cli_trace_lint_changed_only_ignores_changed_files_no_item_references() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    changed_only_project(&dir);
+    let dir_str = dir.to_str().unwrap();
+
+    std::fs::write(dir.join("README.md"), "x\n").unwrap();
+    git(&dir, &["add", "README.md"]);
+    git(&dir, &["commit", "-q", "-m", "readme"]);
+    std::fs::write(dir.join("README.md"), "y\n").unwrap();
+
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("JSON output");
+    assert!(
+        parsed["findings"].as_array().unwrap().is_empty(),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn cli_trace_lint_changed_only_exits_nonzero_on_missing_profile_layer() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["add", "src"]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-changed-only-mpl" }),
+    );
+    // REQ-001 declares it needs a basic_spec child nobody provides.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "requirements-changed-only-mpl",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 First\n\n- needs: basic_spec\n\nBody.\n\n### REQ-002 Second\n\n- needs: basic_spec\n\nBody.\n",
+        }),
+    );
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": dir_str,
+            "ops": [{ "op": "set", "item": "REQ-001", "impl_refs": [{ "path": "src/a.rs" }] }],
+        }),
+    );
+    drop(server);
+    std::fs::write(dir.join(".gitignore"), "/.handoff/\n").unwrap();
+    git(&dir, &["add", ".gitignore"]);
+    git(&dir, &["commit", "-q", "-m", "ignore handoff"]);
+
+    // Unchanged tree: the gate is clean even though both items lack basic_spec.
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    // Touching a.rs pulls REQ-001 (and only REQ-001) into the gate.
+    std::fs::write(dir.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("JSON output");
+    let rules: Vec<&str> = parsed["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert!(rules.contains(&"missing_profile_layer"), "{parsed}");
+    assert!(
+        parsed["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["item"] == "REQ-001"),
+        "{parsed}"
+    );
+}
+
+/// Regression: a document's `scope_paths` must not mask a later direct ref.
+/// `git diff --name-only` is alphabetical, so an unrelated in-scope file
+/// (`src/a.rs`) is seen before the item's own ref (`src/z.rs`); the gate has to
+/// decide direct-ref membership over ALL changed files, not the first match.
+#[test]
+fn cli_trace_lint_changed_only_catches_a_direct_ref_behind_an_in_scope_file() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(dir.join("src/z.rs"), "fn z() {}\n").unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["add", "src"]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-changed-only-scope" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "requirements-changed-only-scope",
+            "title": "Requirements",
+            "layer": "requirement",
+            "scope_paths": ["src/"],
+            "body": "# Requirements\n\n### REQ-001 First\n\nBody.\n",
+        }),
+    );
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": dir_str,
+            "ops": [{ "op": "set", "item": "REQ-001", "impl_refs": [{ "path": "src/z.rs" }] }],
+        }),
+    );
+    drop(server);
+    std::fs::write(dir.join(".gitignore"), "/.handoff/\n").unwrap();
+    git(&dir, &["add", ".gitignore"]);
+    git(&dir, &["commit", "-q", "-m", "ignore handoff"]);
+
+    std::fs::write(dir.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
+    std::fs::write(dir.join("src/z.rs"), "fn z() { 1 }\n").unwrap();
+
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("JSON output");
+    assert_eq!(finding_items(&parsed), vec!["REQ-001"], "{parsed}");
+    assert_eq!(parsed["findings"][0]["rule"], "code_drift", "{parsed}");
+    assert_eq!(
+        parsed["changed_files"],
+        json!(["src/a.rs", "src/z.rs"]),
+        "{parsed}"
+    );
+}
+
+/// A gate that cannot see the diff must not pass: outside a git repository
+/// `--changed-only` is a usage/config error (exit 2), not a clean exit 0.
+#[test]
+fn cli_trace_lint_changed_only_fails_closed_outside_a_git_repo() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-changed-only-nogit" }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--changed-only"]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+}
+
+#[test]
+fn cli_trace_lint_rejects_a_non_boolean_changed_only() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    changed_only_project(&dir);
+    let dir_str = dir.to_str().unwrap();
+
+    let (_stdout, _stderr, code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--changed-only",
+        "maybe",
+    ]);
+    assert_eq!(code, 2);
+}

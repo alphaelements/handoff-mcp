@@ -51,17 +51,17 @@ test('a non-string profile is rejected', () => {
 // ============================================================
 test('express runs the developer only', () => {
   const s = profileStages('express');
-  assert.deepEqual(s, { implement: true, test: false, integrate: false, review: false });
+  assert.deepEqual(s, { implement: true, test: false, integrate: false, review: false, reconcile: false, specPrep: false });
 });
 
 test('standard runs developer + tester + integration, no reviewer', () => {
   const s = profileStages('standard');
-  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: false });
+  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: false, reconcile: true, specPrep: true });
 });
 
 test('full runs all four stages', () => {
   const s = profileStages('full');
-  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: true });
+  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true });
 });
 
 test('every declared profile has a stage map', () => {
@@ -117,10 +117,22 @@ test('the integration stage never runs without a test stage', () => {
 // A naive `Object.values(stages).filter(Boolean).length` would report 4
 // for full and silently misprice the profile.
 // ============================================================
-test('serial turns per profile are 1 / 2 / 3', () => {
+test('serial turns per profile are 1 / 4 / 5 (standard and full pay spec-prep + spec-reconcile turns)', () => {
   assert.equal(serialTurnsForProfile('express'), 1);
-  assert.equal(serialTurnsForProfile('standard'), 2);
-  assert.equal(serialTurnsForProfile('full'), 3);
+  assert.equal(serialTurnsForProfile('standard'), 4);
+  assert.equal(serialTurnsForProfile('full'), 5);
+});
+
+test('specPrep (Stage 0) runs under standard and full only', () => {
+  assert.equal(profileStages('express').specPrep, false);
+  assert.equal(profileStages('standard').specPrep, true);
+  assert.equal(profileStages('full').specPrep, true);
+});
+
+test('reconcile (Stage 3.5) runs under standard and full only', () => {
+  assert.equal(profileStages('express').reconcile, false);
+  assert.equal(profileStages('standard').reconcile, true);
+  assert.equal(profileStages('full').reconcile, true);
 });
 
 test('full pays one extra serial turn for the reviewer', () => {
@@ -131,16 +143,16 @@ test('full pays one extra serial turn for the reviewer', () => {
 
 test('DISCRIMINATOR: serial turns are not just the count of enabled stages', () => {
   const naive = (p) => Object.values(profileStages(p)).filter(Boolean).length;
-  assert.equal(naive('full'), 4, 'precondition: full enables four stages');
-  assert.equal(serialTurnsForProfile('full'), 3, 'test + integrate = one agent turn');
+  assert.equal(naive('full'), 6, 'precondition: full enables six stages');
+  assert.equal(serialTurnsForProfile('full'), 5, 'test + integrate = one agent turn');
   assert.notEqual(serialTurnsForProfile('full'), naive('full'));
 });
 
-test('standard is 2 serial turns: test + integrate share a single agent', () => {
+test('standard is 4 serial turns: test + integrate share a single agent', () => {
   const s = profileStages('standard');
   assert.equal(s.integrate, true);
   assert.equal(s.review, false);
-  assert.equal(serialTurnsForProfile('standard'), 2);
+  assert.equal(serialTurnsForProfile('standard'), 4);
 });
 
 test('serialTurnsForProfile rejects an unknown profile', () => {

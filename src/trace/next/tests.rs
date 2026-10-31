@@ -886,9 +886,10 @@ fn with_acs(mut it: TraceItemInput, labels: &[&str]) -> TraceItemInput {
     it
 }
 
-const ALL_KINDS: [NextActionKind; 10] = [
+const ALL_KINDS: [NextActionKind; 11] = [
     NextActionKind::FixFailing,
     NextActionKind::ReviewSuspect,
+    NextActionKind::UpdateDriftedSpec,
     NextActionKind::Rerun,
     NextActionKind::ManualPending,
     NextActionKind::WriteVerification,
@@ -953,7 +954,10 @@ fn every_kind_corpus() -> (TraceInput, HashMap<String, ItemNextMeta>) {
         suspect_down,
         // dangling refines -> fix_link.
         in_doc(item("SPEC-003", "basic_spec", &["NOPE-1"], &[]), "d-spec"),
+        // code-drifted spec -> update_drifted_spec.
+        in_doc(item("SPEC-004", "basic_spec", &["REQ-004"], &[]), "d-spec"),
     ]);
+    inp.code_drift_items.insert("SPEC-004".to_string());
     inp.configured_layers = all_layers();
     inp.runs_latest
         .insert("AT-001".to_string(), "fail".to_string());
@@ -1048,6 +1052,10 @@ fn suggest_arguments_name_the_documents_the_tools_require() {
     let mp = of(NextActionKind::ManualPending, "AT-003");
     assert_eq!(mp.suggest.arguments["results"][0]["item"], "AT-003");
     assert_eq!(mp.suggest.arguments["results"][0]["result"], "not_run");
+    // update_drifted_spec previews an upsert on the drifted item's document.
+    let ud = of(NextActionKind::UpdateDriftedSpec, "SPEC-004");
+    assert_eq!(ud.suggest.arguments["ops"][0]["doc"], "d-spec");
+    assert_eq!(ud.suggest.arguments["ops"][0]["id"], "SPEC-004");
     // relink names the verifier's own document.
     let rl = of(NextActionKind::RelinkCandidate, "UT-001");
     assert_eq!(rl.suggest.arguments["ops"][0]["doc"], "d-ut");

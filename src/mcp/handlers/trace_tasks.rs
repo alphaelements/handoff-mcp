@@ -403,11 +403,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     // so a future caller of `handle_create` from this module that *does*
     // create straight into "review"/"done" automatically gets the project's
     // real configured policy, not a stale assumption.
-    let done_guard = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace.done_guard)
-        .ok()
-        .filter(|v| v == "block" || v == "off")
-        .unwrap_or_else(|| "warn".to_string());
+    let done_guard = super::update_task::resolve_done_guard(handoff);
 
     // E6 (wiki/260 §4.9's own note: "グラフは読み取り専用経路（trace_readonly.rs）
     // で作り"): the same fully-read-only load trace_lint/trace_matrix/trace_impact

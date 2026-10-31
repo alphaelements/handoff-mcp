@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::*;
 use crate::storage::config::{TraceLintRequireRule, TraceLintRequireWhen};
 use crate::storage::docs::UnreadableDoc;
-use crate::trace::types::{TaskLinkRole, TaskRequirementLink, TraceInput};
+use crate::trace::types::{TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput};
 
 fn item(id: &str) -> crate::trace::types::TraceItemInput {
     crate::trace::types::TraceItemInput {
@@ -1742,4 +1742,544 @@ fn composite_waive_verify_is_redundant_only_once_children_cover_it() {
             .any(|f| f.rule == "unverified" && f.item.as_deref() == Some("REQ-P")),
         "{covered:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// missing_profile_layer (wiki/430 §3.2, LINT-W030, REQ-LAG-007)
+// ---------------------------------------------------------------------------
+
+fn layered(id: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItemInput {
+    TraceItemInput {
+        layer: Some(layer.to_string()),
+        refines: refines.iter().map(|s| s.to_string()).collect(),
+        verifies: verifies.iter().map(|s| s.to_string()).collect(),
+        ..item(id)
+    }
+}
+
+fn needs_map(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+        .collect()
+}
+
+fn standard_needs() -> BTreeMap<String, Vec<String>> {
+    needs_map(&[
+        ("requirement", &["acceptance", "basic_spec"]),
+        ("basic_spec", &["system_test"]),
+    ])
+}
+
+fn full_needs() -> BTreeMap<String, Vec<String>> {
+    needs_map(&[
+        ("requirement", &["acceptance", "basic_spec"]),
+        ("basic_spec", &["system_test", "detailed_spec"]),
+        ("detailed_spec", &["unit_test"]),
+    ])
+}
+
+fn layers_of(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+fn standard_input(items: Vec<TraceItemInput>) -> TraceInput {
+    TraceInput {
+        items,
+        configured_layers: layers_of(&["requirement", "basic_spec", "acceptance", "system_test"]),
+        project_default_needs: standard_needs(),
+        project_default_profile_name: Some("standard".to_string()),
+        ..Default::default()
+    }
+}
+
+fn full_input(items: Vec<TraceItemInput>) -> TraceInput {
+    TraceInput {
+        items,
+        configured_layers: layers_of(&[
+            "requirement",
+            "basic_spec",
+            "detailed_spec",
+            "acceptance",
+            "system_test",
+            "unit_test",
+        ]),
+        project_default_needs: full_needs(),
+        project_default_profile_name: Some("full".to_string()),
+        ..Default::default()
+    }
+}
+
+fn lint_profile_layer(input: &TraceInput) -> Vec<LintFinding> {
+    let graph = TraceGraph::build(input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+    evaluate(&graph, input, &ctx, &config, None)
+        .into_iter()
+        .filter(|f| f.rule == "missing_profile_layer")
+        .collect()
+}
+
+#[test]
+fn missing_profile_layer_fires_on_standard_when_basic_spec_is_absent() {
+    let input = standard_input(vec![layered("REQ-001", "requirement", &[], &[])]);
+
+    let found = lint_profile_layer(&input);
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].item.as_deref(), Some("REQ-001"));
+    assert_eq!(
+        found[0].message,
+        "LINT-W030 missing_profile_layer: requirement 'REQ-001' has no refining basic_spec \
+         item (profile 'standard' default_needs requires basic_spec coverage)"
+    );
+}
+
+#[test]
+fn missing_profile_layer_is_quiet_once_a_basic_spec_item_refines_the_requirement() {
+    let input = standard_input(vec![
+        layered("REQ-001", "requirement", &[], &[]),
+        layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+        layered("ST-001", "system_test", &[], &["BS-001"]),
+    ]);
+
+    let found = lint_profile_layer(&input);
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn missing_profile_layer_is_per_item_not_per_document() {
+    // REQ-002 shares REQ-001's document, but only REQ-001 has a basic_spec.
+    let input = standard_input(vec![
+        layered("REQ-001", "requirement", &[], &[]),
+        layered("REQ-002", "requirement", &[], &[]),
+        layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+        layered("ST-001", "system_test", &[], &["BS-001"]),
+    ]);
+
+    let found = lint_profile_layer(&input);
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("REQ-002"));
+}
+
+#[test]
+fn missing_profile_layer_standard_flags_a_basic_spec_without_system_test() {
+    let input = standard_input(vec![
+        layered("REQ-001", "requirement", &[], &[]),
+        layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+    ]);
+
+    let found = lint_profile_layer(&input);
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("BS-001"));
+    assert!(found[0].message.contains("no verifying system_test item"));
+}
+
+#[test]
+fn missing_profile_layer_fires_on_full_for_detailed_spec_and_unit_test() {
+    // REQ -> BS (with system_test) but no detailed_spec: BS is flagged.
+    let no_detailed = full_input(vec![
+        layered("REQ-001", "requirement", &[], &[]),
+        layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+        layered("ST-001", "system_test", &[], &["BS-001"]),
+    ]);
+    let found = lint_profile_layer(&no_detailed);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("BS-001"));
+    assert!(found[0].message.contains("no refining detailed_spec item"));
+    assert!(found[0].message.contains("profile 'full'"));
+
+    // detailed_spec present but no unit_test: DS is flagged.
+    let no_unit = full_input(vec![
+        layered("REQ-001", "requirement", &[], &[]),
+        layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+        layered("ST-001", "system_test", &[], &["BS-001"]),
+        layered("DS-001", "detailed_spec", &["BS-001"], &[]),
+    ]);
+    let found = lint_profile_layer(&no_unit);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("DS-001"));
+    assert!(found[0].message.contains("no verifying unit_test item"));
+
+    // the whole chain present: quiet.
+    let complete = full_input(vec![
+        layered("REQ-001", "requirement", &[], &[]),
+        layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+        layered("ST-001", "system_test", &[], &["BS-001"]),
+        layered("DS-001", "detailed_spec", &["BS-001"], &[]),
+        layered("UT-001", "unit_test", &[], &["DS-001"]),
+    ]);
+    assert!(lint_profile_layer(&complete).is_empty());
+}
+
+#[test]
+fn missing_profile_layer_does_not_fire_on_minimal_or_bugfix() {
+    // minimal / bugfix: requirement -> [acceptance] only (no basic_spec).
+    for name in ["minimal", "bugfix"] {
+        let input = TraceInput {
+            items: vec![layered("REQ-001", "requirement", &[], &[])],
+            configured_layers: layers_of(&["requirement", "acceptance"]),
+            project_default_needs: needs_map(&[("requirement", &["acceptance"])]),
+            project_default_profile_name: Some(name.to_string()),
+            ..Default::default()
+        };
+        assert!(lint_profile_layer(&input).is_empty(), "profile {name}");
+    }
+}
+
+#[test]
+fn missing_profile_layer_does_not_fire_without_any_default_needs() {
+    let input = TraceInput {
+        items: vec![layered("REQ-001", "requirement", &[], &[])],
+        configured_layers: layers_of(&["requirement", "basic_spec"]),
+        ..Default::default()
+    };
+    assert!(lint_profile_layer(&input).is_empty());
+}
+
+#[test]
+fn missing_profile_layer_honors_the_documents_profile_override() {
+    use crate::trace::types::EffectiveProfile;
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "doc".to_string(),
+        EffectiveProfile {
+            name: "minimal".to_string(),
+            layers: layers_of(&["requirement", "acceptance"]),
+            default_needs: needs_map(&[("requirement", &["acceptance"])]),
+        },
+    );
+    // A project on `standard`, but the item's document is overridden to minimal.
+    let mut input = standard_input(vec![layered("REQ-001", "requirement", &[], &[])]);
+    input.doc_profile_overrides = overrides;
+    assert!(lint_profile_layer(&input).is_empty());
+
+    // A project on `minimal`, with the document overridden up to `standard`.
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "doc".to_string(),
+        EffectiveProfile {
+            name: "standard".to_string(),
+            layers: layers_of(&["requirement", "basic_spec", "acceptance", "system_test"]),
+            default_needs: standard_needs(),
+        },
+    );
+    let input = TraceInput {
+        items: vec![layered("REQ-001", "requirement", &[], &[])],
+        configured_layers: layers_of(&["requirement", "basic_spec", "acceptance", "system_test"]),
+        project_default_needs: needs_map(&[("requirement", &["acceptance"])]),
+        project_default_profile_name: Some("minimal".to_string()),
+        doc_profile_overrides: overrides,
+        ..Default::default()
+    };
+    let found = lint_profile_layer(&input);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].message.contains("profile 'standard'"));
+}
+
+#[test]
+fn missing_profile_layer_respects_item_needs_waivers_and_composites() {
+    // `needs: []` opts the item out; waive-refine skips the left-side check.
+    let opted_out = TraceItemInput {
+        needs: Some(Vec::new()),
+        ..layered("REQ-001", "requirement", &[], &[])
+    };
+    let waived = TraceItemInput {
+        waived_axes: vec![crate::trace::types::WaiverAxis::Refine],
+        ..layered("REQ-002", "requirement", &[], &[])
+    };
+    let input = standard_input(vec![opted_out, waived]);
+    assert!(lint_profile_layer(&input).is_empty());
+
+    // A composite (has tree children) is judged by its leaves, not itself.
+    let parent = layered("REQ-010", "requirement", &[], &[]);
+    let mut child = layered("REQ-011", "requirement", &[], &[]);
+    child.tree.parents = vec!["REQ-010".to_string()];
+    let input = standard_input(vec![parent, child]);
+    let found = lint_profile_layer(&input);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("REQ-011"));
+}
+
+#[test]
+fn missing_profile_layer_severity_override_and_rules_filter_apply() {
+    let input = standard_input(vec![layered("REQ-001", "requirement", &[], &[])]);
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    assert!(is_known_rule_id("missing_profile_layer", &config));
+
+    config
+        .rules
+        .insert("missing_profile_layer".to_string(), "error".to_string());
+    let only: HashSet<String> = ["missing_profile_layer".to_string()].into_iter().collect();
+    let findings = evaluate(&graph, &input, &ctx, &config, Some(&only));
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, Severity::Error);
+
+    config
+        .rules
+        .insert("missing_profile_layer".to_string(), "off".to_string());
+    assert!(!evaluate(&graph, &input, &ctx, &config, None)
+        .iter()
+        .any(|f| f.rule == "missing_profile_layer"));
+}
+
+#[test]
+fn code_drift_warning_fires_for_a_code_drift_item() {
+    let input = TraceInput {
+        items: vec![item("SPEC-001")],
+        code_drift_items: ["SPEC-001".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+
+    let drift: Vec<_> = findings.iter().filter(|f| f.rule == "code_drift").collect();
+    assert_eq!(
+        drift.len(),
+        1,
+        "exactly one code_drift finding: {findings:?}"
+    );
+    assert_eq!(drift[0].severity, Severity::Warning);
+    assert_eq!(drift[0].item.as_deref(), Some("SPEC-001"));
+    assert!(
+        !findings.iter().any(|f| f.rule == "suspect_code"),
+        "the code suspect must not be reported twice"
+    );
+}
+
+#[test]
+fn code_drift_does_not_fire_without_drift_items() {
+    let input = TraceInput {
+        items: vec![item("SPEC-001")],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+
+    assert!(!findings.iter().any(|f| f.rule == "code_drift"));
+}
+
+#[test]
+fn code_drift_severity_is_overridable_and_a_known_rule_id() {
+    let input = TraceInput {
+        items: vec![item("SPEC-001")],
+        code_drift_items: ["SPEC-001".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    config
+        .rules
+        .insert("code_drift".to_string(), "off".to_string());
+
+    assert!(validate_lint_config(&config).is_ok());
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(!findings.iter().any(|f| f.rule == "code_drift"));
+}
+
+#[test]
+fn code_drift_on_a_passing_verifier_flags_it_for_reverify_through_the_graph() {
+    let verifier = crate::trace::types::TraceItemInput {
+        layer: Some("acceptance".to_string()),
+        method: Some("auto_test".to_string()),
+        ..item("AT-001")
+    };
+    let mut runs_latest = HashMap::new();
+    runs_latest.insert("AT-001".to_string(), "pass".to_string());
+    let input = TraceInput {
+        items: vec![verifier],
+        runs_latest,
+        code_drift_items: ["AT-001".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let graph = TraceGraph::build(&input);
+
+    assert!(graph.reverify_items().contains("AT-001"));
+    assert!(graph
+        .suspects()
+        .iter()
+        .any(|s| s.kind == crate::trace::types::SuspectKind::Code && s.item == "AT-001"));
+}
+
+// ---------------------------------------------------------------------------
+// low_confidence_spec (wiki/430 §3.3, REQ-LAG-006): a generated spec item that
+// still carries the `(要確認)` marker is surfaced as a warning.
+// ---------------------------------------------------------------------------
+
+fn lint_low_confidence(
+    items: Vec<TraceItemInput>,
+    statements: &[(&str, &str)],
+    titles: &[(&str, &str)],
+    rules_filter: Option<&HashSet<String>>,
+) -> Vec<LintFinding> {
+    let input = TraceInput {
+        items,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let tree_text: HashMap<String, ItemTreeText> = statements
+        .iter()
+        .map(|(id, s)| {
+            (
+                id.to_string(),
+                ItemTreeText {
+                    statement: s.to_string(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let item_meta: HashMap<String, ItemLintMeta> = titles
+        .iter()
+        .map(|(id, t)| {
+            (
+                id.to_string(),
+                ItemLintMeta {
+                    doc_slug: "spec-doc".to_string(),
+                    priority: None,
+                    approval: "draft".to_string(),
+                    title: t.to_string(),
+                },
+            )
+        })
+        .collect();
+    let ctx = LintContext {
+        item_meta: &item_meta,
+        tree_text: &tree_text,
+        ..empty_ctx()
+    };
+    let config = crate::storage::config::TraceLintConfig::default();
+    evaluate(&graph, &input, &ctx, &config, rules_filter)
+        .into_iter()
+        .filter(|f| f.rule == "low_confidence_spec")
+        .collect()
+}
+
+#[test]
+fn low_confidence_spec_warns_on_marker_in_basic_spec_statement() {
+    let found = lint_low_confidence(
+        vec![layered("BS-001", "basic_spec", &[], &[])],
+        &[("BS-001", "The export retries three times. (要確認)")],
+        &[("BS-001", "Export retry")],
+        None,
+    );
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].item.as_deref(), Some("BS-001"));
+    assert_eq!(found[0].doc.as_deref(), Some("spec-doc"));
+    assert!(
+        found[0].message.contains("low_confidence_spec"),
+        "{found:?}"
+    );
+    assert!(found[0].message.contains("(要確認)"), "{found:?}");
+}
+
+#[test]
+fn low_confidence_spec_warns_on_marker_in_detailed_spec_title() {
+    let found = lint_low_confidence(
+        vec![layered("DS-001", "detailed_spec", &[], &[])],
+        &[("DS-001", "Plain statement.")],
+        &[("DS-001", "Retry backoff (要確認)")],
+        None,
+    );
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("DS-001"));
+}
+
+#[test]
+fn low_confidence_spec_is_quiet_without_the_marker() {
+    let found = lint_low_confidence(
+        vec![layered("BS-001", "basic_spec", &[], &[])],
+        &[("BS-001", "The export retries three times.")],
+        &[("BS-001", "Export retry")],
+        None,
+    );
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn low_confidence_spec_ignores_layers_other_than_basic_and_detailed_spec() {
+    let found = lint_low_confidence(
+        vec![
+            layered("REQ-001", "requirement", &[], &[]),
+            layered("ST-001", "system_test", &[], &[]),
+        ],
+        &[
+            ("REQ-001", "Open question (要確認)"),
+            ("ST-001", "Scaffold (要確認)"),
+        ],
+        &[],
+        None,
+    );
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn low_confidence_spec_can_be_selected_and_excluded_by_the_rules_filter() {
+    let items = || vec![layered("BS-001", "basic_spec", &[], &[])];
+    let statements = [("BS-001", "Guess (要確認)")];
+
+    let only: HashSet<String> = ["low_confidence_spec".to_string()].into_iter().collect();
+    assert_eq!(
+        lint_low_confidence(items(), &statements, &[], Some(&only)).len(),
+        1
+    );
+
+    let other: HashSet<String> = ["orphan".to_string()].into_iter().collect();
+    assert!(lint_low_confidence(items(), &statements, &[], Some(&other)).is_empty());
+}
+
+#[test]
+fn low_confidence_spec_severity_is_overridable_and_can_be_switched_off() {
+    let input = TraceInput {
+        items: vec![layered("BS-001", "basic_spec", &[], &[])],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let tree_text: HashMap<String, ItemTreeText> = [(
+        "BS-001".to_string(),
+        ItemTreeText {
+            statement: "Guess (要確認)".to_string(),
+            ..Default::default()
+        },
+    )]
+    .into_iter()
+    .collect();
+    let ctx = LintContext {
+        tree_text: &tree_text,
+        ..empty_ctx()
+    };
+    let mut config = crate::storage::config::TraceLintConfig::default();
+
+    config
+        .rules
+        .insert("low_confidence_spec".to_string(), "error".to_string());
+    let errored = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(errored
+        .iter()
+        .any(|f| f.rule == "low_confidence_spec" && f.severity == Severity::Error));
+
+    config
+        .rules
+        .insert("low_confidence_spec".to_string(), "off".to_string());
+    let off = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(!off.iter().any(|f| f.rule == "low_confidence_spec"));
 }

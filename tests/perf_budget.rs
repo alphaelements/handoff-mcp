@@ -662,7 +662,7 @@ fn run_ops(
         let config_path = proj.join(".handoff").join("config.toml");
         let mut config = handoff_mcp::storage::config::read_config(&config_path)
             .expect("read config.toml for done_guard block setup");
-        config.trace.done_guard = "block".to_string();
+        config.trace.done_guard.mode = "block".to_string();
         handoff_mcp::storage::config::write_config(&config_path, &config)
             .expect("write config.toml with done_guard=block");
 
@@ -709,7 +709,7 @@ fn run_ops(
 
         let mut config = handoff_mcp::storage::config::read_config(&config_path)
             .expect("read config.toml to revert done_guard");
-        config.trace.done_guard = "warn".to_string();
+        config.trace.done_guard.mode = "warn".to_string();
         handoff_mcp::storage::config::write_config(&config_path, &config)
             .expect("revert config.toml done_guard to warn");
     }

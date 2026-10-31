@@ -18,6 +18,8 @@ implementation, adversarial testing, and architectural review.
 ### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet),
   session-integration-tester (Sonnet), session-reviewer (Opus),
+  session-spec-writer (Sonnet — Stage 0: derives missing basic_spec from requirements, scaffolds system_test (full: + detailed_spec/unit_test), self-checks with confidence + checker_result),
+  session-spec-reconciler (Sonnet — Stage 3.5: syncs basic_spec/system_test with the implementation, reports contract_ambiguity),
   session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
   requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
   requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check, plus the opt-in ISO 29119 `test_spec` check of scaffolded test specifications; cross-document duplicate/contradiction/omission review),
@@ -61,6 +63,7 @@ Session Manager (main agent, /loop /session-loop)
  |-- Picks a pipeline profile, gets user approval
  |-- Launches Workflow(session-execute)
  |    |
+ |    |-- Stage 0: Spec-Prep — spec-writer derives missing basic_spec + scaffolds (Sonnet) [standard, full]
  |    |-- Main loop (up to max_rounds, one flat loop, 3 serial stages):
  |    |   |-- Stage 1: Parallel developers (TDD, Sonnet)              [every profile]
  |    |   |-- Stage 2: Single tester — per-task adversarial verification
@@ -114,12 +117,12 @@ dominant term in wall-clock latency:
 | Profile | Stages | Serial turns |
 | --- | --- | --- |
 | `express` | developer | 1 |
-| `standard` *(default)* | developer → tester | 2 |
-| `full` | developer → tester → reviewer | 3 |
+| `standard` *(default)* | spec-prep → developer → tester → spec-reconcile | 4 |
+| `full` | spec-prep → developer → tester → reviewer → spec-reconcile | 5 |
 
 The integration tester handles both per-task adversarial checks and whole-project
 suite / E2E / wiring in a single agent invocation, so `test` and `integrate` share
-one serial turn. `full` adds the reviewer as a third turn. `express` has no
+one serial turn. `full` adds the reviewer as an extra turn; `standard`/`full` also pay one turn each for Spec-Prep (Stage 0) and Spec-Reconcile (Stage 3.5). `express` has no
 integration tester — its tasks are mechanical and self-verifying, so there is no
 wiring to check, and the developer owns the whole-project suite there.
 

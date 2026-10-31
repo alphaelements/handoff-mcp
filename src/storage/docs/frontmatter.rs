@@ -863,11 +863,13 @@ mod tests {
                     path: "src/foo.rs".to_string(),
                     lines: Some("10-50".to_string()),
                     label: None,
+                    content_hash: None,
                 }],
                 test_refs: vec![CodeRef {
                     path: "tests/foo.rs".to_string(),
                     lines: None,
                     label: None,
+                    content_hash: None,
                 }],
                 reviewer: None,
                 verified_at: Some("2026-07-18T12:00:00Z".to_string()),

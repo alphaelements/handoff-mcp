@@ -237,6 +237,7 @@ pub fn collect_doc_profile_overrides(
                 EffectiveProfile {
                     name: profile.name,
                     layers: profile.layers,
+                    default_needs: profile.default_needs,
                 },
             );
         }
@@ -315,6 +316,9 @@ pub fn build_trace_input(
         // name); the caller that has them fills this in (see
         // `TraceInput::task_status`). Empty = every task counts as started.
         task_status: HashMap::new(),
+        // File hashing is I/O, which this module never does; the loader
+        // (`load_trace_input_from_docs`) fills it in.
+        code_drift_items: Default::default(),
         docs: docs
             .iter()
             .map(|d| DocRefInput {

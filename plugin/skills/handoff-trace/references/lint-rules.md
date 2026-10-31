@@ -39,6 +39,7 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 | `suspect_link` | warning | an upstream item changed after a `refines:`/`verifies:` link to it was baselined | review the downstream item, update it if needed, then `trace_suspect(action="clear")` |
 | `suspect_task` | warning | an item changed after a task's link to it was baselined | review the task, then clear the suspect |
 | `stale_result` | warning | the latest `pass` was recorded against an earlier definition of the item | re-run the check and record a new result |
+| `code_drift` | warning | a file named by an item's `impl_refs`/`test_refs` changed (or was deleted) since its `content_hash` was recorded; refs with no recorded hash never fire — that covers refs stamped while their file did not yet exist (they stay untracked even after the file appears), body-declared `test_refs` (no hash), and unreadable files (fail-open). Hashes are recorded only by `trace_update` `set` and `doc_verify` `set_refs` (`doc_save` has no refs input). A passing verifier carrying it is listed in `reverify` | review the item against the new code, then re-set the refs (`trace_update` `set`) to record the current hash |
 | `unbaselined` | info | a link or task link has no baseline yet, so it can never become suspect | `trace_suspect(action="baseline")` |
 | `unwanted_coverage` | info | a verifier comes from a layer outside the item's `needs`/`default_needs`. It is excluded from coverage | move the verifier to a needed layer, or widen `needs` |
 
@@ -52,6 +53,7 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 | `unknown_acceptance_ref` | warning | `verifies: X#ACn` names an acceptance label that `X` does not declare (it falls back to verifying the whole item) | fix the label |
 | `redundant_waiver` | info | the item is already covered or partial on a waived axis, so the waiver is unused. For a composite, "covered" means through its children: the waiver stands while no child is covered | remove the waiver |
 | `layer_outside_profile` | info | the item's layer is not in its effective used-layer set, so it is left out of coverage and state | change the profile or `layers`, or move the item |
+| `missing_profile_layer` | warning | the item's effective profile `default_needs` (its document's `trace_profile`, else the project default; or the item's own `- needs:`) requires a layer such as `basic_spec`, `system_test`, `detailed_spec` or `unit_test` that has no refining (left side) or verifying (right side) item for it. Per item, not per document; `acceptance` is left to `unverified`/`missing_acceptance`; composites, `waive-refine`/`waive-verify` and `needs: []` are skipped. `minimal`/`bugfix` never fire | add the missing layer item (`refines`/`verifies` this one), or change the profile |
 
 ### Drift (stored data versus documents and tasks)
 
@@ -184,6 +186,35 @@ accepts these ids too.
 
 `handoff-mcp trace tree` also exits 2 on bad arguments; other subcommands use 0/1. The `2` exists so CI can tell
 "policy violated" apart from "lint could not run".
+
+### `--changed-only`: gate a commit on the files it touches
+
+`handoff-mcp trace lint --changed-only` (tool argument `changed_only: true`) lints only the items whose
+`impl_refs` / `test_refs` name a file in `git diff HEAD --name-only` (uncommitted changes against `HEAD`; paths
+are compared normalized, and a `scope_paths` match does not count). Unless you pass `--rules`, it runs just
+`code_drift` and `missing_profile_layer`, and `--fail-on` defaults to `warning`, so any such finding exits `1`
+even though both rules are warnings by default. The JSON adds `changed_only: true` and `changed_files: [...]`.
+With no changed files it reports no findings and a `warnings` entry, and exits `0`. If git itself fails (not a
+repository, no commit yet) the gate fails closed with exit `2`, so it never passes blind. A direct ref match on any
+changed file counts, even when another changed file only falls under the document's `scope_paths`.
+
+`code_drift` only fires for refs that recorded a `content_hash` (set through `trace_update` `set` or
+`doc_verify` `set_refs`). After a deliberate code change, re-run `set` for the item's `impl_refs` to accept the
+new hash and clear the finding.
+
+Example `lefthook.yml` (pre-commit; add `--project-dir .` if the hook does not run from the project root):
+
+```yaml
+pre-commit:
+  commands:
+    trace-lint-changed:
+      glob: "**/*.{rs,ts,js,py,go}"
+      run: handoff-mcp trace lint --changed-only --format text
+      fail_text: "A spec item tied to a changed file has drifted or lacks a required layer. Update the spec, or re-record impl_refs with trace_update set."
+```
+
+The same command works as a CI step: `handoff-mcp trace lint --changed-only --fail-on warning`. Note that lefthook
+runs before the commit exists, so `git diff HEAD` sees the working tree including the changes being committed.
 
 ## 6. `action="quality_prompt"`: LLM-judged quality
 

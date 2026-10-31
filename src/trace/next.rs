@@ -41,6 +41,13 @@ use super::types::{
 pub enum NextActionKind {
     FixFailing,
     ReviewSuspect,
+    /// t-layergen.9 (wiki/430 §3.7, REQ-LAG-006): a left-side item whose
+    /// `impl_refs`/`test_refs` files changed since their recorded
+    /// `content_hash` ([`TraceInput::code_drift_items`]) — its spec may no
+    /// longer describe the code. Shares rank 3 with `Rerun` but sorts before
+    /// it: the spec is revised first, then its verifiers are re-run. A
+    /// proposal only; no task or document is ever created by this kind.
+    UpdateDriftedSpec,
     Rerun,
     /// M3 (wiki/270-vmodel-m3-design.md §4.5, FR-307): an assigned manual/
     /// visual/review verification item that has never been run. Shares rank
@@ -72,7 +79,7 @@ impl NextActionKind {
         match self {
             Self::FixFailing => 1,
             Self::ReviewSuspect => 2,
-            Self::Rerun | Self::ManualPending => 3,
+            Self::UpdateDriftedSpec | Self::Rerun | Self::ManualPending => 3,
             Self::WriteVerification => 4,
             Self::Refine => 5,
             Self::CreateTask => 6,
@@ -120,6 +127,23 @@ pub struct ItemNextMeta {
     /// gathered the same way `priority`/`dev_stage` are — used by both the
     /// `assignee` filter and [`manual_pending_candidates`].
     pub assignee: Option<String>,
+    /// t-layergen.9 (REQ-LAG-006): plan-document `SubItem`s reached through a
+    /// task that implements this item — attached to this item's
+    /// `update_drifted_spec` action as `plan_update_needed` when it drifted.
+    /// Gathered by the caller (`handoff_trace_next`) from tasks + plan docs;
+    /// empty for every other caller.
+    pub plan_updates: Vec<PlanUpdateRef>,
+}
+
+/// One plan-document `SubItem` whose `dev_stage` may need revisiting because
+/// a linked item's code drifted (same `{doc_id, stable_id, current_dev_stage}`
+/// vocabulary `handoff_update_task`'s `plan_update_needed` line uses; no
+/// `suggested_dev_stage` — a drift does not imply a specific new stage).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanUpdateRef {
+    pub doc_id: String,
+    pub stable_id: String,
+    pub current_dev_stage: String,
 }
 
 /// A suggested follow-up MCP tool call (§3.5's table's rightmost column,
@@ -146,6 +170,9 @@ pub struct NextAction {
     pub priority: Option<String>,
     pub reason: String,
     pub suggest: Suggest,
+    /// Plan items linked to a drifted item (`update_drifted_spec` only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plan_update_needed: Vec<PlanUpdateRef>,
 }
 
 /// Internal sort key (§3.5: "同じ順位の中では、項目の priority（P0 → P3）→
@@ -317,6 +344,7 @@ fn candidate(
             priority: m.priority,
             reason,
             suggest,
+            plan_update_needed: Vec::new(),
         },
     }
 }
@@ -439,35 +467,143 @@ fn rerun_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
         if !ready {
             continue;
         }
-        // `trace_ingest` matches test output to items; an item run by hand —
-        // an implicit acceptance item, or `method: manual`/`visual`/`review`
-        // — has no test output to match, and its result is recorded directly.
-        let by_hand = item.implicit_of.is_some()
-            || matches!(item.method.as_deref(), Some("manual" | "visual" | "review"));
-        let follow_up = if !by_hand {
-            suggest(
-                "handoff_trace_ingest",
-                serde_json::json!({"format": "junit_xml"}),
-            )
-        } else {
-            // `not_run` is a placeholder the executor must replace with the
-            // real outcome. It is NOT a no-op: recorded as-is it appends a
-            // `not_run` run, which supersedes a stale pass (clearing its
-            // result suspect / reverify) without any re-verification.
-            suggest(
-                "handoff_trace_record",
-                serde_json::json!({"results": [{"item": id, "result": "not_run"}]}),
-            )
-        };
         out.push(candidate(
             ctx,
             NextActionKind::Rerun,
             id,
             format!("{id} needs a fresh run (reverify or never run) — execute, then record"),
-            follow_up,
+            rerun_follow_up(item),
         ));
     }
     out
+}
+
+/// The suggested call for re-running `item`: `trace_ingest` matches test
+/// output to items, so an item run by hand — an implicit acceptance item, or
+/// `method: manual`/`visual`/`review` — has no test output to match and its
+/// result is recorded directly instead.
+fn rerun_follow_up(item: &TraceItemInput) -> Suggest {
+    let by_hand = item.implicit_of.is_some()
+        || matches!(item.method.as_deref(), Some("manual" | "visual" | "review"));
+    if !by_hand {
+        suggest(
+            "handoff_trace_ingest",
+            serde_json::json!({"format": "junit_xml"}),
+        )
+    } else {
+        // `not_run` is a placeholder the executor must replace with the
+        // real outcome. It is NOT a no-op: recorded as-is it appends a
+        // `not_run` run, which supersedes a stale pass (clearing its
+        // result suspect / reverify) without any re-verification.
+        suggest(
+            "handoff_trace_record",
+            serde_json::json!({"results": [{"item": item.stable_id, "result": "not_run"}]}),
+        )
+    }
+}
+
+/// t-layergen.9 (wiki/430 §3.7, REQ-LAG-006) code-drift follow-ups, derived
+/// from [`TraceInput::code_drift_items`] (an id naming no item is skipped):
+///
+/// - a drifted **left-side** item -> `update_drifted_spec` (its spec may no
+///   longer describe the changed code), carrying the plan items its
+///   implementing tasks reach as `plan_update_needed`;
+/// - a **right-side verifier** of a drifted left-side item, and a drifted
+///   right-side item itself (its test code changed) -> `rerun`.
+///
+/// Verifiers outside the candidate set (`ids`: task scope / layers /
+/// assignee filters) are not proposed, same as every other kind. A verifier
+/// the ordinary rerun rule already proposed (`already_rerun`) or an earlier
+/// drifted spec already proposed is not repeated. Proposals only — nothing
+/// is created (§3.7 "タスクの自動作成はしない").
+fn code_drift_candidates(
+    ctx: &Ctx,
+    ids: &HashSet<String>,
+    already_rerun: &HashSet<String>,
+) -> Vec<Candidate> {
+    let mut drifted: Vec<&String> = ctx
+        .input
+        .code_drift_items
+        .iter()
+        .filter(|id| ids.contains(id.as_str()))
+        .collect();
+    drifted.sort();
+
+    let mut proposed_rerun: HashSet<&str> = already_rerun.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for id in drifted {
+        let Some(item) = ctx.item(id) else { continue };
+        match ctx.layer_of(id).map(|l| l.side) {
+            Some(LayerSide::Left) => {
+                let mut c = candidate(
+                    ctx,
+                    NextActionKind::UpdateDriftedSpec,
+                    id,
+                    format!(
+                        "{id}: its impl_refs/test_refs files changed since the recorded \
+                         content_hash — revise the spec to match the code, then re-record the \
+                         refs (handoff_trace_update `set` impl_refs/test_refs)"
+                    ),
+                    drift_spec_suggest(id, item),
+                );
+                c.action.plan_update_needed = ctx.meta_for(id).plan_updates;
+                out.push(c);
+                for verifier in &ctx.input.items {
+                    let vid = verifier.stable_id.as_str();
+                    let verifies_it = verifier
+                        .verifies
+                        .iter()
+                        .any(|v| v.split('#').next().unwrap_or(v) == id.as_str());
+                    let right_side = ctx.layer_of(vid).map(|l| l.side) == Some(LayerSide::Right);
+                    if !verifies_it
+                        || !right_side
+                        || !ids.contains(vid)
+                        || !proposed_rerun.insert(vid)
+                    {
+                        continue;
+                    }
+                    out.push(candidate(
+                        ctx,
+                        NextActionKind::Rerun,
+                        vid,
+                        format!("{vid} verifies {id}, whose code changed — re-run it"),
+                        rerun_follow_up(verifier),
+                    ));
+                }
+            }
+            Some(LayerSide::Right) => {
+                if !proposed_rerun.insert(id.as_str()) {
+                    continue;
+                }
+                out.push(candidate(
+                    ctx,
+                    NextActionKind::Rerun,
+                    id,
+                    format!("{id}: its test_refs files changed since the recorded content_hash — re-run it"),
+                    rerun_follow_up(item),
+                ));
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// `update_drifted_spec`'s suggested call: preview (`dry_run`) an
+/// `upsert_item` on the drifted item's own document so the caller fills in
+/// the revised `statement`/`acceptance`; without a known document there is
+/// nothing to target, so it falls back to inspecting the item.
+fn drift_spec_suggest(id: &str, item: &TraceItemInput) -> Suggest {
+    if item.doc_id.is_empty() {
+        return suggest("handoff_trace_slice", serde_json::json!({"item": id}));
+    }
+    suggest(
+        "handoff_trace_update",
+        serde_json::json!({
+            "dry_run": true,
+            "ops": [{"op": "upsert_item", "doc": item.doc_id, "id": id}],
+        }),
+    )
 }
 
 /// M3 (wiki/270-vmodel-m3-design.md §4.5, FR-307) `kind: manual_pending` — a
@@ -1009,6 +1145,7 @@ fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidat
                      relinking the task to {ds_id} instead",
                     link.task_id, link.stable_id
                 ),
+                plan_update_needed: Vec::new(),
                 suggest: suggest(
                     "handoff_update_task",
                     serde_json::json!({
@@ -1127,7 +1264,13 @@ pub fn derive_next_actions(
     let mut candidates: Vec<Candidate> = Vec::new();
     candidates.extend(fix_failing_candidates(&ctx, &ordered_ids));
     candidates.extend(review_suspect_candidates(&ctx, &all_ids));
-    candidates.extend(rerun_candidates(&ctx, &all_ids));
+    let reruns = rerun_candidates(&ctx, &all_ids);
+    let rerun_ids: HashSet<String> = reruns
+        .iter()
+        .filter_map(|c| c.action.item.clone())
+        .collect();
+    candidates.extend(reruns);
+    candidates.extend(code_drift_candidates(&ctx, &all_ids, &rerun_ids));
     candidates.extend(manual_pending_candidates(&ctx, &all_ids));
     candidates.extend(write_verification_candidates(&ctx, &all_ids));
     candidates.extend(refine_candidates(&ctx, &all_ids));
@@ -1157,3 +1300,6 @@ mod tests;
 
 #[cfg(test)]
 mod implicit_tests;
+
+#[cfg(test)]
+mod drift_tests;

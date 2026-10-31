@@ -505,11 +505,33 @@ mod tests {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
 
+        /// `execve` fails with ETXTBSY (os error 26) while any process still holds
+        /// the file open for writing. Closing our own fd is not enough: a sibling
+        /// test thread may `fork()` between `create` and `close`, and the child
+        /// keeps a copy of the write fd until it reaches its own `exec`.
+        const ETXTBSY: i32 = 26;
+        const EXEC_READY_ATTEMPTS: u32 = 200;
+
         fn fake_tool(dir: &Path, name: &str, script_body: &str) -> PathBuf {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{script_body}\n")).unwrap();
+            {
+                let mut f = std::fs::File::create(&p).unwrap();
+                std::io::Write::write_all(&mut f, format!("#!/bin/sh\n{script_body}\n").as_bytes())
+                    .unwrap();
+                f.sync_all().unwrap();
+            }
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            p
+            // Wait until no forked child still holds the write fd, so later
+            // executions of this tool cannot race. The scripts are side-effect free.
+            for _ in 0..EXEC_READY_ATTEMPTS {
+                match std::process::Command::new(&p).output() {
+                    Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    _ => return p,
+                }
+            }
+            panic!("{} still busy (ETXTBSY) after waiting", p.display());
         }
 
         fn path_of(dir: &Path) -> OsString {

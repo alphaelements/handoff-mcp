@@ -24,6 +24,7 @@ use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::{
     push_config_warning, read_config, read_config_lenient, read_trace_config_lenient,
 };
+use crate::storage::docs::code_hash;
 use crate::storage::docs::doc_type::infer_doc_type;
 use crate::storage::docs::filter::DocFilter;
 use crate::storage::docs::layer::LayerRegistry;
@@ -2811,9 +2812,12 @@ fn item_effective_status(item: &VerificationItem) -> String {
 }
 
 /// Parses a JSON array of `{path, lines?, label?}` objects into `CodeRef`s.
-/// Entries missing the required `path` are skipped.
-fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
-    v.as_array()
+/// Entries missing the required `path` are skipped. `content_hash` is always
+/// derived from the file below `project_root` (wiki/430 §3.1), never taken
+/// from the input.
+fn code_refs_from_value(project_root: &Path, v: &Value) -> Vec<CodeRef> {
+    let mut refs: Vec<CodeRef> = v
+        .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|r| {
@@ -2822,11 +2826,14 @@ fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
                         path,
                         lines: r.get("lines").and_then(|v| v.as_str()).map(str::to_string),
                         label: r.get("label").and_then(|v| v.as_str()).map(str::to_string),
+                        content_hash: None,
                     })
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    code_hash::stamp_content_hashes(project_root, &mut refs);
+    refs
 }
 
 /// Source file extensions `suggest_refs` scans for impl/test definitions
@@ -6288,8 +6295,13 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .get("fragment_seq")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
-            let impl_refs = arguments.get("impl_refs").map(code_refs_from_value);
-            let test_refs = arguments.get("test_refs").map(code_refs_from_value);
+            let ref_root = code_hash::project_root(handoff);
+            let impl_refs = arguments
+                .get("impl_refs")
+                .map(|v| code_refs_from_value(ref_root, v));
+            let test_refs = arguments
+                .get("test_refs")
+                .map(|v| code_refs_from_value(ref_root, v));
             let sub_item_id = arguments
                 .get("sub_item_id")
                 .and_then(|v| v.as_str())
@@ -8181,6 +8193,7 @@ mod requirements_summary_tests {
                     path: "src/a.rs".to_string(),
                     lines: None,
                     label: None,
+                    content_hash: None,
                 }],
                 ..Default::default()
             },
@@ -8202,11 +8215,13 @@ mod requirements_summary_tests {
                     path: "src/c.rs".to_string(),
                     lines: None,
                     label: None,
+                    content_hash: None,
                 }],
                 test_refs: vec![CodeRef {
                     path: "tests/c.rs".to_string(),
                     lines: None,
                     label: None,
+                    content_hash: None,
                 }],
                 ..Default::default()
             },
@@ -12322,6 +12337,67 @@ mod layer_sync_wiring_tests {
         assert!(
             result.is_ok(),
             "impl_refs-only set_refs must be allowed on a layer document: {result:?}"
+        );
+    }
+
+    /// REQ-LAG-020: `doc_verify(set_refs)` stamps `content_hash` on the refs
+    /// it stores (existing file -> SHA-256, missing file -> none).
+    #[test]
+    fn set_refs_records_content_hash_for_existing_files() {
+        let (tmp, handoff) = {
+            let tmp = tempfile::tempdir().unwrap();
+            let handoff = tmp.path().join(".handoff");
+            std::fs::create_dir_all(&handoff).unwrap();
+            (tmp, handoff)
+        };
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/x.rs"), "abc").unwrap();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc", "title": "Spec", "layer": "basic_spec",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+            }),
+        )
+        .unwrap();
+        let doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id, "action": "set_refs", "sub_item_id": "SPEC-001",
+                "impl_refs": [{"path": "src/x.rs"}, {"path": "src/none.rs"}],
+            }),
+        )
+        .unwrap();
+
+        let doc = crate::storage::docs::read_doc(&handoff, "spec-doc")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        let hashes: Vec<Option<String>> = sub
+            .impl_refs
+            .iter()
+            .map(|r| r.content_hash.clone())
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![
+                Some(
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string()
+                ),
+                None
+            ]
         );
     }
 
