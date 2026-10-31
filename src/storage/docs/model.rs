@@ -981,6 +981,13 @@ pub struct CodeRef {
     pub lines: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// SHA-256 (lowercase hex) of the referenced file's content when this
+    /// ref was set (wiki/430 §3.1) — compared at trace-load time to detect
+    /// code-side drift. Always derived by the server (never taken from
+    /// input); `None` for a ref set before this field existed or whose file
+    /// did not exist at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -1231,11 +1238,13 @@ mod tests {
                     path: "src/storage/docs/mod.rs".to_string(),
                     lines: Some("42-180".to_string()),
                     label: Some("DocStore".to_string()),
+                    content_hash: None,
                 }],
                 test_refs: vec![CodeRef {
                     path: "tests/doc_save.rs".to_string(),
                     lines: None,
                     label: Some("doc_save roundtrip".to_string()),
+                    content_hash: None,
                 }],
                 reviewer: Some("ai".to_string()),
                 verified_at: Some("2026-07-11T14:30:00Z".to_string()),

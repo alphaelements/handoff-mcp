@@ -99,6 +99,9 @@ quick-xml = "0.42"
 # `def_hash`/`ac_hash` need a normalization whose behavior this crate pins
 # itself, not one that rides along with an unrelated dependency bump.
 unicode-normalization = "0.1"
+# SHA-256 of referenced source files for `CodeRef.content_hash` (wiki/430 §3.1):
+# whole-file hashing needs collision resistance FNV-1a does not give.
+sha2 = "0.10"
 handlebars = "6.4.4"
 # Embedded Typst compiler (feature `bundled-typst`). The typst-* crates are
 # released in lockstep: keep all of them on the same minor version. `typst` and

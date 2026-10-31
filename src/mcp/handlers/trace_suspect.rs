@@ -60,6 +60,7 @@ fn suspect_kind_str(kind: SuspectKind) -> &'static str {
         SuspectKind::Link => "link",
         SuspectKind::Task => "task",
         SuspectKind::Result => "result",
+        SuspectKind::Code => "code",
     }
 }
 
@@ -68,6 +69,7 @@ fn parse_suspect_kind(s: &str) -> Option<SuspectKind> {
         "link" => Some(SuspectKind::Link),
         "task" => Some(SuspectKind::Task),
         "result" => Some(SuspectKind::Result),
+        "code" => Some(SuspectKind::Code),
         _ => None,
     }
 }
@@ -131,7 +133,9 @@ fn handle_list(handoff: &Path, arguments: &Value) -> Result<String> {
             let mut kinds = HashSet::new();
             for s in &raw {
                 let kind = parse_suspect_kind(s).ok_or_else(|| {
-                    anyhow::anyhow!("unknown kind {s:?} (expected 'link' | 'task' | 'result')")
+                    anyhow::anyhow!(
+                        "unknown kind {s:?} (expected 'link' | 'task' | 'result' | 'code')"
+                    )
                 })?;
                 kinds.insert(kind);
             }
@@ -499,6 +503,16 @@ fn handle_clear(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     from_hash: from,
                     to_hash: s.current_hash.clone(),
                 });
+            }
+            SuspectKind::Code => {
+                // A code suspect has no baseline to re-record: the hash lives
+                // on the item's CodeRefs, so it clears only when they are
+                // re-set (which re-stamps `content_hash`).
+                warnings.push(format!(
+                    "{}: code suspect not cleared — re-set its impl_refs/test_refs \
+                     (handoff_trace_update set) to record the files' current hashes",
+                    s.item
+                ));
             }
             SuspectKind::Result => {
                 let latest = loaded.latest_cache.items.get(&s.item);

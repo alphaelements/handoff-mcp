@@ -348,6 +348,7 @@ pub fn handle_trace_ingest(ctx: &HandlerContext, arguments: &Value) -> Result<St
                         path: test_name_module_path(test_name).to_string(),
                         lines: None,
                         label: Some(label),
+                        content_hash: None,
                     }),
                 }
             }
@@ -439,6 +440,7 @@ mod tests {
                     path: t.to_string(),
                     lines: None,
                     label: None,
+                    content_hash: None,
                 })
                 .collect(),
             ..Default::default()

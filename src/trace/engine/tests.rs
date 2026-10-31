@@ -1365,6 +1365,7 @@ fn doc_profile_override_applies_to_its_whole_reachable_tree_and_out_of_profile_c
         EffectiveProfile {
             name: "minimal_like".to_string(),
             layers: vec!["requirement".to_string(), "acceptance".to_string()],
+            default_needs: Default::default(),
         },
     );
     let input = TraceInput {
@@ -1404,6 +1405,7 @@ fn item_reachable_from_both_a_default_and_an_overridden_root_carries_both_profil
         EffectiveProfile {
             name: "custom".to_string(),
             layers: vec!["requirement".to_string(), "detailed_spec".to_string()],
+            default_needs: Default::default(),
         },
     );
     let input = TraceInput {

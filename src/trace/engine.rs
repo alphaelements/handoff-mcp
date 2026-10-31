@@ -1927,6 +1927,7 @@ fn aggregate_suspect_counts(
             super::types::SuspectKind::Link => entry.suspect.links += 1,
             super::types::SuspectKind::Task => entry.suspect.tasks += 1,
             super::types::SuspectKind::Result => entry.suspect.results += 1,
+            super::types::SuspectKind::Code => entry.suspect.code += 1,
         }
         items_with_suspect
             .entry(layer)

@@ -564,3 +564,66 @@ fn dangling_refines_target_is_neither_suspect_nor_unbaselined() {
     assert!(out.suspects.is_empty());
     assert_eq!(out.unbaselined, UnbaselinedCounts::default());
 }
+
+#[test]
+fn code_suspect_emitted_for_each_code_drift_item() {
+    let input = TraceInput {
+        items: vec![item("SPEC-001"), item("SPEC-002")],
+        code_drift_items: ["SPEC-001".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let out = compute(&input, &HashMap::new());
+
+    assert_eq!(out.suspects.len(), 1);
+    let s = &out.suspects[0];
+    assert_eq!(s.kind, SuspectKind::Code);
+    assert_eq!(s.item, "SPEC-001");
+    assert!(s.upstream.is_none() && s.task.is_none() && s.link_type.is_none());
+}
+
+#[test]
+fn code_drift_item_not_resolving_to_an_item_is_ignored() {
+    let input = TraceInput {
+        items: vec![item("SPEC-001")],
+        code_drift_items: ["GHOST-9".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+
+    assert!(compute(&input, &HashMap::new()).suspects.is_empty());
+}
+
+#[test]
+fn code_suspect_adds_passing_item_to_reverify_but_not_a_failing_one() {
+    let input = TraceInput {
+        items: vec![item("AT-001"), item("AT-002")],
+        code_drift_items: ["AT-001".to_string(), "AT-002".to_string()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+
+    let out = compute(
+        &input,
+        &states(&[
+            ("AT-001", ItemState::Passing),
+            ("AT-002", ItemState::Failing),
+        ]),
+    );
+
+    assert!(out.reverify.contains("AT-001"));
+    assert!(!out.reverify.contains("AT-002"));
+}
+
+#[test]
+fn no_code_drift_items_means_no_code_suspects() {
+    let input = TraceInput {
+        items: vec![item("AT-001")],
+        ..Default::default()
+    };
+
+    let out = compute(&input, &states(&[("AT-001", ItemState::Passing)]));
+
+    assert!(out.suspects.is_empty());
+    assert!(out.reverify.is_empty());
+}

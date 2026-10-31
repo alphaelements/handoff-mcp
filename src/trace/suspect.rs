@@ -1,5 +1,5 @@
-//! Suspect derivation (wiki/260-vmodel-m2-design.md §3.2/§4.1, M2-05): the 3
-//! suspect kinds (`link`/`task`/`result`), the `unbaselined` links/tasks that
+//! Suspect derivation (wiki/260-vmodel-m2-design.md §3.2/§4.1, M2-05): the 4
+//! suspect kinds (`link`/`task`/`result`, plus `code` from wiki/430 §3.1), the `unbaselined` links/tasks that
 //! never got a suspect check in the first place (no baseline recorded yet),
 //! and the `reverify` item set — a pure function over an already-loaded
 //! [`TraceInput`] plus the `state` map [`super::engine::TraceGraph::build`]
@@ -34,8 +34,8 @@ pub struct SuspectDerivation {
     pub unbaselined_links: Vec<UnbaselinedLink>,
     pub unbaselined_tasks: Vec<UnbaselinedTask>,
     /// stable_ids of `state == Passing` verification items whose own result
-    /// is suspect, or one of whose `verifies` links is suspect (§3.2's
-    /// "再検証要 reverify" — FR-402).
+    /// is suspect, whose referenced code drifted (`code`), or one of whose
+    /// `verifies` links is suspect (§3.2's "再検証要 reverify" — FR-402).
     pub reverify: HashSet<String>,
 }
 
@@ -232,11 +232,37 @@ fn result_suspects(
     }
 }
 
+/// One `code` suspect per [`TraceInput::code_drift_items`] entry that
+/// resolves to an item (an id naming no item has nothing to attach to — a
+/// dangling/duplicate concern reported elsewhere). `baseline_hash`/
+/// `current_hash` are empty: the hashes live on the item's `CodeRef`s.
+fn code_suspects(
+    by_id: &HashMap<&str, &TraceItemInput>,
+    code_drift_items: &HashSet<String>,
+    suspects: &mut Vec<Suspect>,
+) {
+    for id in code_drift_items {
+        if !by_id.contains_key(id.as_str()) {
+            continue;
+        }
+        suspects.push(Suspect {
+            kind: SuspectKind::Code,
+            item: id.clone(),
+            upstream: None,
+            task: None,
+            link_type: None,
+            baseline_hash: String::new(),
+            current_hash: String::new(),
+        });
+    }
+}
+
 fn suspect_sort_key(s: &Suspect) -> (u8, &str, &str, &str) {
     let kind = match s.kind {
         SuspectKind::Link => 0,
         SuspectKind::Task => 1,
         SuspectKind::Result => 2,
+        SuspectKind::Code => 3,
     };
     (
         kind,
@@ -269,12 +295,18 @@ pub fn compute(input: &TraceInput, states: &HashMap<String, ItemState>) -> Suspe
         &input.runs_latest_hashes,
         &mut suspects,
     );
+    code_suspects(&by_id, &input.code_drift_items, &mut suspects);
 
     suspects.sort_by(|a, b| suspect_sort_key(a).cmp(&suspect_sort_key(b)));
 
     let result_suspect_items: HashSet<&str> = suspects
         .iter()
         .filter(|s| s.kind == SuspectKind::Result)
+        .map(|s| s.item.as_str())
+        .collect();
+    let code_suspect_items: HashSet<&str> = suspects
+        .iter()
+        .filter(|s| s.kind == SuspectKind::Code)
         .map(|s| s.item.as_str())
         .collect();
     let verifies_link_suspect_items: HashSet<&str> = suspects
@@ -288,6 +320,7 @@ pub fn compute(input: &TraceInput, states: &HashMap<String, ItemState>) -> Suspe
         .filter(|(id, state)| {
             **state == ItemState::Passing
                 && (result_suspect_items.contains(id.as_str())
+                    || code_suspect_items.contains(id.as_str())
                     || verifies_link_suspect_items.contains(id.as_str()))
         })
         .map(|(id, _)| id.clone())

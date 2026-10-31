@@ -468,6 +468,7 @@ pub fn sync_layer_items_with_options(
                 path: t.clone(),
                 lines: None,
                 label: None,
+                content_hash: None,
             })
             .collect();
         sub.body_hash = Some(parsed_item.body_hash.clone());
@@ -958,6 +959,7 @@ mod tests {
                 path: "src/lockout.rs".to_string(),
                 lines: None,
                 label: None,
+                content_hash: None,
             }];
         }
         let old_login_seq = doc

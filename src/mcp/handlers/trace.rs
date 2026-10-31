@@ -41,6 +41,7 @@ use super::docs::{
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::config::{push_config_warning, read_trace_config_lenient, TraceConfig};
+use crate::storage::docs::code_hash;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::layer_sync::PendingBaseline;
@@ -572,6 +573,10 @@ pub(super) fn load_trace_input_from_docs(
         &trace_config,
     );
     trace_input.task_status = task_status;
+    // wiki/430 §3.1: file hashing happens here, once, at load time — never in
+    // `trace_lint`/`trace_suspect` (D1), which only read this side channel.
+    trace_input.code_drift_items =
+        code_hash::collect_code_drift_items(code_hash::project_root(handoff), &docs);
     Ok(LoadedTrace {
         docs,
         tasks,
@@ -934,23 +939,31 @@ fn suspect_counts_json(graph: &TraceGraph) -> Value {
     let mut links = 0usize;
     let mut tasks = 0usize;
     let mut results = 0usize;
+    let mut code = 0usize;
     let mut items: HashSet<&str> = HashSet::new();
     for s in graph.suspects() {
         match s.kind {
             SuspectKind::Link => links += 1,
             SuspectKind::Task => tasks += 1,
             SuspectKind::Result => results += 1,
+            SuspectKind::Code => code += 1,
         }
         items.insert(s.item.as_str());
     }
     let unbaselined = graph.unbaselined_counts();
-    json!({
+    let mut counts = json!({
         "links": links,
         "tasks": tasks,
         "results": results,
         "items": items.len(),
         "unbaselined": unbaselined.links + unbaselined.tasks,
-    })
+    });
+    // Additive key (wiki/430 §3.1): emitted only when non-zero, so the report
+    // stays byte-identical for projects without code drift.
+    if code > 0 {
+        counts["code"] = json!(code);
+    }
+    counts
 }
 
 /// `tasks[]` (wiki/260 §3.4/§5.1, M2-07/t360.20.25): every task with at

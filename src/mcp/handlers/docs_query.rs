@@ -3984,11 +3984,13 @@ mod doc_req_list_tests {
                             path: "src/a.rs".to_string(),
                             lines: None,
                             label: None,
+                            content_hash: None,
                         }],
                         vec![CodeRef {
                             path: "tests/a.rs".to_string(),
                             lines: None,
                             label: None,
+                            content_hash: None,
                         }],
                     ),
                 ],
@@ -5054,6 +5056,7 @@ Some preamble text.
                         path: "src/board.rs".to_string(),
                         lines: None,
                         label: None,
+                        content_hash: None,
                     }],
                     ..Default::default()
                 }],
@@ -6505,6 +6508,7 @@ mod doc_req_impact_tests {
                 path: impl_ref_path.to_string(),
                 lines: None,
                 label: None,
+                content_hash: None,
             }],
             ..Default::default()
         };

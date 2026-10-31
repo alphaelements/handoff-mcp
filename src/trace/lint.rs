@@ -13,7 +13,7 @@ use crate::storage::docs::{DocMetadata, UnreadableDoc};
 
 use super::engine::TraceGraph;
 use super::tree::TreeKind;
-use super::types::{GapKind, ItemState, SuspectKind, TaskLinkRole, TraceInput};
+use super::types::{GapKind, ItemState, SuspectKind, TaskLinkRole, TraceInput, WaiverAxis};
 use crate::storage::docs::layer::LayerSide;
 
 /// Either a stable_id whose stored `SubItem.task_ids` disagrees with what
@@ -124,7 +124,15 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("suspect_link", Severity::Warning),
     ("suspect_task", Severity::Warning),
     ("stale_result", Severity::Warning),
+    // wiki/430 §3.1 (REQ-LAG-021, LINT-W031): a file named by an item's
+    // `impl_refs`/`test_refs` changed since its `content_hash` was recorded.
+    // Derived from `TraceInput::code_drift_items` via the `code` suspect.
+    ("code_drift", Severity::Warning),
     ("unbaselined", Severity::Info),
+    // wiki/430 §3.2 (REQ-LAG-007, LINT-W030): an item's effective profile
+    // `default_needs` requires a layer (basic_spec, system_test, ...) that
+    // has no refining/verifying item for it.
+    ("missing_profile_layer", Severity::Warning),
     ("waiver_on_na", Severity::Warning),
     ("unlabeled_acceptance", Severity::Warning),
     ("invalid_waiver", Severity::Warning),
@@ -342,6 +350,7 @@ fn suspect_kind_rule_id(kind: SuspectKind) -> &'static str {
         SuspectKind::Link => "suspect_link",
         SuspectKind::Task => "suspect_task",
         SuspectKind::Result => "stale_result",
+        SuspectKind::Code => "code_drift",
     }
 }
 
@@ -429,6 +438,9 @@ pub fn evaluate(
     // --- Requirement tree (SPEC-TREE-010) ---
     evaluate_tree_rules(graph, trace_input, ctx, config, &wants, &mut out);
 
+    // --- Profile layer coverage (wiki/430 §3.2) ---
+    evaluate_missing_profile_layer(graph, trace_input, ctx, config, &wants, &mut out);
+
     // --- Change (suspect/unbaselined) ---
     for s in graph.suspects() {
         let id = suspect_kind_rule_id(s.kind);
@@ -460,6 +472,11 @@ pub fn evaluate(
             ),
             SuspectKind::Result => format!(
                 "{}'s latest recorded pass is against a prior definition",
+                s.item
+            ),
+            SuspectKind::Code => format!(
+                "a file referenced by {}'s impl_refs/test_refs changed since its content_hash \
+                 was recorded",
                 s.item
             ),
         };
@@ -1142,6 +1159,133 @@ fn evaluate_tree_rules(
                     );
                 }
             }
+        }
+    }
+}
+
+/// The coverage requirement `item` carries and the label naming where it
+/// comes from: its own `needs` when declared (`[]` opts out), else the
+/// `default_needs` entry of its effective profile — the document's
+/// `trace_profile` override when there is one, else the project default.
+fn effective_profile_needs<'a>(
+    item: &'a super::types::TraceItemInput,
+    layer: &str,
+    trace_input: &'a TraceInput,
+) -> Option<(&'a [String], String)> {
+    if let Some(own) = &item.needs {
+        return Some((own.as_slice(), "the item's own needs".to_string()));
+    }
+    if let Some(over) = trace_input.doc_profile_overrides.get(&item.doc_id) {
+        let needs = over.default_needs.get(layer)?;
+        return Some((
+            needs.as_slice(),
+            format!("profile '{}' default_needs", over.name),
+        ));
+    }
+    let needs = trace_input.project_default_needs.get(layer)?;
+    let label = match &trace_input.project_default_profile_name {
+        Some(name) => format!("profile '{name}' default_needs"),
+        None => "project default_needs".to_string(),
+    };
+    Some((needs.as_slice(), label))
+}
+
+/// `missing_profile_layer` (wiki/430 §3.2, LINT-W030, REQ-LAG-007): per
+/// *item*, every layer its effective profile's `default_needs` requires must
+/// have at least one item behind it — a left-side layer needs an item that
+/// `refines` this one, a right-side layer needs an item that `verifies` it.
+///
+/// Scope notes:
+/// - `acceptance` is skipped: acceptance coverage (explicit, inline or
+///   implicit `#ACn` verifier) already has its own `unverified` /
+///   `missing_acceptance` rules, so this rule stays about the spec/test
+///   layers the profile adds.
+/// - A tree composite (has children) is judged by its leaves, the same way
+///   the `unrefined`/`unverified` gaps treat it; `waive-refine` /
+///   `waive-verify` skip the matching side, `derived` is irrelevant here.
+/// - An item outside its effective layer set (`layer_outside_profile`) is
+///   not checked.
+fn evaluate_missing_profile_layer(
+    graph: &TraceGraph,
+    trace_input: &TraceInput,
+    ctx: &LintContext<'_>,
+    config: &TraceLintConfig,
+    wants: &dyn Fn(&str) -> bool,
+    out: &mut Vec<LintFinding>,
+) {
+    const RULE: &str = "missing_profile_layer";
+    /// Verified through the acceptance machinery, see the doc comment.
+    const ACCEPTANCE_LAYER: &str = "acceptance";
+
+    let Some(severity) = effective_severity(RULE, wants, &config.rules) else {
+        return;
+    };
+    let layer_of: HashMap<&str, &str> = trace_input
+        .items
+        .iter()
+        .filter_map(|i| Some((i.stable_id.as_str(), i.layer.as_deref()?)))
+        .collect();
+
+    for item in &trace_input.items {
+        let Some(layer) = item.layer.as_deref() else {
+            continue;
+        };
+        if item.implicit_of.is_some()
+            || !graph.in_scope(&item.stable_id)
+            || graph.tree().is_branch(&item.stable_id)
+        {
+            continue;
+        }
+        let Some((needs, source)) = effective_profile_needs(item, layer, trace_input) else {
+            continue;
+        };
+        for required in needs {
+            if required == ACCEPTANCE_LAYER || required == layer {
+                continue;
+            }
+            let Some(def) = trace_input
+                .layer_registry
+                .iter()
+                .find(|l| l.id == *required)
+            else {
+                continue;
+            };
+            let (axis, waiver, children) = match def.side {
+                LayerSide::Left => (
+                    "refining",
+                    WaiverAxis::Refine,
+                    graph.refines_children(&item.stable_id),
+                ),
+                LayerSide::Right => (
+                    "verifying",
+                    WaiverAxis::Verify,
+                    graph.verified_by(&item.stable_id),
+                ),
+            };
+            if item.waived_axes.contains(&waiver) {
+                continue;
+            }
+            let satisfied = children
+                .iter()
+                .any(|c| layer_of.get(c.as_str()) == Some(&required.as_str()));
+            if satisfied {
+                continue;
+            }
+            out.push(LintFinding {
+                rule: RULE.to_string(),
+                severity,
+                item: Some(item.stable_id.clone()),
+                task: None,
+                doc: ctx
+                    .item_meta
+                    .get(&item.stable_id)
+                    .map(|m| m.doc_slug.clone()),
+                message: format!(
+                    "LINT-W030 {RULE}: {layer} '{id}' has no {axis} {required} item \
+                     ({source} requires {required} coverage)",
+                    id = item.stable_id
+                ),
+            });
         }
     }
 }

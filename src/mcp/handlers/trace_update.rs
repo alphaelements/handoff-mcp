@@ -77,6 +77,7 @@ use super::tree_guard::{
 };
 use super::HandlerContext;
 use crate::storage::config::{push_config_warning, read_trace_config_lenient};
+use crate::storage::docs::code_hash;
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_parse::{
     default_prefix_table, parse_layer_body, ExtAttrs, ParsedItem,
@@ -1718,8 +1719,13 @@ fn dropped_acceptance_warning(
 /// clear. Anything malformed is an error: the old behaviour skipped bad
 /// entries, so one typo could turn the whole list into `[]` and wipe the
 /// stored refs.
+///
+/// Every entry's `content_hash` is (re)derived from the referenced file below
+/// `project_root` (wiki/430 §3.1) — a caller-supplied value is ignored, and a
+/// file that does not exist leaves it `None`.
 fn parse_code_refs_arg(
     op_index: usize,
+    project_root: &Path,
     raw_op: &Value,
     key: &str,
     warnings: &mut Vec<String>,
@@ -1768,8 +1774,10 @@ fn parse_code_refs_arg(
             path,
             lines: optional_str("lines")?,
             label: optional_str("label")?,
+            content_hash: None,
         });
     }
+    code_hash::stamp_content_hashes(project_root, &mut refs);
     Ok(Some(refs))
 }
 
@@ -2133,7 +2141,13 @@ fn plan_one_op(
                     );
                 }
             }
-            let impl_refs = parse_code_refs_arg(op_index, raw_op, "impl_refs", warnings)?;
+            let impl_refs = parse_code_refs_arg(
+                op_index,
+                code_hash::project_root(handoff),
+                raw_op,
+                "impl_refs",
+                warnings,
+            )?;
             let priority = raw_op
                 .get("priority")
                 .and_then(|v| v.as_str())
@@ -2146,7 +2160,13 @@ fn plan_one_op(
                     );
                 }
             }
-            let test_refs = parse_code_refs_arg(op_index, raw_op, "test_refs", warnings)?;
+            let test_refs = parse_code_refs_arg(
+                op_index,
+                code_hash::project_root(handoff),
+                raw_op,
+                "test_refs",
+                warnings,
+            )?;
             let waive = parse_waive_update(op_index, raw_op)?;
 
             if dev_stage.is_none()
@@ -4272,6 +4292,109 @@ mod tests {
         let out = set_impl_refs(&c, Value::Null);
         assert!(out.get("failed").is_none(), "{out}");
         assert!(stored_impl_paths(&handoff).is_empty());
+    }
+
+    fn stored_impl_hashes(handoff: &std::path::Path) -> Vec<Option<String>> {
+        let doc = read_doc(handoff, "req-doc").unwrap().unwrap();
+        find_sub_item(&doc, "REQ-001")
+            .impl_refs
+            .iter()
+            .map(|r| r.content_hash.clone())
+            .collect()
+    }
+
+    fn lint_rule_items(c: &HandlerContext, rule: &str) -> Vec<String> {
+        let out: Value = serde_json::from_str(
+            &crate::mcp::handlers::trace_lint::handle_trace_lint(c, &json!({})).unwrap(),
+        )
+        .unwrap();
+        out["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["rule"] == rule)
+            .map(|f| f["item"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// REQ-LAG-020 AC1/AC2: `set` records the SHA-256 of an existing file and
+    /// leaves `None` (no error) for a missing one; a caller-supplied
+    /// `content_hash` is ignored.
+    #[test]
+    fn set_impl_refs_records_content_hash_of_existing_files_only() {
+        let (tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "abc").unwrap();
+
+        let out = set_impl_refs(
+            &c,
+            json!([
+                {"path": "src/a.rs", "content_hash": "forged"},
+                {"path": "src/missing.rs"},
+            ]),
+        );
+
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(
+            stored_impl_hashes(&handoff),
+            vec![
+                Some(
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string()
+                ),
+                None,
+            ]
+        );
+    }
+
+    /// REQ-LAG-021/022 through the real handlers: no drift right after
+    /// `set`, a `code_drift` lint warning and a `code` suspect once the file
+    /// changes, and drift cleared again by re-setting the refs.
+    #[test]
+    fn changed_referenced_file_surfaces_as_code_drift_lint_and_code_suspect() {
+        let (tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let file = tmp.path().join("src/a.rs");
+        std::fs::write(&file, "v1").unwrap();
+        set_impl_refs(&c, json!([{"path": "src/a.rs"}]));
+
+        assert!(lint_rule_items(&c, "code_drift").is_empty());
+
+        std::fs::write(&file, "v2").unwrap();
+        assert_eq!(lint_rule_items(&c, "code_drift"), vec!["REQ-001"]);
+        let suspects: Value = serde_json::from_str(
+            &crate::mcp::handlers::trace_suspect::handle_trace_suspect(
+                &c,
+                &json!({"action": "list", "kinds": ["code"]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let list = suspects["suspects"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "{suspects}");
+        assert_eq!(list[0]["kind"], "code");
+        assert_eq!(list[0]["item"], "REQ-001");
+
+        set_impl_refs(&c, json!([{"path": "src/a.rs"}]));
+        assert!(lint_rule_items(&c, "code_drift").is_empty());
+    }
+
+    /// REQ-LAG-021 AC2: a ref with no recorded hash (pre-feature data, or
+    /// its file was missing when set) never drifts, even once the file
+    /// appears or changes.
+    #[test]
+    fn ref_without_recorded_hash_does_not_report_code_drift() {
+        let (tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        set_impl_refs(&c, json!([{"path": "src/later.rs"}]));
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/later.rs"), "now exists").unwrap();
+
+        assert!(lint_rule_items(&c, "code_drift").is_empty());
     }
 
     #[test]
