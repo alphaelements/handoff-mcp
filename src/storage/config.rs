@@ -522,7 +522,7 @@ fn default_history_limit() -> u32 {
 /// 6-layer table (`storage::docs::layer::BUILTIN_LAYERS`) reads. Layer
 /// *parsing* is t360.5's concern — this struct only stores the config
 /// value, so it's independently testable and reviewable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceConfig {
     /// Layer ids considered "in use" (wiki/220 §2.1: "使用中の層"). Empty
     /// (the default, and TOML-omitted) means "not explicitly configured" —
@@ -549,14 +549,11 @@ pub struct TraceConfig {
     /// `profile` > auto).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// `[trace] done_guard` (wiki/260 §3.4): `"warn"` (default) | `"block"` |
-    /// `"off"`. Enforcement is M2-13's scope — this struct only stores the
-    /// setting.
-    #[serde(
-        default = "default_done_guard",
-        skip_serializing_if = "is_default_done_guard"
-    )]
-    pub done_guard: String,
+    /// `[trace] done_guard` (wiki/260 §3.4, wiki/430 §3.6): either the bare
+    /// mode string (`done_guard = "block"`) or a `[trace.done_guard]` table
+    /// that also carries the `check_*` switches. See [`DoneGuardConfig`].
+    #[serde(default, skip_serializing_if = "DoneGuardConfig::is_default")]
+    pub done_guard: DoneGuardConfig,
     /// `[trace.profiles.<name>]` project-defined profiles (wiki/260 §2.1).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub profiles: HashMap<String, TraceProfileConfig>,
@@ -665,12 +662,117 @@ pub const DEFAULT_PLAN_LAYER: &str = "detailed_spec";
 /// Accepted `[trace] done_guard` values.
 pub const DONE_GUARD_MODES: &[&str] = &["off", "warn", "block"];
 
-fn default_done_guard() -> String {
-    "warn".to_string()
+/// `[trace] done_guard` (wiki/260 §3.4, wiki/430 §3.6).
+///
+/// Two accepted TOML shapes:
+/// - `done_guard = "warn"` (legacy): the mode alone, every `check_*` on;
+/// - `[trace.done_guard]` table: `mode` (default `"warn"`) plus the
+///   `check_suspects` / `check_profile_layers` / `check_code_drift` switches
+///   (each default `true`).
+///
+/// `mode` is stored as written; readers fall back to `"warn"` for an
+/// unrecognized value (`resolve_done_guard`). Serialization emits the bare
+/// string whenever every switch is on, so legacy configs round-trip as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneGuardConfig {
+    /// `"warn"` (default) | `"block"` | `"off"`.
+    pub mode: String,
+    /// Outstanding task/link suspects count as blockers.
+    pub check_suspects: bool,
+    /// A layer the effective profile requires (`missing_profile_layer`) but
+    /// no item provides, for the task's linked items, counts as a blocker.
+    pub check_profile_layers: bool,
+    /// A changed `impl_refs`/`test_refs` file (`code_drift`) behind one of
+    /// the task's linked items counts as a blocker.
+    pub check_code_drift: bool,
 }
 
-fn is_default_done_guard(v: &str) -> bool {
-    v == "warn"
+impl Default for DoneGuardConfig {
+    fn default() -> Self {
+        DoneGuardConfig {
+            mode: "warn".to_string(),
+            check_suspects: true,
+            check_profile_layers: true,
+            check_code_drift: true,
+        }
+    }
+}
+
+impl DoneGuardConfig {
+    /// A config with only the `mode` set; every `check_*` on.
+    pub fn with_mode(mode: impl Into<String>) -> Self {
+        DoneGuardConfig {
+            mode: mode.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn all_checks_on(&self) -> bool {
+        self.check_suspects && self.check_profile_layers && self.check_code_drift
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_done_guard_mode() -> String {
+    DoneGuardConfig::default().mode
+}
+
+/// The `[trace.done_guard]` table shape. Unknown keys are rejected so a
+/// typo'd switch (`check_suspect`) fails loudly instead of silently staying on.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DoneGuardTable {
+    #[serde(default = "default_done_guard_mode")]
+    mode: String,
+    #[serde(default = "default_true")]
+    check_suspects: bool,
+    #[serde(default = "default_true")]
+    check_profile_layers: bool,
+    #[serde(default = "default_true")]
+    check_code_drift: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DoneGuardRepr {
+    Mode(String),
+    Table(DoneGuardTable),
+}
+
+impl<'de> Deserialize<'de> for DoneGuardConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match DoneGuardRepr::deserialize(deserializer)? {
+            DoneGuardRepr::Mode(mode) => DoneGuardConfig::with_mode(mode),
+            DoneGuardRepr::Table(t) => DoneGuardConfig {
+                mode: t.mode,
+                check_suspects: t.check_suspects,
+                check_profile_layers: t.check_profile_layers,
+                check_code_drift: t.check_code_drift,
+            },
+        })
+    }
+}
+
+impl Serialize for DoneGuardConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.all_checks_on() {
+            return serializer.serialize_str(&self.mode);
+        }
+        DoneGuardTable {
+            mode: self.mode.clone(),
+            check_suspects: self.check_suspects,
+            check_profile_layers: self.check_profile_layers,
+            check_code_drift: self.check_code_drift,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// One `[trace.profiles.<name>]` entry (wiki/260 §2.1's example: `extends`,
@@ -810,30 +912,13 @@ where
     )
 }
 
-impl Default for TraceConfig {
-    fn default() -> Self {
-        TraceConfig {
-            layers: Vec::new(),
-            id_prefixes: HashMap::new(),
-            layer: Vec::new(),
-            profile: None,
-            done_guard: default_done_guard(),
-            profiles: HashMap::new(),
-            lint: TraceLintConfig::default(),
-            auto_layer: false,
-            plan_default_layer: None,
-            requirement_gate: None,
-        }
-    }
-}
-
 impl TraceConfig {
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
             && self.id_prefixes.is_empty()
             && self.layer.is_empty()
             && self.profile.is_none()
-            && is_default_done_guard(&self.done_guard)
+            && self.done_guard.is_default()
             && self.profiles.is_empty()
             && self.lint.is_empty()
             && !self.auto_layer
@@ -1601,7 +1686,7 @@ skip_checks = ["completeness"]
 name = "test"
 "#,
         );
-        assert_eq!(cfg.trace.done_guard, "warn");
+        assert_eq!(cfg.trace.done_guard.mode, "warn");
         assert!(
             cfg.trace.is_empty(),
             "an all-default [trace] must stay 'empty' (no spurious diff, NFR-004)"
@@ -1700,7 +1785,64 @@ done_guard = "error"
         assert_eq!(cfg.trace.layer[0].id, "");
         assert_eq!(cfg.trace.layer[0].side, "left");
         // The rest of [trace] must not be discarded by the malformed entry.
-        assert_eq!(cfg.trace.done_guard, "error");
+        assert_eq!(cfg.trace.done_guard.mode, "error");
+    }
+
+    fn done_guard_of(toml_str: &str) -> DoneGuardConfig {
+        parse_config(&format!("[project]\nname = \"t\"\n{toml_str}"))
+            .trace
+            .done_guard
+    }
+
+    /// wiki/430 §3.6: the legacy string form keeps parsing, with every
+    /// `check_*` switched on.
+    #[test]
+    fn done_guard_string_form_enables_all_checks() {
+        let g = done_guard_of("[trace]\ndone_guard = \"block\"\n");
+        assert_eq!(g, DoneGuardConfig::with_mode("block"));
+        assert!(g.check_suspects && g.check_profile_layers && g.check_code_drift);
+    }
+
+    #[test]
+    fn done_guard_table_form_parses_and_defaults_missing_keys() {
+        let g = done_guard_of(
+            "[trace.done_guard]\nmode = \"block\"\ncheck_suspects = false\ncheck_code_drift = false\n",
+        );
+        assert_eq!(g.mode, "block");
+        assert!(!g.check_suspects);
+        assert!(g.check_profile_layers);
+        assert!(!g.check_code_drift);
+
+        // A table without `mode` keeps the default mode.
+        let g = done_guard_of("[trace.done_guard]\ncheck_profile_layers = false\n");
+        assert_eq!(g.mode, "warn");
+        assert!(!g.check_profile_layers && g.check_suspects);
+    }
+
+    #[test]
+    fn done_guard_table_rejects_unknown_keys() {
+        let r: Result<Config, _> =
+            toml::from_str("[project]\nname = \"t\"\n[trace.done_guard]\ncheck_suspect = false\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn done_guard_round_trips_in_both_shapes() {
+        for src in [
+            "[trace]\ndone_guard = \"block\"\n",
+            "[trace.done_guard]\nmode = \"block\"\ncheck_suspects = false\ncheck_profile_layers = true\ncheck_code_drift = true\n",
+        ] {
+            let cfg = parse_config(&format!("[project]\nname = \"t\"\n{src}"));
+            let back = parse_config(&render_config(&cfg).unwrap());
+            assert_eq!(back.trace.done_guard, cfg.trace.done_guard, "{src}");
+        }
+        // All checks on -> the legacy bare string; default -> omitted.
+        let cfg = parse_config("[project]\nname = \"t\"\n[trace]\ndone_guard = \"block\"\n");
+        assert!(render_config(&cfg)
+            .unwrap()
+            .contains("done_guard = \"block\""));
+        let cfg = parse_config("[project]\nname = \"t\"\n");
+        assert!(!render_config(&cfg).unwrap().contains("done_guard"));
     }
 
     #[test]
@@ -1721,7 +1863,7 @@ implicit_acceptance = false
 "#,
         );
         assert_eq!(cfg.trace.profile.as_deref(), Some("web"));
-        assert_eq!(cfg.trace.done_guard, "block");
+        assert_eq!(cfg.trace.done_guard.mode, "block");
         let web = cfg.trace.profiles.get("web").unwrap();
         assert_eq!(web.extends.as_deref(), Some("standard"));
         assert_eq!(web.layers.len(), 4);

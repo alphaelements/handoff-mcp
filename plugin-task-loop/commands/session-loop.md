@@ -402,10 +402,11 @@ The workflow returns:
 |---|---|---|
 | `passed` | boolean | `true` = converged or `max_rounds` reached (remainder → `pending_followups`). `false` = developer crashed with no report |
 | `profile` | string | resolved profile |
-| `stages_run` | object | `{ implement, test, integrate, review, reconcile }` |
+| `stages_run` | object | `{ specPrep, implement, test, integrate, review, reconcile }` |
 | `dev_reports` | (string\|null)[] | `null` = developer crashed |
 | `integration_report` | object\|null | `{ verdict, findings[], report }`. `null` under `express` or crash |
 | `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran |
+| `spec_prep_report` | object\|null | Stage 0 (Spec-Prep, `standard`/`full`) result: `{ specs_generated[], scaffolds_created[], low_confidence_items[], checker_result{ verdict, issues[] }, error? }`. Low-confidence items, a failing checker, or a crash are added to `warnings` (never fails the session). `null` under `express` |
 | `spec_reconcile_report` | object\|null | Stage 3.5 (Spec-Reconcile, `standard`/`full`) result: `{ mode: audit\|apply, reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[], error? }`. Each `contract_ambiguity` is also appended to `pending_followups` (source `spec-reconciler`) and each `verification_impact` to `warnings`. `null` under `express` or when `passed: false` |
 | `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
 | `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |

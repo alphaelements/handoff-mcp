@@ -158,6 +158,32 @@ fn valid_done_guard_values_are_accepted() {
 }
 
 #[test]
+fn done_guard_check_switches_are_accepted_and_validated() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({
+            "trace.done_guard.mode": "block",
+            "trace.done_guard.check_suspects": false,
+        }),
+    );
+    assert!(!is_error(&resp), "{}", text(&resp));
+    let cfg = config_text(&pd);
+    assert!(cfg.contains("[trace.done_guard]"), "{cfg}");
+    assert!(cfg.contains("check_suspects = false"), "{cfg}");
+    assert_rejected(
+        &pd,
+        json!({ "trace.done_guard.mode": "error" }),
+        "trace.done_guard",
+    );
+    assert_rejected(
+        &pd,
+        json!({ "trace.done_guard.check_code_drift": "nope" }),
+        "trace.done_guard",
+    );
+}
+
+#[test]
 fn invalid_value_in_mixed_batch_blocks_whole_update() {
     let (_d, pd) = setup();
     assert_rejected(

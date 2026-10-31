@@ -245,10 +245,10 @@ fn apply_single_update(
     let transitioning_to_guarded_status =
         (new_status == "review" || new_status == "done") && new_status != current_status;
     if transitioning_to_guarded_status && done_guard != "off" && !(done_guard == "block" && force) {
-        if let Some((_, view)) =
+        if let Some((_, findings)) =
             load_done_guard_block_check(handoff_dir, task_id, &data.task_links, None)?
         {
-            if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view.blockers) {
+            if let Some(blocker_msg) = done_guard_blocker_message(task_id, &findings) {
                 if done_guard == "block" {
                     anyhow::bail!(
                         "{blocker_msg} [trace] done_guard = \"block\" rejects this status \

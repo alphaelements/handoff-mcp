@@ -16,6 +16,7 @@ mod doc_export_task;
 pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
+mod done_guard;
 pub mod events;
 pub mod fork_session;
 pub mod get_session;

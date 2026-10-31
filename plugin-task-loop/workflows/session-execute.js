@@ -5,6 +5,7 @@ export const meta = {
   whenToUse:
     'Called by the session manager to execute one batch of tasks. Pass session design via args, including the pipeline `profile`.',
   phases: [
+    { title: 'Spec-Prep', detail: 'Generate missing basic_spec/system_test (standard/full only)' },
     { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
     { title: 'Test', detail: 'Single tester verifies entire scope: adversarial per-task + integration + E2E (standard, full)' },
     { title: 'Review', detail: 'Reviewer audits design and test quality (full only)' },
@@ -111,8 +112,8 @@ const {
  * turns a session costs — the dominant term in wall-clock latency.
  *
  *   express  — developer                                   (1 serial turn)
- *   standard — developer -> tester -> spec-reconcile       (3 serial turns)
- *   full     — developer -> tester -> reviewer -> spec-reconcile (4 serial turns)
+ *   standard — spec-prep -> developer -> tester -> spec-reconcile       (4 serial turns)
+ *   full     — spec-prep -> developer -> tester -> reviewer -> spec-reconcile (5 serial turns)
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -151,10 +152,15 @@ const DEFAULT_PROFILE = 'standard';
 // "mechanical and self-verifying" lane, and the developer handles any doc
 // touch-up inline. standard/full pay one more serial turn so a spec never
 // silently drifts from the code that closed it.
+//
+// `specPrep` (Stage 0, Spec-Prep) is the mirror image: before Implement it derives
+// the missing basic_spec (and, under full, detailed_spec) from each task's
+// requirement and scaffolds the verification layer, so developers implement
+// against a written contract. `express` skips it for the same reason.
 const PROFILE_STAGES = Object.freeze({
-  express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false }),
-  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true }),
-  full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true }),
+  express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false, specPrep: false }),
+  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true, specPrep: true }),
+  full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
 });
 
 /**
@@ -185,6 +191,7 @@ function profileStages(profile) {
     integrate: stages.integrate,
     review: stages.review,
     reconcile: stages.reconcile,
+    specPrep: stages.specPrep,
   };
 }
 
@@ -195,7 +202,8 @@ function profileStages(profile) {
  * E2E, wiring) in a single agent invocation alongside per-task adversarial
  * checks, so `test` and `integrate` together cost one serial turn — NOT two.
  * Under `full`, the reviewer runs after the tester, adding one more turn.
- * The spec-reconciler (Stage 3.5) is always its own serial turn.
+ * The spec-writer (Stage 0) and the spec-reconciler (Stage 3.5) are each always
+ * their own serial turn.
  *
  * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
  * `full` and silently misprice the profile.
@@ -203,6 +211,7 @@ function profileStages(profile) {
 function serialTurnsForProfile(profile) {
   const s = profileStages(profile);
   let turns = 0;
+  if (s.specPrep) turns += 1;
   if (s.implement) turns += 1;
   // test and integrate are handled by a single integration tester agent.
   if (s.test || s.integrate) turns += 1;
@@ -351,6 +360,10 @@ const CLOSER_EFFORT = 'medium';
 // needs more than transcription, but not Opus-grade design reasoning.
 const SPEC_RECONCILER_MODEL = 'sonnet';
 const SPEC_RECONCILER_EFFORT = 'high';
+// The spec-writer derives an external spec from a requirement and judges its own
+// confidence: same tier as the reconciler (judgement, not design-grade reasoning).
+const SPEC_WRITER_MODEL = 'sonnet';
+const SPEC_WRITER_EFFORT = 'high';
 const MAX_ROUNDS = resolveRoundBudget('max_rounds', max_rounds, 3);
 const INTEGRATION_EXPECTED = resolveIntegrationExpected(integration_expected);
 
@@ -435,6 +448,7 @@ const RESPONSE_LANGUAGE_INSTRUCTION = [
 const HAS_TEST_STAGE = STAGES.test || STAGES.integrate;
 const HAS_REVIEW_STAGE = STAGES.review;
 const HAS_RECONCILE_STAGE = STAGES.reconcile;
+const HAS_SPEC_PREP_STAGE = STAGES.specPrep;
 
 // ============================================================
 // Structured output schemas
@@ -695,6 +709,62 @@ const CLOSER_SCHEMA = {
     error: { type: 'string' },
   },
   required: ['tasks_processed'],
+};
+
+// The spec-writer's structured result (Stage 0). Mirrors the output schema in
+// agents/session-spec-writer.md.
+const SPEC_WRITER_SCHEMA = {
+  type: 'object',
+  properties: {
+    specs_generated: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          stable_id: { type: 'string' },
+          layer: { type: 'string', enum: ['basic_spec', 'detailed_spec'] },
+          refines: { type: 'string' },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          summary: { type: 'string' },
+        },
+        required: ['stable_id', 'layer'],
+      },
+    },
+    scaffolds_created: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          layer: { type: 'string', enum: ['system_test', 'unit_test'] },
+          stable_id: { type: 'string' },
+          verifies: { type: 'string' },
+        },
+        required: ['layer', 'stable_id'],
+      },
+    },
+    low_confidence_items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          stable_id: { type: 'string' },
+          reason: { type: 'string' },
+        },
+        required: ['stable_id'],
+      },
+    },
+    checker_result: {
+      type: 'object',
+      properties: {
+        verdict: { type: 'string', enum: ['PASS', 'FAIL'] },
+        issues: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['verdict'],
+    },
+    warnings: { type: 'array', items: { type: 'string' } },
+    report: { type: 'string' },
+  },
+  required: ['specs_generated', 'scaffolds_created', 'low_confidence_items', 'checker_result'],
 };
 
 // The spec-reconciler's structured result (Stage 3.5). Mirrors the output schema in
@@ -1582,6 +1652,7 @@ function buildDevPrompt(assignment, currentRound, maxRound, reworkSource) {
     assignment.extra_context
       ? `\n## Developer-specific context\n${assignment.extra_context}`
       : '',
+    renderSpecPrepForDeveloper(),
     ``,
     INJECTED_CONTEXT,
     ``,
@@ -1878,6 +1949,138 @@ function buildCloserPrompt() {
 }
 
 // ============================================================
+// Helper: spec-writer prompt + result handling (Stage 0)
+// ============================================================
+function buildSpecWriterPrompt() {
+  const full = PROFILE === 'full';
+  const taskBlocks = tasks
+    .map((t) => {
+      const linked = Array.isArray(t.requirement_ids) && t.requirement_ids.length > 0
+        ? JSON.stringify(t.requirement_ids)
+        : 'none pre-linked (use handoff_get_task links)';
+      return [
+        `### Task: ${t.id} — ${t.title}`,
+        `**done_criteria**: ${JSON.stringify(t.done_criteria)}`,
+        `**spec**: ${t.spec_path || 'none'}`,
+        `**requirement_ids**: ${linked}`,
+        `**Instructions**:`,
+        t.instructions || 'None',
+      ].join('\n');
+    })
+    .join('\n\n---\n\n');
+
+  return [
+    `You are a session-spec-writer. Prepare the specs for this session before implementation starts (Stage 0, Spec-Prep).`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
+    ``,
+    `## Session info`,
+    `- Session: ${session_id}`,
+    `- Branch: ${sessionContext.branch}`,
+    `- Tasks: ${tasks.map((t) => t.id).join(', ')}`,
+    `- profile: ${PROFILE}`,
+    ``,
+    `## Scope`,
+    full
+      ? `- Generate missing \`basic_spec\` and \`detailed_spec\` items, then scaffold \`system_test\` and \`unit_test\` (full profile).`
+      : `- Generate missing \`basic_spec\` items, then scaffold \`system_test\` (standard profile). Do not generate detailed_spec or unit_test.`,
+    ``,
+    `## Rules`,
+    `- Follow agents/session-spec-writer.md. Derive each basic_spec from the task's requirement and the`,
+    `  instructions below; every item carries \`refines: <REQ-xxx>\`.`,
+    `- Judge \`confidence\` (high/medium/low) per item. Keep a \`(要確認)\` marker on low items and list them in`,
+    `  \`low_confidence_items\`. Never invent requirements.`,
+    `- Idempotent: a requirement that already has a basic_spec is skipped, never overwritten.`,
+    `- Finish with the checker pass and report it as \`checker_result\` (PASS only if truly clean).`,
+    `- Do not edit source code. Do not call \`handoff_load_context\`.`,
+    `- Return the structured result: specs_generated[], scaffolds_created[], low_confidence_items[], checker_result.`,
+    ``,
+    `## Tasks`,
+    taskBlocks,
+    ``,
+    INJECTED_CONTEXT,
+  ].join('\n');
+}
+
+/**
+ * Fold a spec-writer result into the workflow's outputs. Never throws: a spec-writer
+ * problem must not block implementation, but it must never read as "specs are ready".
+ *
+ *  - crash / malformed result -> warning + report carrying `error`
+ *  - checker_result missing or not PASS -> warning (the specs are unverified)
+ *  - low_confidence_items -> one warning each (the human must confirm them)
+ */
+function foldSpecWriterResult(result) {
+  const warnings = [];
+  const arr = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x === 'object') : []);
+
+  if (result === null || result === undefined || typeof result !== 'object' || Array.isArray(result)) {
+    const report = {
+      error: 'spec-writer returned no structured result (crashed or skipped)',
+      specs_generated: [],
+      scaffolds_created: [],
+      low_confidence_items: [],
+      checker_result: null,
+    };
+    warnings.push(
+      `Spec-prep failed (${report.error}). Specs were NOT prepared — implementation proceeded without generated basic_spec/system_test.`,
+    );
+    return { report, warnings };
+  }
+
+  const checker = result.checker_result && typeof result.checker_result === 'object' ? result.checker_result : null;
+  const report = {
+    ...result,
+    specs_generated: arr(result.specs_generated),
+    scaffolds_created: arr(result.scaffolds_created),
+    low_confidence_items: arr(result.low_confidence_items),
+    checker_result: checker,
+  };
+
+  if (!checker || (checker.verdict !== 'PASS' && checker.verdict !== 'FAIL')) {
+    warnings.push('Spec-prep: the spec-writer returned no valid checker_result — generated specs are unverified.');
+  } else if (checker.verdict === 'FAIL') {
+    const issues = Array.isArray(checker.issues) && checker.issues.length > 0 ? checker.issues.join('; ') : '(no issues listed)';
+    warnings.push(`Spec-prep: checker FAILED the generated specs — review them before trusting: ${issues}`);
+  }
+  for (const item of report.low_confidence_items) {
+    warnings.push(
+      `Spec-prep: low-confidence spec ${item.stable_id || '(unnamed)'} (要確認): ${item.reason || '(no reason given)'}`,
+    );
+  }
+  if (Array.isArray(result.warnings)) {
+    warnings.push(...result.warnings.map((w) => `Spec-prep: ${w}`));
+  }
+  return { report, warnings };
+}
+
+/**
+ * The developer-facing digest of Stage 0: which specs and scaffolds now exist, and
+ * how far to trust them. Empty when the stage did not run or produced nothing.
+ */
+function renderSpecPrepForDeveloper() {
+  if (!specPrepReport || specPrepReport.error) return '';
+  const specs = specPrepReport.specs_generated.map(
+    (s) => `- ${s.stable_id} (${s.layer}${s.refines ? `, refines ${s.refines}` : ''}${s.confidence ? `, ${s.confidence}` : ''})`,
+  );
+  const scaffolds = specPrepReport.scaffolds_created.map(
+    (s) => `- ${s.stable_id} (${s.layer}${s.verifies ? `, verifies ${s.verifies}` : ''})`,
+  );
+  if (specs.length === 0 && scaffolds.length === 0) return '';
+  const checker = specPrepReport.checker_result;
+  const trust = checker && checker.verdict === 'PASS'
+    ? 'The spec checker passed these. Low-confidence items (要確認) still need confirming.'
+    : 'These specs are unverified (the spec checker did not pass them): treat them as a draft, and flag any contradiction with the requirement.';
+  return [
+    ``,
+    `## Spec-Prep (Stage 0) — specs generated for this session`,
+    trust,
+    ...(specs.length > 0 ? [`Specs:`, ...specs] : []),
+    ...(scaffolds.length > 0 ? [`Verification scaffolds:`, ...scaffolds] : []),
+  ].join('\n');
+}
+
+// ============================================================
 // Helper: spec-reconciler prompt + result handling (Stage 3.5)
 // ============================================================
 function buildSpecReconcilerPrompt(mode) {
@@ -1941,6 +2144,7 @@ function buildSpecReconcilerPrompt(mode) {
  *
  *  - contract_ambiguities -> follow-ups (the closer then keeps the named task in `review`)
  *  - verification_impacts -> manager warnings (right-hand docs may need re-verification)
+ *  - audit mode with non-empty trace_updates -> warning (audit is read-only)
  *  - crash / malformed result -> warning + report carrying `error`
  */
 function foldSpecReconcilerResult(result, mode) {
@@ -1986,6 +2190,11 @@ function foldSpecReconcilerResult(result, mode) {
   for (const v of report.verification_impacts) {
     warnings.push(
       `Spec-reconcile: ${v.stable_id}${v.layer ? ` (${v.layer})` : ''} may need re-verification: ${v.reason || '(no reason given)'}`,
+    );
+  }
+  if (report.mode === 'audit' && report.trace_updates.length > 0) {
+    warnings.push(
+      `Spec-reconcile: audit mode is read-only but the reconciler reported ${report.trace_updates.length} trace_updates — it may have written to specs/trace despite the audit restriction. Verify manually.`,
     );
   }
   if (Array.isArray(result.warnings)) {
@@ -2671,6 +2880,7 @@ const workflowT0 = _now();
 // ============================================================
 //
 // Architecture (v2):
+//   Stage 0 — Spec-Prep: once, before the loop (standard/full)
 //   Stage 1 — Implement: all developers in parallel
 //   Stage 2 — Test: single tester (adversarial per-task + integration + E2E)
 //   Stage 3 — Review: single reviewer (full profile only)
@@ -2678,6 +2888,52 @@ const workflowT0 = _now();
 //
 // On any stage failure, rework notes are extracted and the loop restarts at
 // stage 1. No nested loops — one flat loop with sequential stages.
+
+// ============================================================
+// STAGE 0 — SPEC-PREP (standard, full): derive missing specs before implementing
+// ============================================================
+// Runs once, ahead of the loop (rework rounds re-implement against the same
+// specs). A spec-writer failure never blocks the session; it is surfaced as a
+// warning and, via renderSpecPrepForDeveloper(), as an "unverified" caveat.
+let specPrepReport = null;
+let specPrepStageRan = false;
+const specPrepWarnings = [];
+if (HAS_SPEC_PREP_STAGE) {
+  phase('Spec-Prep');
+  log(`--- Spec-Prep | Session ${session_id} | profile ${PROFILE} ---`);
+  specPrepStageRan = true;
+
+  let specWriterResult = null;
+  try {
+    specWriterResult = await trackedAgent(
+      buildSpecWriterPrompt(),
+      {
+        label: 'spec-writer',
+        phase: 'Spec-Prep',
+        agentType: 'handoff-task-loop:session-spec-writer',
+        model: SPEC_WRITER_MODEL,
+        effort: SPEC_WRITER_EFFORT,
+        schema: SPEC_WRITER_SCHEMA,
+      },
+      { round: 0, stage: 'spec-prep', role: 'spec-writer', task_ids: TASK_IDS },
+    );
+  } catch (e) {
+    log(`Spec-writer error (non-fatal): ${e}`);
+  }
+
+  const folded = foldSpecWriterResult(specWriterResult);
+  specPrepReport = folded.report;
+  specPrepWarnings.push(...folded.warnings);
+  sessionLog.push({
+    round: 0,
+    phase: 'spec-prep',
+    specs: folded.report.specs_generated.length,
+    scaffolds: folded.report.scaffolds_created.length,
+    low_confidence: folded.report.low_confidence_items.length,
+    checker: folded.report.checker_result ? folded.report.checker_result.verdict || null : null,
+    error: folded.report.error || null,
+  });
+}
 
 let mainRound = 0;
 let sessionPassed = false;
@@ -2927,7 +3183,7 @@ if (sessionPassed && HAS_RECONCILE_STAGE) {
 // verification stages. It is surfaced as `warnings` so the manager can finish
 // the close-out by hand instead of silently skipping it.
 let closerResult = null;
-const closerWarnings = [...reconcileWarnings];
+const closerWarnings = [...specPrepWarnings, ...reconcileWarnings];
 if (sessionPassed && HAS_TEST_STAGE) {
   phase('Close');
   log(`--- Close | Session ${session_id} ---`);
@@ -2978,6 +3234,8 @@ return {
   session_id,
   profile: PROFILE,
   stages_run: {
+    // Stage 0, reported only when it actually executed.
+    specPrep: specPrepStageRan,
     implement: true,
     test: HAS_TEST_STAGE,
     integrate: HAS_TEST_STAGE,
@@ -2997,6 +3255,9 @@ return {
   test_reports: [],
   integration_report: integrationResult,
   review_report: reviewResult,
+  // Stage 0 result ({ specs_generated[], scaffolds_created[], low_confidence_items[],
+  // checker_result, error? }); null under express.
+  spec_prep_report: specPrepReport,
   // Stage 3.5 result ({ mode, reconciled[], contract_ambiguities[], trace_updates[],
   // verification_impacts[], error? }); null under express or when the session did not pass.
   spec_reconcile_report: specReconcileReport,

@@ -838,12 +838,40 @@ mod tests {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
 
+        /// `execve` fails with ETXTBSY (os error 26) while any process still holds
+        /// the file open for writing. Closing our own fd is not enough: a sibling
+        /// test thread may `fork()` between `create` and `close`, and the child
+        /// keeps a copy of the write fd until it reaches its own `exec`.
+        const ETXTBSY: i32 = 26;
+        const EXEC_READY_ATTEMPTS: u32 = 200;
+        /// Set only for the readiness probe; the script header exits before the
+        /// test body runs, so probing has no side effects.
+        const PROBE_ENV: &str = "FAKE_MMDC_PROBE";
+
         /// Writes an executable shell script emulating `mmdc -i IN -o OUT -q`.
         fn script(dir: &Path, body: &str) -> PathBuf {
             let path = dir.join("fake-mmdc");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            {
+                let mut f = std::fs::File::create(&path).unwrap();
+                let content = format!("#!/bin/sh\n[ -n \"${PROBE_ENV}\" ] && exit 0\n{body}\n");
+                std::io::Write::write_all(&mut f, content.as_bytes()).unwrap();
+                f.sync_all().unwrap();
+            }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
+            // Wait until no forked child still holds the write fd, so the real
+            // invocation under test cannot race.
+            for _ in 0..EXEC_READY_ATTEMPTS {
+                match std::process::Command::new(&path)
+                    .env(PROBE_ENV, "1")
+                    .output()
+                {
+                    Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => return path,
+                }
+            }
+            panic!("{} still busy (ETXTBSY) after waiting", path.display());
         }
 
         /// Succeeds unless the input contains `INVALID`; SVG embeds the source.

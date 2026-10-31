@@ -31,6 +31,13 @@ const DEFAULT_RECONCILER_RESULT = {
   verification_impacts: [],
 };
 
+const DEFAULT_SPEC_WRITER_RESULT = {
+  specs_generated: [],
+  scaffolds_created: [],
+  low_confidence_items: [],
+  checker_result: { verdict: 'PASS', issues: [] },
+};
+
 /**
  * Run session-execute.js with stubbed runtime globals.
  * Returns the workflow's return value plus the ordered list of agent labels.
@@ -49,6 +56,8 @@ async function runWorkflow(
     throwCloser = false,
     reconcilerResult = DEFAULT_RECONCILER_RESULT,
     crashReconciler = false,
+    specWriterResult = DEFAULT_SPEC_WRITER_RESULT,
+    crashSpecWriter = false,
     onAgentCall,
   } = {},
 ) {
@@ -82,6 +91,10 @@ async function runWorkflow(
       }
       if (opts.label === 'reviewer') {
         return { verdict: reviewVerdict, findings: [], report: 'review report' };
+      }
+      if (opts.label === 'spec-writer') {
+        if (crashSpecWriter) throw new Error('simulated spec-writer crash');
+        return specWriterResult;
       }
       if (opts.label === 'spec-reconciler') {
         if (crashReconciler) throw new Error('simulated reconciler crash');
@@ -160,6 +173,7 @@ async function runWorkflowStaged(argsObj, { onTester, onReview } = {}, { onDev }
         if (v === 'CRASH') throw new Error('simulated reviewer crash');
         return { verdict: v, findings: [], report: 'review report' };
       }
+      if (opts.label === 'spec-writer') return DEFAULT_SPEC_WRITER_RESULT;
       if (opts.label === 'spec-reconciler') return DEFAULT_RECONCILER_RESULT;
       if (opts.label === 'closer') return DEFAULT_CLOSER_RESULT;
       const dv = onDev ? onDev() : 'OK';
@@ -218,10 +232,11 @@ const twoTasks = () => ({
 /**
  * Serial agent turns the run actually cost.
  *
- * express=1, standard=3 (+spec-reconcile), full=4. Each stage is sequential.
+ * express=1, standard=4 (+spec-prep, +spec-reconcile), full=5. Each stage is sequential.
  */
 const serialTurns = (r) => {
   let turns = 0;
+  if (r.stages_run.specPrep) turns += 1;
   if (r.stages_run.implement) turns += 1;
   if (r.stages_run.test) turns += 1;
   if (r.stages_run.review) turns += 1;
@@ -364,30 +379,30 @@ test('express runs exactly one agent turn: the developer', async () => {
 
 test('standard runs developer then tester — no reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer']);
-  assert.equal(serialTurns(r), 3);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 4);
   assert.equal(r.passed, true);
   assert.equal(r.review_report, null);
 });
 
 test('full runs developer, tester, then reviewer — all sequential', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
-  assert.equal(serialTurns(r), 4);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 5);
   assert.equal(r.passed, true);
 });
 
 test('standard with two devs: both devs in parallel, then one tester', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
-  assert.equal(serialTurns(r), 3);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 4);
   assert.equal(r.passed, true);
 });
 
 test('full with two devs: both devs, then tester, then reviewer', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
-  assert.equal(serialTurns(r), 4);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 5);
   assert.equal(r.passed, true);
 });
 
@@ -397,7 +412,7 @@ test('full with two devs: both devs, then tester, then reviewer', async () => {
 test('omitting profile yields standard, NOT full', async () => {
   const r = await runWorkflow(baseArgs());
   assert.equal(r.profile, 'standard');
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
   assert.ok(!r.calls.includes('reviewer'), 'the reviewer must not run by default');
 });
 
@@ -443,7 +458,7 @@ test('standard: a failing tester retries up to max_rounds, then files a follow-u
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2, 'must exhaust max_rounds');
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
   assert.ok(r.pending_followups.length > 0);
 });
 
@@ -487,7 +502,7 @@ test('full: REQUEST_CHANGES triggers rework loop through all 3 stages', async ()
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findings become follow-ups', async () => {
@@ -505,17 +520,17 @@ test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findin
 
 test('stages_run is reported so the manager knows the depth that ran', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
-  assert.deepEqual(r.stages_run, { implement: true, test: false, integrate: false, review: false, reconcile: false });
+  assert.deepEqual(r.stages_run, { specPrep: false, implement: true, test: false, integrate: false, review: false, reconcile: false });
 });
 
 test('standard stages_run', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: false, reconcile: true });
+  assert.deepEqual(r.stages_run, { specPrep: true, implement: true, test: true, integrate: true, review: false, reconcile: true });
 });
 
 test('full stages_run', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: true, reconcile: true });
+  assert.deepEqual(r.stages_run, { specPrep: true, implement: true, test: true, integrate: true, review: true, reconcile: true });
 });
 
 // ============================================================
@@ -1021,7 +1036,7 @@ test('full: reviewer and tester findings both reach the developer on rework', as
     },
   );
   assert.equal(r.passed, true);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 test('full: rework round includes rework notes in developer prompt', async () => {
@@ -1048,7 +1063,7 @@ test('tester FAIL round 1, PASS round 2, reviewer APPROVE → session passes', a
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 // ============================================================
@@ -1146,8 +1161,8 @@ test('express: stage_telemetry has one entry for each developer', async () => {
 
 test('standard: telemetry records developer + tester with correct metadata', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.equal(r.stage_telemetry.length, 4, 'developer, tester, spec-reconciler, closer');
-  const [dev, tester] = r.stage_telemetry;
+  assert.equal(r.stage_telemetry.length, 5, 'spec-writer, developer, tester, spec-reconciler, closer');
+  const [, dev, tester] = r.stage_telemetry;
   assert.equal(dev.stage, 'implement');
   assert.equal(dev.role, 'developer');
   assert.equal(tester.stage, 'test');
@@ -1158,10 +1173,10 @@ test('standard: telemetry records developer + tester with correct metadata', asy
 
 test('full: telemetry records developer + tester + reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.equal(r.stage_telemetry.length, 5);
+  assert.equal(r.stage_telemetry.length, 6);
   const stages = r.stage_telemetry.map((e) => e.stage);
-  assert.deepEqual(stages, ['implement', 'test', 'review', 'spec-reconcile', 'close']);
-  const reviewer = r.stage_telemetry[2];
+  assert.deepEqual(stages, ['spec-prep', 'implement', 'test', 'review', 'spec-reconcile', 'close']);
+  const reviewer = r.stage_telemetry[3];
   assert.equal(reviewer.role, 'reviewer');
   assert.equal(reviewer.model, 'opus');
   assert.equal(reviewer.verdict, 'APPROVE');
@@ -1170,10 +1185,11 @@ test('full: telemetry records developer + tester + reviewer', async () => {
 test('two devs: telemetry has sequential seq numbers', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
   const seqs = r.stage_telemetry.map((e) => e.seq);
-  assert.deepEqual(seqs, [0, 1, 2, 3, 4]);
-  assert.equal(r.stage_telemetry[0].label, 'dev:A');
-  assert.equal(r.stage_telemetry[1].label, 'dev:B');
-  assert.equal(r.stage_telemetry[2].label, 'tester');
+  assert.deepEqual(seqs, [0, 1, 2, 3, 4, 5]);
+  assert.equal(r.stage_telemetry[0].label, 'spec-writer');
+  assert.equal(r.stage_telemetry[1].label, 'dev:A');
+  assert.equal(r.stage_telemetry[2].label, 'dev:B');
+  assert.equal(r.stage_telemetry[3].label, 'tester');
 });
 
 test('rework rounds are reflected in telemetry round field', async () => {
@@ -1182,9 +1198,10 @@ test('rework rounds are reflected in telemetry round field', async () => {
     { ...baseArgs(), profile: 'full', max_rounds: 2 },
     { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
   );
-  assert.equal(r.stage_telemetry.length, 8);
+  assert.equal(r.stage_telemetry.length, 9);
   const rounds = r.stage_telemetry.map((e) => e.round);
-  assert.deepEqual(rounds, [1, 1, 1, 2, 2, 2, 2, 2]);
+  // Spec-Prep (Stage 0) precedes the loop, so it carries round 0.
+  assert.deepEqual(rounds, [0, 1, 1, 1, 2, 2, 2, 2, 2]);
 });
 
 test('a crashed developer is recorded with crashed: true', async () => {
@@ -1232,6 +1249,7 @@ test('telemetry agentType field matches the launched agent type', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
   const types = r.stage_telemetry.map((e) => e.agentType);
   assert.deepEqual(types, [
+    'handoff-task-loop:session-spec-writer',
     'handoff-task-loop:session-developer',
     'handoff-task-loop:session-integration-tester',
     'handoff-task-loop:session-reviewer',
@@ -1256,7 +1274,7 @@ test('rework only re-launches the developer owning the failed task', async () =>
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
   // Round 1: dev:A, dev:B, tester. Round 2: only dev:A (owns t1), tester.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
 });
 
 test('dev:B report is preserved from round 1 when only dev:A is reworked', async () => {
@@ -1285,7 +1303,7 @@ test('a "*" finding still re-launches ALL developers', async () => {
     },
   );
   // "*" applies rework_notes to all tasks, so all developers must be re-launched.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
 });
 
 test('no-findings tester FAIL still re-launches all developers (safety net)', async () => {
@@ -1294,7 +1312,7 @@ test('no-findings tester FAIL still re-launches all developers (safety net)', as
     { testerVerdict: 'FAIL', testerFindings: [] },
   );
   // Safety net: a FAIL with no attributed findings applies rework to all tasks.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
 });
 
 test('session_log.devs_launched tracks which developers ran each round', async () => {
@@ -1881,13 +1899,13 @@ const specDriftResult = (over = {}) => ({
 
 test('Stage 3.5: standard runs spec-reconciler between tester and closer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
   assert.equal(r.stages_run.reconcile, true);
 });
 
 test('Stage 3.5: full runs spec-reconciler after the reviewer and before the closer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 test('Stage 3.5: express skips spec-reconcile entirely', async () => {
@@ -2010,7 +2028,192 @@ test('Stage 3.5: unresolved follow-ups downgrade the reconciler to audit (read-o
   assert.doesNotMatch(promptFor(r, 'spec-reconciler'), /mode: apply/);
 });
 
+const AUDIT_ARGS = { ...baseArgs(), profile: 'standard', max_rounds: 1 };
+const AUDIT_TESTER = { testerVerdict: 'FAIL', testerFindings: [{ task_id: 't1', severity: 'MAJOR', problem: 'broken' }] };
+
+test('Stage 3.5: audit mode with non-empty trace_updates warns that the read-only contract was violated', async () => {
+  const r = await runWorkflow(AUDIT_ARGS, { ...AUDIT_TESTER, reconcilerResult: specDriftResult() });
+  assert.match(promptFor(r, 'spec-reconciler'), /mode: audit/);
+  assert.ok(
+    r.warnings.some((w) => /spec-reconcile/i.test(w) && /audit/i.test(w) && /trace_updates/.test(w)),
+    `expected an audit/trace_updates warning, got ${JSON.stringify(r.warnings)}`,
+  );
+});
+
+test('Stage 3.5: audit mode with empty trace_updates raises no audit warning', async () => {
+  const r = await runWorkflow(AUDIT_ARGS, {
+    ...AUDIT_TESTER,
+    reconcilerResult: specDriftResult({ trace_updates: [] }),
+  });
+  assert.match(promptFor(r, 'spec-reconciler'), /mode: audit/);
+  assert.ok(!r.warnings.some((w) => /trace_updates/.test(w)), JSON.stringify(r.warnings));
+});
+
+test('Stage 3.5: apply mode with non-empty trace_updates raises no audit warning', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult: specDriftResult() });
+  assert.ok(!r.warnings.some((w) => /trace_updates/.test(w)), JSON.stringify(r.warnings));
+});
+
 test('Stage 3.5: a non-object reconciler result is treated as a failure, not a clean pass', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult: 'plain text' });
   assert.ok(r.warnings.some((w) => /spec-reconcile/i.test(w)));
+});
+
+// ============================================================
+// Stage 0 — Spec-Prep (wiki/430 section 3.3)
+// ============================================================
+const specPrepResult = (over = {}) => ({
+  specs_generated: [
+    { stable_id: 'BS-010', layer: 'basic_spec', refines: 'REQ-LAG-010', confidence: 'high', summary: 'Retry interface' },
+  ],
+  scaffolds_created: [{ layer: 'system_test', stable_id: 'ST-010', verifies: 'BS-010' }],
+  low_confidence_items: [],
+  checker_result: { verdict: 'PASS', issues: [] },
+  ...over,
+});
+
+test('Stage 0: standard runs the spec-writer first, before any developer', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { specWriterResult: specPrepResult() });
+  assert.equal(r.calls[0], 'spec-writer');
+  assert.equal(r.calls[1], 'dev:A');
+  assert.equal(r.stages_run.specPrep, true);
+  assert.equal(r.spec_prep_report.specs_generated[0].stable_id, 'BS-010');
+  assert.equal(r.spec_prep_report.scaffolds_created[0].layer, 'system_test');
+});
+
+test('Stage 0: standard asks for basic_spec + system_test scaffold only', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const p = promptFor(r, 'spec-writer');
+  assert.match(p, /profile: standard/);
+  assert.match(p, /basic_spec/);
+  assert.match(p, /system_test/);
+  assert.match(p, /Do not generate detailed_spec or unit_test/);
+  assert.doesNotMatch(p, /full profile/);
+});
+
+test('Stage 0: full additionally asks for detailed_spec + unit_test scaffold', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.equal(r.calls[0], 'spec-writer');
+  const p = promptFor(r, 'spec-writer');
+  assert.match(p, /profile: full/);
+  assert.match(p, /basic_spec/);
+  assert.match(p, /detailed_spec/);
+  assert.match(p, /unit_test/);
+});
+
+test('Stage 0: express skips Spec-Prep entirely', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok(!r.calls.includes('spec-writer'));
+  assert.equal(r.stages_run.specPrep, false);
+  assert.equal(r.spec_prep_report, null);
+});
+
+test('Stage 0: the spec-writer is launched as the session-spec-writer agentType on Sonnet', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const o = optsFor(r, 'spec-writer');
+  assert.equal(o.agentType, 'handoff-task-loop:session-spec-writer');
+  assert.equal(o.model, 'sonnet');
+  assert.equal(o.phase, 'Spec-Prep');
+  assert.ok(o.schema && o.schema.properties.checker_result);
+});
+
+test('Stage 0: runs once, not again on rework rounds', async () => {
+  let n = 0;
+  const r = await runWorkflowStaged(
+    { ...baseArgs(), profile: 'standard' },
+    { onTester: () => (++n === 1 ? 'FAIL' : 'PASS') },
+  );
+  assert.equal(r.calls.filter((c) => c === 'spec-writer').length, 1);
+  assert.equal(r.calls[0], 'spec-writer');
+});
+
+test('Stage 0: the prompt carries the tasks, their instructions, and requirement ids', async () => {
+  const args = baseArgs();
+  args.tasks[0].instructions = 'raise the retry limit to 5';
+  args.tasks[0].requirement_ids = ['REQ-LAG-010'];
+  const r = await runWorkflow({ ...args, profile: 'standard' });
+  const p = promptFor(r, 'spec-writer');
+  assert.match(p, /t1/);
+  assert.match(p, /raise the retry limit to 5/);
+  assert.match(p, /REQ-LAG-010/);
+  assert.match(p, /refines/);
+  assert.match(p, /confidence/);
+});
+
+test('Stage 0: low_confidence_items are reported as warnings and in the report', async () => {
+  const low = [{ stable_id: 'BS-011', reason: 'requirement does not say what happens on timeout' }];
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { specWriterResult: specPrepResult({ low_confidence_items: low }) },
+  );
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.spec_prep_report.low_confidence_items, low);
+  assert.ok(
+    r.warnings.some((w) => /spec-prep/i.test(w) && /BS-011/.test(w) && /timeout/.test(w)),
+    `expected a low-confidence warning, got ${JSON.stringify(r.warnings)}`,
+  );
+});
+
+test('Stage 0: a failing checker is surfaced as a warning but does not fail the session', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      specWriterResult: specPrepResult({
+        checker_result: { verdict: 'FAIL', issues: ['BS-010 contradicts REQ-LAG-010'] },
+      }),
+    },
+  );
+  assert.equal(r.passed, true);
+  assert.equal(r.spec_prep_report.checker_result.verdict, 'FAIL');
+  assert.ok(
+    r.warnings.some((w) => /spec-prep/i.test(w) && /checker/i.test(w) && /contradicts REQ-LAG-010/.test(w)),
+    `expected a checker warning, got ${JSON.stringify(r.warnings)}`,
+  );
+  assert.ok(r.calls.includes('dev:A'), 'implementation still proceeds');
+});
+
+test('Stage 0: a failing checker tells the developers the generated specs are unverified', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { specWriterResult: specPrepResult({ checker_result: { verdict: 'FAIL', issues: ['bad'] } }) },
+  );
+  assert.match(promptFor(r, 'dev:A'), /Spec-Prep/);
+  assert.match(promptFor(r, 'dev:A'), /unverified/i);
+});
+
+test('Stage 0: generated spec ids are handed to the developers', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { specWriterResult: specPrepResult() });
+  const p = promptFor(r, 'dev:A');
+  assert.match(p, /BS-010/);
+  assert.match(p, /ST-010/);
+});
+
+test('Stage 0: a crashed spec-writer is non-fatal, warned, and implementation proceeds', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { crashSpecWriter: true });
+  assert.equal(r.passed, true);
+  assert.ok(r.calls.includes('dev:A'));
+  assert.ok(r.spec_prep_report.error);
+  assert.ok(r.warnings.some((w) => /spec-prep/i.test(w)), 'crash must be surfaced, not swallowed');
+});
+
+test('Stage 0: a malformed (non-object) spec-writer result is treated as a failure, not as success', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { specWriterResult: 'oops' });
+  assert.ok(r.spec_prep_report.error);
+  assert.ok(r.warnings.some((w) => /spec-prep/i.test(w)));
+});
+
+test('Stage 0: a result without checker_result is not treated as a verified pass', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { specWriterResult: { specs_generated: [], scaffolds_created: [], low_confidence_items: [] } },
+  );
+  assert.ok(r.warnings.some((w) => /spec-prep/i.test(w) && /checker/i.test(w)));
+});
+
+test('Stage 0: spec-prep telemetry is recorded as the first stage', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const e = r.stage_telemetry[0];
+  assert.equal(e.stage, 'spec-prep');
+  assert.equal(e.role, 'spec-writer');
+  assert.equal(e.model, 'sonnet');
 });

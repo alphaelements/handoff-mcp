@@ -101,6 +101,25 @@ fn ref_drifted(root: &Path, r: &CodeRef) -> bool {
 /// `impl_refs`/`test_refs` entry that drifted. Each distinct path is hashed
 /// once per call.
 pub fn collect_code_drift_items(root: &Path, docs: &[DocMetadata]) -> HashSet<String> {
+    collect_drift(root, docs, |_| true)
+}
+
+/// [`collect_code_drift_items`] restricted to the sub-items named in `ids` —
+/// only their referenced files are hashed (the done guard asks about one
+/// task's linked items, not the whole project).
+pub fn collect_code_drift_items_in(
+    root: &Path,
+    docs: &[DocMetadata],
+    ids: &HashSet<String>,
+) -> HashSet<String> {
+    collect_drift(root, docs, |id| ids.contains(id))
+}
+
+fn collect_drift(
+    root: &Path,
+    docs: &[DocMetadata],
+    wanted: impl Fn(&str) -> bool,
+) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut verdict: std::collections::HashMap<(&str, &str), bool> =
         std::collections::HashMap::new();
@@ -113,6 +132,9 @@ pub fn collect_code_drift_items(root: &Path, docs: &[DocMetadata]) -> HashSet<St
         let Some(id) = &sub.stable_id else {
             continue;
         };
+        if !wanted(id) {
+            continue;
+        }
         let drifted = sub
             .impl_refs
             .iter()

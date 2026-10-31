@@ -430,7 +430,7 @@ fn validate_trace_scalar_keys<'a>(
         match key {
             "trace.profile" => profile = true,
             "trace.layers" => layers = true,
-            "trace.done_guard" => done_guard = true,
+            k if k == "trace.done_guard" || k.starts_with("trace.done_guard.") => done_guard = true,
             _ => {}
         }
     }
@@ -449,10 +449,10 @@ fn validate_trace_scalar_keys<'a>(
         .map_err(|e| anyhow::anyhow!("invalid {}: {e}", touched.join(", ")))?;
     let trace = &config.trace;
 
-    if done_guard && !DONE_GUARD_MODES.contains(&trace.done_guard.as_str()) {
+    if done_guard && !DONE_GUARD_MODES.contains(&trace.done_guard.mode.as_str()) {
         anyhow::bail!(
             "invalid trace.done_guard '{}': expected one of {}",
-            trace.done_guard,
+            trace.done_guard.mode,
             DONE_GUARD_MODES.join("/")
         );
     }
