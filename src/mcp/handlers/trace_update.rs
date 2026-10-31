@@ -952,7 +952,7 @@ fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
 /// Every `attrs` key `upsert_item` understands (the `order@<parent>` /
 /// `condition@<parent>` families are matched by prefix in
 /// [`unknown_attr_keys`]).
-const KNOWN_ATTR_KEYS: [&str; 16] = [
+const KNOWN_ATTR_KEYS: [&str; 23] = [
     "layer",
     "refines",
     "verifies",
@@ -969,6 +969,13 @@ const KNOWN_ATTR_KEYS: [&str; 16] = [
     "waive-refine",
     "needs",
     "assignee",
+    "from",
+    "environment",
+    "milestone",
+    "mock",
+    "golden",
+    "viewport",
+    "capture_method",
 ];
 
 /// The `attrs` keys of an `upsert_item` op that nothing reads — they would be
@@ -1148,6 +1155,11 @@ fn build_render_attrs(
             from: item.ext_attrs.from.clone(),
             method: item.attrs.method.clone(),
             environment: item.ext_attrs.environment.clone(),
+            milestone: item.ext_attrs.milestone.clone(),
+            mock: item.ext_attrs.mock.clone(),
+            golden: item.ext_attrs.golden.clone(),
+            viewport: item.ext_attrs.viewport.clone(),
+            capture_method: item.ext_attrs.capture_method.clone(),
             test_refs: item.attrs.test_refs.clone(),
             rationale: item.ext_attrs.rationale.clone(),
             derived: item.ext_attrs.derived.clone(),
@@ -1190,6 +1202,27 @@ fn build_render_attrs(
         }
         if let Some(v) = attrs.get("method") {
             out.method = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("from") {
+            out.from = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("environment") {
+            out.environment = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("milestone") {
+            out.milestone = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("mock") {
+            out.mock = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("golden") {
+            out.golden = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("viewport") {
+            out.viewport = str_or_none(v);
+        }
+        if let Some(v) = attrs.get("capture_method") {
+            out.capture_method = str_or_none(v);
         }
         if let Some(v) = attrs.get("test") {
             out.test_refs = string_list(v);
@@ -3984,6 +4017,170 @@ mod tests {
         assert_eq!(sub.assignee, None);
         // An empty array is the explicit "no coverage needed" list.
         assert_eq!(sub.needs, Some(Vec::new()));
+    }
+
+    /// Overwrites `req-doc`'s body with one item (`REQ-010`) carrying the given
+    /// attribute bullet lines, through the real `doc_save` path.
+    fn seed_item_with_attr_lines(c: &HandlerContext, attr_lines: &str) {
+        let body = format!("# Requirements\n\n### REQ-010 Ten\n\n{attr_lines}\nStatement.\n");
+        handle_doc_save(c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+    }
+
+    fn rendered_body(handoff: &std::path::Path) -> String {
+        crate::storage::docs::read_doc_body(handoff, "req-doc")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_upsert_preserves_environment() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        seed_item_with_attr_lines(&c, "- environment: staging\n");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        assert_eq!(
+            find_sub_item(&doc, "REQ-010").environment.as_deref(),
+            Some("staging")
+        );
+
+        // An unrelated edit (title/priority) must keep `environment`.
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-010", json!({"priority": "P1"})),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-010");
+        assert_eq!(sub.environment.as_deref(), Some("staging"));
+        let body = rendered_body(&handoff);
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.trim().starts_with("- environment:"))
+                .count(),
+            1,
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn test_upsert_preserves_gui_ext_attrs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        seed_item_with_attr_lines(
+            &c,
+            "- milestone: m1\n- mock: mocks/a.html\n- golden: golden/a.png\n\
+             - viewport: 1280x800\n- capture_method: playwright\n",
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        assert_eq!(
+            find_sub_item(&doc, "REQ-010").milestone.as_deref(),
+            Some("m1")
+        );
+
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-010", json!({"priority": "P1"})),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-010");
+        assert_eq!(sub.milestone.as_deref(), Some("m1"));
+        assert_eq!(sub.mock.as_deref(), Some("mocks/a.html"));
+        assert_eq!(sub.golden.as_deref(), Some("golden/a.png"));
+        assert_eq!(sub.viewport.as_deref(), Some("1280x800"));
+        assert_eq!(sub.capture_method.as_deref(), Some("playwright"));
+        let body = rendered_body(&handoff);
+        for attr in [
+            "- milestone:",
+            "- mock:",
+            "- golden:",
+            "- viewport:",
+            "- capture_method:",
+        ] {
+            let count = body.lines().filter(|l| l.trim().starts_with(attr)).count();
+            assert_eq!(count, 1, "{attr} count in:\n{body}");
+        }
+    }
+
+    #[test]
+    fn test_upsert_overlay_gui_ext_attrs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        seed_item_with_attr_lines(&c, "- milestone: m1\n- mock: mocks/a.html\n");
+
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-010",
+                json!({
+                    "milestone": "m2",
+                    "mock": "",
+                    "golden": "golden/b.png",
+                    "viewport": "800x600",
+                    "capture_method": "manual",
+                }),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert!(
+            out.get("warnings").is_none_or(|w| w
+                .as_array()
+                .is_some_and(|a| a.iter().all(|x| !x.as_str().unwrap().contains("unknown")))),
+            "GUI attrs must be known keys: {out}"
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-010");
+        assert_eq!(sub.milestone.as_deref(), Some("m2"));
+        assert_eq!(sub.mock, None, "empty string clears");
+        assert_eq!(sub.golden.as_deref(), Some("golden/b.png"));
+        assert_eq!(sub.viewport.as_deref(), Some("800x600"));
+        assert_eq!(sub.capture_method.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn test_upsert_overlay_environment() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        seed_item_with_attr_lines(&c, "- environment: staging\n- from: REQ-001#AC1\n");
+
+        // Change environment and from.
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-010",
+                json!({"environment": "production", "from": "REQ-002#AC2"}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-010");
+        assert_eq!(sub.environment.as_deref(), Some("production"));
+        assert_eq!(sub.from.as_deref(), Some("REQ-002#AC2"));
+
+        // Set on an item that had none (new item), then clear.
+        run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-011", json!({"environment": "qa"})),
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        assert_eq!(
+            find_sub_item(&doc, "REQ-011").environment.as_deref(),
+            Some("qa")
+        );
+        run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-010", json!({"environment": ""})),
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-010");
+        assert_eq!(sub.environment, None);
+        assert_eq!(sub.from.as_deref(), Some("REQ-002#AC2"), "from untouched");
     }
 
     #[test]

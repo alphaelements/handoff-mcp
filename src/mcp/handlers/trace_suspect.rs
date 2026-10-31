@@ -389,6 +389,18 @@ fn select_suspects<'a>(
 }
 
 fn handle_clear(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    // `clear` has no preview mode: silently ignoring `dry_run=true` would
+    // write the audit file and the clears the caller asked to only preview.
+    if arguments
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "dry_run is not supported for action='clear'. Use action='list' to preview \
+             suspects, or action='baseline' with dry_run=true to preview baseline changes."
+        );
+    }
     let handoff = &ctx.handoff_dir;
 
     let targets_val = arguments

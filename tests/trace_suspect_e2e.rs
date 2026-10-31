@@ -276,6 +276,72 @@ fn suspects_spread_one_hop_then_deeper_after_the_middle_item_changes() {
     assert_eq!(st_suspect["upstream"], "SPEC-100", "{st_suspect}");
 }
 
+/// t422: `action=clear` has no preview mode, so a caller passing
+/// `dry_run=true` must be refused (not silently written) and pointed at
+/// `action=list`; nothing is written under `.handoff/trace/clears/`.
+#[test]
+fn clear_rejects_dry_run_and_points_at_list() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    build_v_project(&mut server, &dir);
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_suspect",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "action": "clear",
+            "targets": [{"upstream": "REQ-100"}],
+            "reason": "preview attempt",
+            "dry_run": true,
+        }),
+    );
+    assert!(is_error, "clear with dry_run=true must error: {text}");
+    assert!(text.contains("dry_run"), "{text}");
+    assert!(text.contains("action='list'"), "{text}");
+    assert!(
+        !dir.join(".handoff/trace/clears").exists()
+            || std::fs::read_dir(dir.join(".handoff/trace/clears"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "a rejected clear must not write an audit file"
+    );
+}
+
+/// t422: an explicit `dry_run=false` is not a preview request, so `clear`
+/// proceeds as usual.
+#[test]
+fn clear_with_dry_run_false_still_works() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let (req_doc_id, _spec_doc_id) = build_v_project(&mut server, &dir);
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": req_doc_id,
+            "body": "# Requirements\n\n### REQ-100 Account lockout\n\n\
+                - priority: P1\n\n\
+                Updated requirement statement text (round 2).\n",
+        }),
+    );
+    let clear = server.call(
+        "handoff_trace_suspect",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "action": "clear",
+            "targets": [{"upstream": "REQ-100"}],
+            "reason": "text-only change",
+            "dry_run": false,
+        }),
+    );
+    assert_eq!(clear["cleared"]["links"], 2, "{clear}");
+}
+
 /// Task suspects, and bulk clear by `{upstream}` (links) + `{task_id}`
 /// (task) in a single call — wiki/260 §4.1's "一括解除（upstream / layer）",
 /// audited in one `.handoff/trace/clears/<id>.json` file.

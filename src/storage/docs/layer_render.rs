@@ -57,6 +57,16 @@ pub struct ItemRenderAttrs {
     /// `- environment: <text>` (ISO 29119 test environment; scaffolded items
     /// start with a [`PLACEHOLDER`]-style `(TBD)` the author fills in).
     pub environment: Option<String>,
+    /// `- milestone: <name>` (REQ-MS-ITEM-001).
+    pub milestone: Option<String>,
+    /// `- mock: <path>` (REQ-GUI-REQ-001).
+    pub mock: Option<String>,
+    /// `- golden: <path>` (REQ-GUI-REQ-001).
+    pub golden: Option<String>,
+    /// `- viewport: <W>x<H>` (REQ-GUI-REQ-001).
+    pub viewport: Option<String>,
+    /// `- capture_method: <name>` (REQ-GUI-REQ-001).
+    pub capture_method: Option<String>,
     /// Raw `path::name` values, one `- test: <value>` line per entry.
     pub test_refs: Vec<String>,
     pub rationale: Option<String>,
@@ -129,6 +139,21 @@ pub fn render_attrs_block(attrs: &ItemRenderAttrs) -> String {
     }
     if let Some(environment) = &attrs.environment {
         out.push_str(&format!("- environment: {environment}\n"));
+    }
+    if let Some(milestone) = &attrs.milestone {
+        out.push_str(&format!("- milestone: {milestone}\n"));
+    }
+    if let Some(mock) = &attrs.mock {
+        out.push_str(&format!("- mock: {mock}\n"));
+    }
+    if let Some(golden) = &attrs.golden {
+        out.push_str(&format!("- golden: {golden}\n"));
+    }
+    if let Some(viewport) = &attrs.viewport {
+        out.push_str(&format!("- viewport: {viewport}\n"));
+    }
+    if let Some(capture_method) = &attrs.capture_method {
+        out.push_str(&format!("- capture_method: {capture_method}\n"));
     }
     for test in &attrs.test_refs {
         out.push_str(&format!("- test: {test}\n"));
@@ -290,6 +315,26 @@ mod tests {
         assert_eq!(
             render_attrs_block(&attrs),
             "- verifies: REQ-003\n- from: REQ-003#AC1\n- method: manual\n"
+        );
+    }
+
+    #[test]
+    fn render_attrs_block_emits_milestone_and_gui_attrs_after_environment() {
+        let attrs = ItemRenderAttrs {
+            environment: Some("staging".to_string()),
+            milestone: Some("m1".to_string()),
+            mock: Some("mocks/a.html".to_string()),
+            golden: Some("golden/a.png".to_string()),
+            viewport: Some("1280x800".to_string()),
+            capture_method: Some("playwright".to_string()),
+            test_refs: vec!["t.rs::a".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            render_attrs_block(&attrs),
+            "- environment: staging\n- milestone: m1\n- mock: mocks/a.html\n\
+             - golden: golden/a.png\n- viewport: 1280x800\n- capture_method: playwright\n\
+             - test: t.rs::a\n"
         );
     }
 

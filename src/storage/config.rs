@@ -115,6 +115,11 @@ pub struct Config {
     /// before this section existed parsing and re-serializing unchanged.
     #[serde(default, skip_serializing_if = "GuiConfig::is_empty")]
     pub gui: GuiConfig,
+    /// Test settings: `[test.environments]` (named test environments).
+    /// `serde(default)` + `skip_serializing_if` keep every config.toml written
+    /// before this section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "TestConfig::is_empty")]
+    pub test: TestConfig,
 }
 
 /// `[gui]` section (REQ-GUI-CFG-001). handoff-mcp only stores and exposes
@@ -136,6 +141,22 @@ pub struct GuiConfig {
 impl GuiConfig {
     pub fn is_empty(&self) -> bool {
         self.default_capture_method.is_none() && self.capture_methods.is_empty()
+    }
+}
+
+/// `[test]` section. handoff-mcp only stores these values (so a rewritten
+/// config.toml keeps them); consuming them is the job of skills and scripts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestConfig {
+    /// Named test environments (`[test.environments]`). A `BTreeMap` so a
+    /// rewritten config.toml lists them in a stable order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environments: BTreeMap<String, String>,
+}
+
+impl TestConfig {
+    pub fn is_empty(&self) -> bool {
+        self.environments.is_empty()
     }
 }
 
@@ -1077,6 +1098,7 @@ impl Config {
             worktree: WorktreeConfig::default(),
             trace: TraceConfig::default(),
             gui: GuiConfig::default(),
+            test: TestConfig::default(),
         }
     }
 }
@@ -2262,5 +2284,33 @@ pair = "usability_test"
         for field in ["work_start_hour", "work_end_hour", "max_parallel_tasks"] {
             assert!(!rendered.contains(field), "{rendered}");
         }
+    }
+
+    /// t424: `[test.environments]` is stored in `Config` and survives a
+    /// parse -> render -> re-parse round trip (write_config no longer drops it).
+    #[test]
+    fn test_config_preserves_test_environments() {
+        let cfg = parse_config(
+            "[project]\nname = \"test\"\n\n[test.environments]\n\
+             ci = \"cargo test\"\nlocal = \"cargo test --features bundled-typst\"\n",
+        );
+        assert_eq!(cfg.test.environments.len(), 2);
+        assert_eq!(cfg.test.environments["ci"], "cargo test");
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("[test.environments]"), "{rendered}");
+        let reparsed = parse_config(&rendered);
+        assert_eq!(reparsed.test, cfg.test);
+    }
+
+    /// t424: a config.toml with no `[test]` section parses to an empty
+    /// `TestConfig` and re-serializes without inventing one.
+    #[test]
+    fn test_config_without_test_section() {
+        let cfg = parse_config("[project]\nname = \"test\"\n");
+        assert!(cfg.test.is_empty());
+        assert_eq!(cfg.test, TestConfig::default());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(!rendered.contains("[test"), "{rendered}");
+        assert_eq!(parse_config(&rendered).test, cfg.test);
     }
 }
