@@ -50,6 +50,14 @@ export const meta = {
 //     // full     = developer -> tester -> reviewer             (3 serial turns)
 //     // An unrecognized value throws; it is never silently downgraded.
 //
+//   // --- Project trace tier (set by session-loop Step 2f) ---
+//   trace_profile?: 'minimal' | 'bugfix' | 'standard' | 'full',
+//     // minimal/bugfix = project needs no extra spec layers -> Stage 0 (Spec-Prep) is skipped
+//     // standard/full  = Stage 0 runs (if the pipeline `profile` has it) and the spec-writer
+//     //                  scopes its output to this tier (full also derives detailed_spec/unit_test)
+//     // omitted        = the pipeline `profile` alone decides (backward compatible)
+//     // An unrecognized value throws; it is never silently downgraded.
+//
 //   // --- Wiring expectation (session-level, not per-task) ---
 //   integration_expected?: boolean,  // default true
 //
@@ -90,6 +98,7 @@ const {
   reviewer_model,
   max_rounds,
   profile,
+  trace_profile,
   integration_expected,
   response_language,
   budgets,
@@ -334,6 +343,21 @@ function innerLoopSatisfied(profile, devResults, testResults, allTestsPassedFn) 
 const PROFILE = resolveProfile(profile);
 const STAGES = profileStages(PROFILE);
 
+// Project trace tier from session-loop Step 2f. null = unspecified: the pipeline
+// profile alone decides whether Stage 0 runs and how wide its scope is.
+const TRACE_PROFILES = ['minimal', 'bugfix', 'standard', 'full'];
+function resolveTraceProfile(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const key = typeof value === 'string' ? value.trim().toLowerCase() : value;
+  if (TRACE_PROFILES.includes(key)) return key;
+  throw new Error(
+    `session-execute: unknown trace_profile ${JSON.stringify(value)}. ` +
+      `Expected one of: ${TRACE_PROFILES.join(', ')} (or omit it).`,
+  );
+}
+const TRACE_PROFILE = resolveTraceProfile(trace_profile);
+const TRACE_NEEDS_SPECS = TRACE_PROFILE === 'standard' || TRACE_PROFILE === 'full';
+
 // v2: test_assignments is no longer required — the single integration tester
 // covers the entire scope. Override requiredArgsForProfile's demand.
 const REQUIRED_FIELDS = ['session_id', 'tasks', 'dev_assignments'];
@@ -448,7 +472,8 @@ const RESPONSE_LANGUAGE_INSTRUCTION = [
 const HAS_TEST_STAGE = STAGES.test || STAGES.integrate;
 const HAS_REVIEW_STAGE = STAGES.review;
 const HAS_RECONCILE_STAGE = STAGES.reconcile;
-const HAS_SPEC_PREP_STAGE = STAGES.specPrep;
+// minimal/bugfix trace tiers have no layers for Stage 0 to derive, so they switch it off.
+const HAS_SPEC_PREP_STAGE = STAGES.specPrep && TRACE_PROFILE !== 'minimal' && TRACE_PROFILE !== 'bugfix';
 
 // ============================================================
 // Structured output schemas
@@ -1952,7 +1977,8 @@ function buildCloserPrompt() {
 // Helper: spec-writer prompt + result handling (Stage 0)
 // ============================================================
 function buildSpecWriterPrompt() {
-  const full = PROFILE === 'full';
+  // The trace tier (when given) sets the scope; otherwise the pipeline profile does.
+  const full = (TRACE_PROFILE || PROFILE) === 'full';
   const taskBlocks = tasks
     .map((t) => {
       const linked = Array.isArray(t.requirement_ids) && t.requirement_ids.length > 0
@@ -1979,6 +2005,7 @@ function buildSpecWriterPrompt() {
     `- Branch: ${sessionContext.branch}`,
     `- Tasks: ${tasks.map((t) => t.id).join(', ')}`,
     `- profile: ${PROFILE}`,
+    ...(TRACE_PROFILE ? [`- trace_profile: ${TRACE_PROFILE}`] : []),
     ``,
     `## Scope`,
     full
@@ -2898,6 +2925,12 @@ const workflowT0 = _now();
 let specPrepReport = null;
 let specPrepStageRan = false;
 const specPrepWarnings = [];
+if (TRACE_NEEDS_SPECS && !STAGES.specPrep) {
+  specPrepWarnings.push(
+    `Spec-prep skipped: trace_profile ${TRACE_PROFILE} needs basic_spec/system_test, but the ${PROFILE} pipeline has no Spec-Prep stage. ` +
+      `Re-run under standard/full or generate the specs by hand.`,
+  );
+}
 if (HAS_SPEC_PREP_STAGE) {
   phase('Spec-Prep');
   log(`--- Spec-Prep | Session ${session_id} | profile ${PROFILE} ---`);
@@ -3233,6 +3266,7 @@ if (sessionPassed && HAS_TEST_STAGE) {
 return {
   session_id,
   profile: PROFILE,
+  trace_profile: TRACE_PROFILE,
   stages_run: {
     // Stage 0, reported only when it actually executed.
     specPrep: specPrepStageRan,

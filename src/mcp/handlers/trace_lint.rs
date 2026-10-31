@@ -25,6 +25,9 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::docs_query::{
+    find_affected_requirements, git_diff_changed_files_strict, normalize_req_impact_path,
+};
 use super::trace::{with_persisted_trace_report, NFR_COVERAGE_KEY};
 use super::trace_readonly::{dedup_preserve_order, load_trace_input_fully_read_only};
 use super::tree_guard::collect_item_tree_text;
@@ -170,10 +173,27 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
 }
 
+/// The rules `changed_only` runs when the caller names none (wiki/430 §3.6):
+/// the two checks a pre-commit / CI gate cares about.
+const CHANGED_ONLY_DEFAULT_RULES: [&str; 2] = ["code_drift", "missing_profile_layer"];
+
+/// `changed_only` (wiki/430 §3.6, REQ-LAG-005): `true` narrows the lint to
+/// the items whose `impl_refs` / `test_refs` name a file in `git diff HEAD
+/// --name-only`. Present but not a boolean is a usage error (a typo'd value
+/// must not silently lint the whole graph).
+fn parse_changed_only(arguments: &Value) -> Result<bool> {
+    match arguments.get("changed_only") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => anyhow::bail!("changed_only: must be a boolean, got {other}"),
+    }
+}
+
 fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
     let trace_config = load_trace_lint_config(handoff)?;
+    let changed_only = parse_changed_only(arguments)?;
 
     // t360.20.32 (M2-S8 reviewer): a `rules` array that is *present* but
     // yields zero ids is a usage error, not "no filter requested" — the CLI's
@@ -195,6 +215,12 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // keeps "key absent" (`None`, no filter) and "key present but wrong
     // type" (bail) distinguishable.
     let rules_filter: Option<HashSet<String>> = match arguments.get("rules") {
+        None if changed_only => Some(
+            CHANGED_ONLY_DEFAULT_RULES
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
+        ),
         None => None,
         Some(v) => {
             let arr = v
@@ -226,10 +252,14 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     }
 
+    // The gate rules default to warning severity, yet a gate that detects
+    // drift must fail: `changed_only` therefore defaults `fail_on` to
+    // "warning" (an explicit `fail_on` still wins).
+    let default_fail_on = if changed_only { "warning" } else { "error" };
     let fail_on = arguments
         .get("fail_on")
         .and_then(|v| v.as_str())
-        .unwrap_or("error");
+        .unwrap_or(default_fail_on);
     let fail_on_severity = match fail_on {
         "error" => Severity::Error,
         "warning" => Severity::Warning,
@@ -279,6 +309,29 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         rules_filter.as_ref(),
     );
 
+    let mut changed_files: Vec<String> = Vec::new();
+    if changed_only {
+        changed_files = git_diff_changed_files_strict(&ctx.project_dir)?;
+        let normalized: Vec<String> = changed_files
+            .iter()
+            .map(|f| normalize_req_impact_path(f))
+            .collect();
+        // Direct ref matches only: a `scope_path` match is indirect and would
+        // pull every item of a broad document into the gate. The helper labels
+        // an item with the match type of the FIRST changed file that hits any
+        // branch, so an earlier in-scope file would mask a later direct ref;
+        // query one file at a time and union the direct hits instead.
+        let in_scope: HashSet<String> = normalized
+            .iter()
+            .flat_map(|file| {
+                find_affected_requirements(&read_only.loaded.docs, std::slice::from_ref(file))
+            })
+            .filter(|a| a.match_type != "scope_path")
+            .map(|a| a.stable_id)
+            .collect();
+        findings.retain(|f| f.item.as_ref().is_some_and(|id| in_scope.contains(id)));
+    }
+
     let mut counts = json!({"error": 0, "warning": 0, "info": 0});
     for f in &findings {
         let key = severity_str(f.severity);
@@ -305,6 +358,13 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // warning.
     let mut warnings = read_only.warnings.clone();
     warnings.extend(read_only.loaded.config_warnings.clone());
+    if changed_only && changed_files.is_empty() {
+        warnings.push(
+            "changed_only: `git diff HEAD --name-only` reported no changed files — \
+             nothing was linted"
+                .to_string(),
+        );
+    }
     dedup_preserve_order(&mut warnings);
     if let Some(limit) = limit {
         if findings.len() > limit {
@@ -321,6 +381,10 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "exit_code": exit_code,
         "warnings": warnings,
     });
+    if changed_only {
+        out["changed_only"] = json!(true);
+        out["changed_files"] = json!(changed_files);
+    }
     if format == "text" {
         out["text"] = json!(render_text(&findings));
     }

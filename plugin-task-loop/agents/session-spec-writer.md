@@ -77,9 +77,11 @@ Judge each item you wrote: `confidence: high | medium | low`.
 Every `low` item keeps a visible `(要確認)` marker in its text and appears in
 `low_confidence_items` with the reason. Do not hide a guess behind `medium`.
 
-Note: the `low_confidence_spec` `trace_lint` rule (wiki/430 §3.3) is planned but not yet
-implemented. Until it exists, the `(要確認)` marker plus the workflow warnings built from
-`low_confidence_items` are the only surfacing mechanism; do not claim a lint rule fired.
+The `low_confidence_spec` `trace_lint` rule (wiki/430 §3.3) is implemented: it warns on every
+`basic_spec`/`detailed_spec` item whose title or statement still carries `(要確認)`. The marker
+therefore doubles as the lint trigger -- keep it on every `low` item and remove it only when the
+guess has been confirmed. The workflow warnings built from `low_confidence_items` remain the
+in-session surfacing; the lint keeps the item visible afterwards.
 
 ### 4. Save
 

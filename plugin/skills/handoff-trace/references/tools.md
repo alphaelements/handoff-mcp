@@ -176,6 +176,7 @@ handoff_trace_next(task_id?, layers?: [layer], assignee?, kinds?: [kind], limit?
 |---|---|---|---|
 | 1 | `fix_failing` | A verification item's state is failing or blocked | `handoff_trace_slice` (then fix, then record) |
 | 2 | `review_suspect` | An item has a suspect upstream link | `handoff_trace_impact` (then fix the body, or clear the suspect) |
+| 3 | `update_drifted_spec` | A left-side item's `impl_refs`/`test_refs` files changed since their recorded `content_hash` (the `code_drift` finding). Its right-side verifiers (and a drifted right-side item itself) are proposed as `rerun`. Sorts before `rerun`; proposal only, no task is created. When a task implementing the item is also linked to plan-document items, the action carries `plan_update_needed: [{doc_id, stable_id, current_dev_stage}]` | `handoff_trace_update` (dry-run `upsert_item` on the item's document to revise the spec; then a `set` op re-records the refs) |
 | 3 | `rerun` | A verifier needs reverification or has never run, and its verified target is `implemented` or later (for an inline item, its own `dev_stage`) | `handoff_trace_ingest` (`{format:"junit_xml"}`) |
 | 3 | `manual_pending` | An item with an assignee whose `method` is `manual`, `visual` or `review` is still `not_run` | `handoff_trace_record` (`results:[{item, result:"not_run"}]`; replace `not_run` with the real outcome) |
 | 4 | `write_verification` | A left-side item **with acceptance criteria** has uncovered or partial horizontal coverage (an item without criteria has nothing to scaffold and gets no action; `trace_lint` still reports it as `unverified`) | `handoff_trace_scaffold` into the pair layer's document (`{items:[id], target_doc}`), or `handoff_doc_save` to create that layer's first document |
@@ -253,6 +254,7 @@ Runs rule-based lint over the whole trace graph. It can also return LLM prompt t
 handoff_trace_lint(action?: "lint"|"quality_prompt"|"nfr_check"="lint",
                    rules?: [id], fail_on?: "error"|"warning"="error",
                    format?: "json"|"text"="json", limit?,      # action=lint
+                   changed_only?: bool=false,                   # action=lint
                    items?: [id], aspects?: [aspect])           # action=quality_prompt
                    items?: [id], review?: {category: status}   # action=nfr_check
 ```
@@ -266,7 +268,8 @@ handoff_trace_lint(action?: "lint"|"quality_prompt"|"nfr_check"="lint",
 
 - Evaluates the built-in rules together with the project's `[[trace.lint.require]]` policy rules. The full rule list, default severities and policy syntax are in `lint-rules.md`. Per-rule severity overrides (`[trace.lint.rules]`) are in `config.md`.
 - `rules`: limits evaluation to these rule or policy ids. An unknown id is an error.
-- `fail_on`: the severity that sets `exit_code` to 1.
+- `fail_on`: the severity that sets `exit_code` to 1 (default `error`; `warning` when `changed_only` is true).
+- `changed_only`: CLI `--changed-only`. Lints only items whose `impl_refs`/`test_refs` name a file in `git diff HEAD --name-only`; defaults `rules` to `code_drift` + `missing_profile_layer`. Adds `changed_only` and `changed_files` to the output. See `lint-rules.md` section 5 for the lefthook example.
 - `limit`: truncates `findings`. `counts` and `exit_code` still reflect every match.
 - `format="text"`: adds a rendered `text` field. The CLI prints this field.
 - Findings are sorted by severity (highest first), then rule id, then item in natural order.

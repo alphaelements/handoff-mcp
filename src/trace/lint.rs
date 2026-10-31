@@ -133,6 +133,10 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     // `default_needs` requires a layer (basic_spec, system_test, ...) that
     // has no refining/verifying item for it.
     ("missing_profile_layer", Severity::Warning),
+    // wiki/430 §3.3 (REQ-LAG-006): a basic_spec/detailed_spec item whose title
+    // or statement still carries the spec-writer's `(要確認)` low-confidence
+    // marker.
+    ("low_confidence_spec", Severity::Warning),
     ("waiver_on_na", Severity::Warning),
     ("unlabeled_acceptance", Severity::Warning),
     ("invalid_waiver", Severity::Warning),
@@ -440,6 +444,9 @@ pub fn evaluate(
 
     // --- Profile layer coverage (wiki/430 §3.2) ---
     evaluate_missing_profile_layer(graph, trace_input, ctx, config, &wants, &mut out);
+
+    // --- Low-confidence generated specs (wiki/430 §3.3) ---
+    evaluate_low_confidence_spec(trace_input, ctx, config, &wants, &mut out);
 
     // --- Change (suspect/unbaselined) ---
     for s in graph.suspects() {
@@ -1287,6 +1294,62 @@ fn evaluate_missing_profile_layer(
                 ),
             });
         }
+    }
+}
+
+/// The marker the spec-writer keeps on every item it had to guess
+/// (`agents/session-spec-writer.md`, confidence `low`).
+const LOW_CONFIDENCE_MARKER: &str = "(要確認)";
+
+/// Layers whose items the spec-writer generates and the marker applies to.
+const GENERATED_SPEC_LAYERS: [&str; 2] = ["basic_spec", "detailed_spec"];
+
+/// `low_confidence_spec` (wiki/430 §3.3, REQ-LAG-006): every `basic_spec` /
+/// `detailed_spec` item whose title (`ItemLintMeta::title`) or body statement
+/// (`ItemTreeText::statement`) contains [`LOW_CONFIDENCE_MARKER`] gets a
+/// finding, so a guessed spec stays visible until a human confirms it and
+/// removes the marker. An item with no recorded text simply has nothing to
+/// match.
+fn evaluate_low_confidence_spec(
+    trace_input: &TraceInput,
+    ctx: &LintContext<'_>,
+    config: &TraceLintConfig,
+    wants: &dyn Fn(&str) -> bool,
+    out: &mut Vec<LintFinding>,
+) {
+    const RULE: &str = "low_confidence_spec";
+
+    let Some(severity) = effective_severity(RULE, wants, &config.rules) else {
+        return;
+    };
+    for item in &trace_input.items {
+        let Some(layer) = item.layer.as_deref() else {
+            continue;
+        };
+        if !GENERATED_SPEC_LAYERS.contains(&layer) || item.implicit_of.is_some() {
+            continue;
+        }
+        let meta = ctx.item_meta.get(&item.stable_id);
+        let in_title = meta.is_some_and(|m| m.title.contains(LOW_CONFIDENCE_MARKER));
+        let in_statement = ctx
+            .tree_text
+            .get(&item.stable_id)
+            .is_some_and(|t| t.statement.contains(LOW_CONFIDENCE_MARKER));
+        if !(in_title || in_statement) {
+            continue;
+        }
+        out.push(LintFinding {
+            rule: RULE.to_string(),
+            severity,
+            item: Some(item.stable_id.clone()),
+            task: None,
+            doc: meta.map(|m| m.doc_slug.clone()),
+            message: format!(
+                "{RULE}: {layer} '{id}' still carries the {LOW_CONFIDENCE_MARKER} marker; \
+                 confirm the spec and remove the marker",
+                id = item.stable_id
+            ),
+        });
     }
 }
 

@@ -62,8 +62,9 @@ test('the body defines the confidence rule and the (要確認) marker', () => {
   assert.match(body, /confidence/);
   for (const level of ['high', 'medium', 'low']) assert.ok(body.includes(level), `confidence level ${level}`);
   assert.ok(body.includes('(要確認)'), 'low confidence items must carry the (要確認) marker');
-  assert.ok(body.includes('low_confidence_spec'), 'must name the planned lint rule');
-  assert.match(body, /planned but not yet\s+implemented/, 'must not claim the lint rule exists');
+  assert.ok(body.includes('low_confidence_spec'), 'must name the lint rule');
+  assert.ok(!/planned but not yet\s+implemented/.test(body), 'the lint rule is implemented; must not call it planned');
+  assert.match(body, /low_confidence_spec[^]*?is implemented/, 'must state the lint rule is implemented');
 });
 
 test('the body defines the checker pass and forbids inventing requirements', () => {

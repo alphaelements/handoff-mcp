@@ -2114,3 +2114,172 @@ fn code_drift_on_a_passing_verifier_flags_it_for_reverify_through_the_graph() {
         .iter()
         .any(|s| s.kind == crate::trace::types::SuspectKind::Code && s.item == "AT-001"));
 }
+
+// ---------------------------------------------------------------------------
+// low_confidence_spec (wiki/430 §3.3, REQ-LAG-006): a generated spec item that
+// still carries the `(要確認)` marker is surfaced as a warning.
+// ---------------------------------------------------------------------------
+
+fn lint_low_confidence(
+    items: Vec<TraceItemInput>,
+    statements: &[(&str, &str)],
+    titles: &[(&str, &str)],
+    rules_filter: Option<&HashSet<String>>,
+) -> Vec<LintFinding> {
+    let input = TraceInput {
+        items,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let tree_text: HashMap<String, ItemTreeText> = statements
+        .iter()
+        .map(|(id, s)| {
+            (
+                id.to_string(),
+                ItemTreeText {
+                    statement: s.to_string(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let item_meta: HashMap<String, ItemLintMeta> = titles
+        .iter()
+        .map(|(id, t)| {
+            (
+                id.to_string(),
+                ItemLintMeta {
+                    doc_slug: "spec-doc".to_string(),
+                    priority: None,
+                    approval: "draft".to_string(),
+                    title: t.to_string(),
+                },
+            )
+        })
+        .collect();
+    let ctx = LintContext {
+        item_meta: &item_meta,
+        tree_text: &tree_text,
+        ..empty_ctx()
+    };
+    let config = crate::storage::config::TraceLintConfig::default();
+    evaluate(&graph, &input, &ctx, &config, rules_filter)
+        .into_iter()
+        .filter(|f| f.rule == "low_confidence_spec")
+        .collect()
+}
+
+#[test]
+fn low_confidence_spec_warns_on_marker_in_basic_spec_statement() {
+    let found = lint_low_confidence(
+        vec![layered("BS-001", "basic_spec", &[], &[])],
+        &[("BS-001", "The export retries three times. (要確認)")],
+        &[("BS-001", "Export retry")],
+        None,
+    );
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].item.as_deref(), Some("BS-001"));
+    assert_eq!(found[0].doc.as_deref(), Some("spec-doc"));
+    assert!(
+        found[0].message.contains("low_confidence_spec"),
+        "{found:?}"
+    );
+    assert!(found[0].message.contains("(要確認)"), "{found:?}");
+}
+
+#[test]
+fn low_confidence_spec_warns_on_marker_in_detailed_spec_title() {
+    let found = lint_low_confidence(
+        vec![layered("DS-001", "detailed_spec", &[], &[])],
+        &[("DS-001", "Plain statement.")],
+        &[("DS-001", "Retry backoff (要確認)")],
+        None,
+    );
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].item.as_deref(), Some("DS-001"));
+}
+
+#[test]
+fn low_confidence_spec_is_quiet_without_the_marker() {
+    let found = lint_low_confidence(
+        vec![layered("BS-001", "basic_spec", &[], &[])],
+        &[("BS-001", "The export retries three times.")],
+        &[("BS-001", "Export retry")],
+        None,
+    );
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn low_confidence_spec_ignores_layers_other_than_basic_and_detailed_spec() {
+    let found = lint_low_confidence(
+        vec![
+            layered("REQ-001", "requirement", &[], &[]),
+            layered("ST-001", "system_test", &[], &[]),
+        ],
+        &[
+            ("REQ-001", "Open question (要確認)"),
+            ("ST-001", "Scaffold (要確認)"),
+        ],
+        &[],
+        None,
+    );
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn low_confidence_spec_can_be_selected_and_excluded_by_the_rules_filter() {
+    let items = || vec![layered("BS-001", "basic_spec", &[], &[])];
+    let statements = [("BS-001", "Guess (要確認)")];
+
+    let only: HashSet<String> = ["low_confidence_spec".to_string()].into_iter().collect();
+    assert_eq!(
+        lint_low_confidence(items(), &statements, &[], Some(&only)).len(),
+        1
+    );
+
+    let other: HashSet<String> = ["orphan".to_string()].into_iter().collect();
+    assert!(lint_low_confidence(items(), &statements, &[], Some(&other)).is_empty());
+}
+
+#[test]
+fn low_confidence_spec_severity_is_overridable_and_can_be_switched_off() {
+    let input = TraceInput {
+        items: vec![layered("BS-001", "basic_spec", &[], &[])],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let tree_text: HashMap<String, ItemTreeText> = [(
+        "BS-001".to_string(),
+        ItemTreeText {
+            statement: "Guess (要確認)".to_string(),
+            ..Default::default()
+        },
+    )]
+    .into_iter()
+    .collect();
+    let ctx = LintContext {
+        tree_text: &tree_text,
+        ..empty_ctx()
+    };
+    let mut config = crate::storage::config::TraceLintConfig::default();
+
+    config
+        .rules
+        .insert("low_confidence_spec".to_string(), "error".to_string());
+    let errored = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(errored
+        .iter()
+        .any(|f| f.rule == "low_confidence_spec" && f.severity == Severity::Error));
+
+    config
+        .rules
+        .insert("low_confidence_spec".to_string(), "off".to_string());
+    let off = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(!off.iter().any(|f| f.rule == "low_confidence_spec"));
+}

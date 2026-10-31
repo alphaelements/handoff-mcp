@@ -63,7 +63,7 @@ fn parse_kinds_filter(scope: &Value) -> Result<Vec<NextActionKind>> {
         let kind = parse_next_action_kind(s).ok_or_else(|| {
             anyhow::anyhow!(
                 "scope.kinds: unknown kind {s:?}; expected one of fix_failing, review_suspect, \
-                 rerun, manual_pending, write_verification, refine, create_task, fix_link, \
+                 update_drifted_spec, rerun, manual_pending, write_verification, refine, create_task, fix_link, \
                  baseline, relink_candidate"
             )
         })?;
@@ -221,6 +221,7 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
                     priority: sub.priority.clone(),
                     dev_stage: sub.dev_stage.clone(),
                     assignee: sub.assignee.clone(),
+                    ..Default::default()
                 });
             }
         }

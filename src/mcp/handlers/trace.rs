@@ -1368,6 +1368,7 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
                     priority: sub.priority.clone(),
                     dev_stage: sub.dev_stage.clone(),
                     assignee: sub.assignee.clone(),
+                    ..Default::default()
                 });
             }
         }

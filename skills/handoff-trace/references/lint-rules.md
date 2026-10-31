@@ -187,6 +187,35 @@ accepts these ids too.
 `handoff-mcp trace tree` also exits 2 on bad arguments; other subcommands use 0/1. The `2` exists so CI can tell
 "policy violated" apart from "lint could not run".
 
+### `--changed-only`: gate a commit on the files it touches
+
+`handoff-mcp trace lint --changed-only` (tool argument `changed_only: true`) lints only the items whose
+`impl_refs` / `test_refs` name a file in `git diff HEAD --name-only` (uncommitted changes against `HEAD`; paths
+are compared normalized, and a `scope_paths` match does not count). Unless you pass `--rules`, it runs just
+`code_drift` and `missing_profile_layer`, and `--fail-on` defaults to `warning`, so any such finding exits `1`
+even though both rules are warnings by default. The JSON adds `changed_only: true` and `changed_files: [...]`.
+With no changed files it reports no findings and a `warnings` entry, and exits `0`. If git itself fails (not a
+repository, no commit yet) the gate fails closed with exit `2`, so it never passes blind. A direct ref match on any
+changed file counts, even when another changed file only falls under the document's `scope_paths`.
+
+`code_drift` only fires for refs that recorded a `content_hash` (set through `trace_update` `set` or
+`doc_verify` `set_refs`). After a deliberate code change, re-run `set` for the item's `impl_refs` to accept the
+new hash and clear the finding.
+
+Example `lefthook.yml` (pre-commit; add `--project-dir .` if the hook does not run from the project root):
+
+```yaml
+pre-commit:
+  commands:
+    trace-lint-changed:
+      glob: "**/*.{rs,ts,js,py,go}"
+      run: handoff-mcp trace lint --changed-only --format text
+      fail_text: "A spec item tied to a changed file has drifted or lacks a required layer. Update the spec, or re-record impl_refs with trace_update set."
+```
+
+The same command works as a CI step: `handoff-mcp trace lint --changed-only --fail-on warning`. Note that lefthook
+runs before the commit exists, so `git diff HEAD` sees the working tree including the changes being committed.
+
 ## 6. `action="quality_prompt"`: LLM-judged quality
 
 Some quality checks need judgment that string matching cannot give. This

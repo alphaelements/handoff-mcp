@@ -287,6 +287,28 @@ intended implementation sequence. Use it as a tie-breaker for task priority.
    Mention the plan in the session plan shown to the user ("Roadmap: <plan doc id>, next
    items: ...").
 
+### 2f. Spec generation gate (if the trace profile requires additional layers)
+
+Projects on a `standard`/`full` trace profile need `basic_spec`/`system_test` (and under
+`full`, `detailed_spec`/`unit_test`) items behind each requirement. This gate decides whether
+the workflow's Stage 0 (Spec-Prep, `session-spec-writer`) has anything to generate.
+
+1. `handoff_get_config` -> read `[trace] profile`.
+2. **`minimal` / `bugfix` / unset -> skip this step entirely** (no `trace_profile` in `args`,
+   Stage 0 has nothing to derive; passing `minimal`/`bugfix` explicitly also switches Stage 0 off).
+3. **`standard` / `full`** -> `trace_lint(action="lint", rules=["missing_profile_layer"])`
+   and look for findings on the requirements of this session's tasks.
+   - Findings present -> set `trace_profile: '<standard|full>'` in the `session-execute` `args`
+     (Step 5). This is injected automatically, never asked of the user. `session-execute`
+     reads it: the spec-writer is told the tier (`full` also derives `detailed_spec`/`unit_test`).
+     Stage 0 only exists under pipeline `profile` `standard`/`full`: if Step 2b chose `express`
+     while gaps exist, raise it to `standard` and tell the user (otherwise the workflow returns a
+     `warnings` entry saying Stage 0 was not run).
+   - No findings -> still pass `trace_profile` (so the workflow and the spec-writer know the
+     project's tier); Stage 0 skips requirements that already have specs, so it is a cheap no-op.
+4. Mention the result in the session plan ("Spec gate: N requirements missing
+   basic_spec/system_test -> Stage 0 will generate them", or "Spec gate: skipped (minimal)").
+
 ### 3. Assign developers
 
 - Assign tasks so **file scopes don't conflict** between developers
@@ -356,6 +378,7 @@ Workflow({
     session_id: '<id>',
     profile: 'standard',        // express | standard | full
     integration_expected: true,  // see step 2c
+    trace_profile: 'standard',   // see step 2f (omit for minimal/bugfix)
     tasks: [
       {
         id: 't1+t2',

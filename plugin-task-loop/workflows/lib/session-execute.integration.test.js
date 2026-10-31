@@ -2217,3 +2217,47 @@ test('Stage 0: spec-prep telemetry is recorded as the first stage', async () => 
   assert.equal(e.role, 'spec-writer');
   assert.equal(e.model, 'sonnet');
 });
+
+// ============================================================
+// args.trace_profile (set by session-loop Step 2f) — the project's trace tier
+// ============================================================
+test('trace_profile minimal/bugfix skips Stage 0 even under a pipeline that has it', async () => {
+  for (const tp of ['minimal', 'bugfix']) {
+    const r = await runWorkflow({ ...baseArgs(), profile: 'standard', trace_profile: tp });
+    assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer'], tp);
+    assert.equal(r.stages_run.specPrep, false, tp);
+    assert.equal(r.spec_prep_report, null, tp);
+  }
+});
+
+test('trace_profile standard/full runs Stage 0 and tells the spec-writer the tier', async () => {
+  const std = await runWorkflow({ ...baseArgs(), profile: 'standard', trace_profile: 'standard' });
+  assert.equal(std.calls[0], 'spec-writer');
+  assert.match(promptFor(std, 'spec-writer'), /- trace_profile: standard/);
+  assert.match(promptFor(std, 'spec-writer'), /Do not generate detailed_spec or unit_test/);
+});
+
+test('trace_profile full widens the spec-writer scope even under the standard pipeline', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard', trace_profile: 'full' });
+  assert.match(promptFor(r, 'spec-writer'), /- trace_profile: full/);
+  assert.match(promptFor(r, 'spec-writer'), /detailed_spec` and scaffold|detailed_spec` items, then scaffold/);
+});
+
+test('trace_profile standard under express warns that Stage 0 was not run', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express', trace_profile: 'standard' });
+  assert.deepEqual(r.calls, ['dev:A']);
+  assert.ok(r.warnings.some((w) => /trace_profile standard.*express/.test(w)), JSON.stringify(r.warnings));
+});
+
+test('omitting trace_profile leaves Stage 0 to the pipeline profile (backward compatible)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.equal(r.calls[0], 'spec-writer');
+  assert.doesNotMatch(promptFor(r, 'spec-writer'), /trace_profile:/);
+});
+
+test('an unknown trace_profile throws instead of silently downgrading', async () => {
+  await assert.rejects(
+    () => runWorkflow({ ...baseArgs(), trace_profile: 'huge' }),
+    /unknown trace_profile "huge"/,
+  );
+});
