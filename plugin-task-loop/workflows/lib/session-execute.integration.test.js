@@ -24,6 +24,13 @@ const DEFAULT_CLOSER_RESULT = {
   tasks_processed: [{ task_id: 't1', status_set: 'done', criteria_checked: [0], trace_updated: false }],
 };
 
+const DEFAULT_RECONCILER_RESULT = {
+  reconciled: [],
+  contract_ambiguities: [],
+  trace_updates: [],
+  verification_impacts: [],
+};
+
 /**
  * Run session-execute.js with stubbed runtime globals.
  * Returns the workflow's return value plus the ordered list of agent labels.
@@ -40,6 +47,8 @@ async function runWorkflow(
     closerResult = DEFAULT_CLOSER_RESULT,
     crashCloser = false,
     throwCloser = false,
+    reconcilerResult = DEFAULT_RECONCILER_RESULT,
+    crashReconciler = false,
     onAgentCall,
   } = {},
 ) {
@@ -73,6 +82,10 @@ async function runWorkflow(
       }
       if (opts.label === 'reviewer') {
         return { verdict: reviewVerdict, findings: [], report: 'review report' };
+      }
+      if (opts.label === 'spec-reconciler') {
+        if (crashReconciler) throw new Error('simulated reconciler crash');
+        return reconcilerResult;
       }
       if (opts.label === 'closer') {
         if (crashCloser) throw new Error('simulated closer crash');
@@ -147,6 +160,7 @@ async function runWorkflowStaged(argsObj, { onTester, onReview } = {}, { onDev }
         if (v === 'CRASH') throw new Error('simulated reviewer crash');
         return { verdict: v, findings: [], report: 'review report' };
       }
+      if (opts.label === 'spec-reconciler') return DEFAULT_RECONCILER_RESULT;
       if (opts.label === 'closer') return DEFAULT_CLOSER_RESULT;
       const dv = onDev ? onDev() : 'OK';
       if (dv === 'CRASH') throw new Error('simulated developer crash');
@@ -204,13 +218,14 @@ const twoTasks = () => ({
 /**
  * Serial agent turns the run actually cost.
  *
- * In v2: express=1, standard=2, full=3. Each stage is sequential.
+ * express=1, standard=3 (+spec-reconcile), full=4. Each stage is sequential.
  */
 const serialTurns = (r) => {
   let turns = 0;
   if (r.stages_run.implement) turns += 1;
   if (r.stages_run.test) turns += 1;
   if (r.stages_run.review) turns += 1;
+  if (r.stages_run.reconcile) turns += 1;
   return turns;
 };
 
@@ -349,30 +364,30 @@ test('express runs exactly one agent turn: the developer', async () => {
 
 test('standard runs developer then tester — no reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'closer']);
-  assert.equal(serialTurns(r), 2);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 3);
   assert.equal(r.passed, true);
   assert.equal(r.review_report, null);
 });
 
 test('full runs developer, tester, then reviewer — all sequential', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'closer']);
-  assert.equal(serialTurns(r), 3);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 4);
   assert.equal(r.passed, true);
 });
 
 test('standard with two devs: both devs in parallel, then one tester', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'closer']);
-  assert.equal(serialTurns(r), 2);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 3);
   assert.equal(r.passed, true);
 });
 
 test('full with two devs: both devs, then tester, then reviewer', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'reviewer', 'closer']);
-  assert.equal(serialTurns(r), 3);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.equal(serialTurns(r), 4);
   assert.equal(r.passed, true);
 });
 
@@ -382,7 +397,7 @@ test('full with two devs: both devs, then tester, then reviewer', async () => {
 test('omitting profile yields standard, NOT full', async () => {
   const r = await runWorkflow(baseArgs());
   assert.equal(r.profile, 'standard');
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer']);
   assert.ok(!r.calls.includes('reviewer'), 'the reviewer must not run by default');
 });
 
@@ -428,7 +443,7 @@ test('standard: a failing tester retries up to max_rounds, then files a follow-u
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2, 'must exhaust max_rounds');
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
   assert.ok(r.pending_followups.length > 0);
 });
 
@@ -472,7 +487,7 @@ test('full: REQUEST_CHANGES triggers rework loop through all 3 stages', async ()
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findings become follow-ups', async () => {
@@ -490,17 +505,17 @@ test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findin
 
 test('stages_run is reported so the manager knows the depth that ran', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
-  assert.deepEqual(r.stages_run, { implement: true, test: false, integrate: false, review: false });
+  assert.deepEqual(r.stages_run, { implement: true, test: false, integrate: false, review: false, reconcile: false });
 });
 
 test('standard stages_run', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: false });
+  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: false, reconcile: true });
 });
 
 test('full stages_run', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: true });
+  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: true, reconcile: true });
 });
 
 // ============================================================
@@ -1006,7 +1021,7 @@ test('full: reviewer and tester findings both reach the developer on rework', as
     },
   );
   assert.equal(r.passed, true);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 test('full: rework round includes rework notes in developer prompt', async () => {
@@ -1033,7 +1048,7 @@ test('tester FAIL round 1, PASS round 2, reviewer APPROVE → session passes', a
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
 });
 
 // ============================================================
@@ -1131,7 +1146,7 @@ test('express: stage_telemetry has one entry for each developer', async () => {
 
 test('standard: telemetry records developer + tester with correct metadata', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.equal(r.stage_telemetry.length, 3, 'developer, tester, closer');
+  assert.equal(r.stage_telemetry.length, 4, 'developer, tester, spec-reconciler, closer');
   const [dev, tester] = r.stage_telemetry;
   assert.equal(dev.stage, 'implement');
   assert.equal(dev.role, 'developer');
@@ -1143,9 +1158,9 @@ test('standard: telemetry records developer + tester with correct metadata', asy
 
 test('full: telemetry records developer + tester + reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.equal(r.stage_telemetry.length, 4);
+  assert.equal(r.stage_telemetry.length, 5);
   const stages = r.stage_telemetry.map((e) => e.stage);
-  assert.deepEqual(stages, ['implement', 'test', 'review', 'close']);
+  assert.deepEqual(stages, ['implement', 'test', 'review', 'spec-reconcile', 'close']);
   const reviewer = r.stage_telemetry[2];
   assert.equal(reviewer.role, 'reviewer');
   assert.equal(reviewer.model, 'opus');
@@ -1155,7 +1170,7 @@ test('full: telemetry records developer + tester + reviewer', async () => {
 test('two devs: telemetry has sequential seq numbers', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
   const seqs = r.stage_telemetry.map((e) => e.seq);
-  assert.deepEqual(seqs, [0, 1, 2, 3]);
+  assert.deepEqual(seqs, [0, 1, 2, 3, 4]);
   assert.equal(r.stage_telemetry[0].label, 'dev:A');
   assert.equal(r.stage_telemetry[1].label, 'dev:B');
   assert.equal(r.stage_telemetry[2].label, 'tester');
@@ -1167,9 +1182,9 @@ test('rework rounds are reflected in telemetry round field', async () => {
     { ...baseArgs(), profile: 'full', max_rounds: 2 },
     { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
   );
-  assert.equal(r.stage_telemetry.length, 7);
+  assert.equal(r.stage_telemetry.length, 8);
   const rounds = r.stage_telemetry.map((e) => e.round);
-  assert.deepEqual(rounds, [1, 1, 1, 2, 2, 2, 2]);
+  assert.deepEqual(rounds, [1, 1, 1, 2, 2, 2, 2, 2]);
 });
 
 test('a crashed developer is recorded with crashed: true', async () => {
@@ -1220,6 +1235,7 @@ test('telemetry agentType field matches the launched agent type', async () => {
     'handoff-task-loop:session-developer',
     'handoff-task-loop:session-integration-tester',
     'handoff-task-loop:session-reviewer',
+    'handoff-task-loop:session-spec-reconciler',
     'handoff-task-loop:session-closer',
   ]);
 });
@@ -1240,7 +1256,7 @@ test('rework only re-launches the developer owning the failed task', async () =>
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
   // Round 1: dev:A, dev:B, tester. Round 2: only dev:A (owns t1), tester.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
 });
 
 test('dev:B report is preserved from round 1 when only dev:A is reworked', async () => {
@@ -1269,7 +1285,7 @@ test('a "*" finding still re-launches ALL developers', async () => {
     },
   );
   // "*" applies rework_notes to all tasks, so all developers must be re-launched.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
 });
 
 test('no-findings tester FAIL still re-launches all developers (safety net)', async () => {
@@ -1278,7 +1294,7 @@ test('no-findings tester FAIL still re-launches all developers (safety net)', as
     { testerVerdict: 'FAIL', testerFindings: [] },
   );
   // Safety net: a FAIL with no attributed findings applies rework to all tasks.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'closer']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
 });
 
 test('session_log.devs_launched tracks which developers ran each round', async () => {
@@ -1843,4 +1859,158 @@ test('a closer telemetry entry is recorded', async () => {
   const entry = r.stage_telemetry.find((e) => e.label === 'closer');
   assert.ok(entry);
   assert.equal(entry.stage, 'close');
+});
+
+// ============================================================
+// Stage 3.5 — Spec-Reconcile (wiki/430 section 3.4)
+// ============================================================
+const specDriftResult = (over = {}) => ({
+  reconciled: [
+    {
+      stable_id: 'REQ-001',
+      target: 'basic_spec',
+      change: 'Updated BS-001 to describe the new retry limit',
+      decision_basis: 'Task instructions: "raise retry limit to 5"',
+    },
+  ],
+  contract_ambiguities: [],
+  trace_updates: [{ stable_id: 'BS-001', op: 'set', result: 'suspect cleared' }],
+  verification_impacts: [],
+  ...over,
+});
+
+test('Stage 3.5: standard runs spec-reconciler between tester and closer', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.equal(r.stages_run.reconcile, true);
+});
+
+test('Stage 3.5: full runs spec-reconciler after the reviewer and before the closer', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+});
+
+test('Stage 3.5: express skips spec-reconcile entirely', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok(!r.calls.includes('spec-reconciler'));
+  assert.equal(r.stages_run.reconcile, false);
+  assert.equal(r.spec_reconcile_report, null);
+});
+
+test('Stage 3.5: the reconciler is launched as the session-spec-reconciler agentType on Sonnet', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const o = optsFor(r, 'spec-reconciler');
+  assert.equal(o.agentType, 'handoff-task-loop:session-spec-reconciler');
+  assert.equal(o.model, 'sonnet');
+  assert.ok(o.effort, 'effort must be explicit');
+  assert.ok(o.schema, 'structured output schema must be supplied');
+});
+
+test('Stage 3.5: a failed test round does not reconcile until the tests pass', async () => {
+  let n = 0;
+  const r = await runWorkflowStaged(
+    { ...baseArgs(), profile: 'standard', max_rounds: 3 },
+    { onTester: () => (++n === 1 ? 'FAIL' : 'PASS') },
+  );
+  assert.equal(r.calls.filter((c) => c === 'spec-reconciler').length, 1, 'reconcile once, after the passing round');
+  assert.deepEqual(r.calls.slice(-2), ['spec-reconciler', 'closer']);
+});
+
+test('Stage 3.5: drift reported against the code change is surfaced in spec_reconcile_report', async () => {
+  const reconcilerResult = specDriftResult({
+    verification_impacts: [
+      { stable_id: 'ST-001', layer: 'system_test', reason: 'retry limit changed; expected value in ST-001 is stale' },
+    ],
+  });
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult });
+  assert.equal(r.spec_reconcile_report.reconciled.length, 1);
+  assert.equal(r.spec_reconcile_report.reconciled[0].stable_id, 'REQ-001');
+  assert.equal(r.spec_reconcile_report.trace_updates[0].op, 'set');
+  assert.ok(
+    r.warnings.some((w) => w.includes('ST-001') && w.includes('system_test')),
+    'a right-hand-side verification impact must reach the manager as a warning',
+  );
+  assert.equal(r.passed, true);
+});
+
+test('Stage 3.5: contract_ambiguity becomes a pending follow-up naming its task', async () => {
+  const reconcilerResult = specDriftResult({
+    reconciled: [],
+    contract_ambiguities: [
+      {
+        task_id: 't1',
+        stable_id: 'BS-002',
+        location: 'src/retry.rs:40',
+        detail: 'Code caps retries at 5 but BS-002 says 3 and no task text justifies the change',
+      },
+    ],
+  });
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult });
+  const f = r.pending_followups.find((x) => x.source === 'spec-reconciler');
+  assert.ok(f, 'ambiguity must be filed as a follow-up, not silently justified');
+  assert.equal(f.task_id, 't1');
+  assert.equal(f.severity, 'MAJOR');
+  assert.equal(f.location, 'src/retry.rs:40');
+  assert.match(f.problem, /BS-002/);
+  assert.equal(r.passed, true, 'ambiguity does not fail the session');
+});
+
+test('Stage 3.5: an ambiguity reaches the closer prompt so the task is not marked done', async () => {
+  const reconcilerResult = specDriftResult({
+    contract_ambiguities: [{ task_id: 't1', detail: 'undocumented behavior change' }],
+  });
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult });
+  assert.match(promptFor(r, 'closer'), /spec-reconciler/);
+  assert.match(promptFor(r, 'closer'), /undocumented behavior change/);
+});
+
+test('Stage 3.5: an ambiguity naming an unknown task falls back to "*"', async () => {
+  const reconcilerResult = specDriftResult({
+    contract_ambiguities: [{ task_id: 'nope', detail: 'x' }, { detail: 'y' }],
+  });
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult });
+  const ids = r.pending_followups.filter((x) => x.source === 'spec-reconciler').map((x) => x.task_id);
+  assert.deepEqual(ids, ['*', '*']);
+});
+
+test('Stage 3.5: with no drift there are no follow-ups and no warnings', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.deepEqual(r.pending_followups, []);
+  assert.deepEqual(r.warnings, []);
+});
+
+test('Stage 3.5: a crashed reconciler is non-fatal, warned, and the closer still runs', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { crashReconciler: true });
+  assert.equal(r.passed, true);
+  assert.ok(r.calls.includes('closer'));
+  assert.ok(r.warnings.some((w) => /spec-reconcile/i.test(w)), 'crash must be surfaced, not swallowed');
+  assert.ok(r.spec_reconcile_report.error);
+});
+
+test('Stage 3.5: the reconciler prompt carries tasks, instructions, dev report, and the safety rule', async () => {
+  const args = baseArgs();
+  args.tasks[0].instructions = 'raise the retry limit to 5';
+  args.tasks[0].requirement_ids = ['REQ-001'];
+  const r = await runWorkflow({ ...args, profile: 'standard' });
+  const p = promptFor(r, 'spec-reconciler');
+  assert.match(p, /mode: apply/);
+  assert.match(p, /t1/);
+  assert.match(p, /raise the retry limit to 5/);
+  assert.match(p, /REQ-001/);
+  assert.match(p, /developer report/);
+  assert.match(p, /contract_ambiguity/);
+});
+
+test('Stage 3.5: unresolved follow-ups downgrade the reconciler to audit (read-only) mode', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard', max_rounds: 1 },
+    { testerVerdict: 'FAIL', testerFindings: [{ task_id: 't1', severity: 'MAJOR', problem: 'broken' }] },
+  );
+  assert.match(promptFor(r, 'spec-reconciler'), /mode: audit/);
+  assert.doesNotMatch(promptFor(r, 'spec-reconciler'), /mode: apply/);
+});
+
+test('Stage 3.5: a non-object reconciler result is treated as a failure, not a clean pass', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { reconcilerResult: 'plain text' });
+  assert.ok(r.warnings.some((w) => /spec-reconcile/i.test(w)));
 });

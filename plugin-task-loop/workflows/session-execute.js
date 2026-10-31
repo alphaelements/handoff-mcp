@@ -8,6 +8,7 @@ export const meta = {
     { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
     { title: 'Test', detail: 'Single tester verifies entire scope: adversarial per-task + integration + E2E (standard, full)' },
     { title: 'Review', detail: 'Reviewer audits design and test quality (full only)' },
+    { title: 'Spec-Reconcile', detail: 'Sync specs with implementation (standard/full only)' },
     { title: 'Close', detail: 'Closer agent checks off done_criteria, updates task status, runs trace_update, and applies plan updates (standard, full)' },
   ],
 };
@@ -110,8 +111,8 @@ const {
  * turns a session costs — the dominant term in wall-clock latency.
  *
  *   express  — developer                                   (1 serial turn)
- *   standard — developer -> tester -> integrate            (3 serial turns)
- *   full     — developer -> tester -> reviewer             (3 serial turns)
+ *   standard — developer -> tester -> spec-reconcile       (3 serial turns)
+ *   full     — developer -> tester -> reviewer -> spec-reconcile (4 serial turns)
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -143,10 +144,17 @@ const DEFAULT_PROFILE = 'standard';
 // `standard` does get one, and pays a serial turn for it (2 -> 3). That is the
 // deliberate trade: an unwired implementation is exactly what `standard` misses
 // today, because it has no reviewer to notice.
+//
+// `reconcile` (Stage 3.5, Spec-Reconcile) syncs the right-hand specs
+// (basic_spec / system_test) with what was implemented, between Review and
+// Close. `express` skips it for the same reason it skips integrate: it is the
+// "mechanical and self-verifying" lane, and the developer handles any doc
+// touch-up inline. standard/full pay one more serial turn so a spec never
+// silently drifts from the code that closed it.
 const PROFILE_STAGES = Object.freeze({
-  express: Object.freeze({ implement: true, test: false, integrate: false, review: false }),
-  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false }),
-  full: Object.freeze({ implement: true, test: true, integrate: true, review: true }),
+  express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false }),
+  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true }),
+  full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true }),
 });
 
 /**
@@ -176,6 +184,7 @@ function profileStages(profile) {
     test: stages.test,
     integrate: stages.integrate,
     review: stages.review,
+    reconcile: stages.reconcile,
   };
 }
 
@@ -186,6 +195,7 @@ function profileStages(profile) {
  * E2E, wiring) in a single agent invocation alongside per-task adversarial
  * checks, so `test` and `integrate` together cost one serial turn — NOT two.
  * Under `full`, the reviewer runs after the tester, adding one more turn.
+ * The spec-reconciler (Stage 3.5) is always its own serial turn.
  *
  * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
  * `full` and silently misprice the profile.
@@ -197,6 +207,7 @@ function serialTurnsForProfile(profile) {
   // test and integrate are handled by a single integration tester agent.
   if (s.test || s.integrate) turns += 1;
   if (s.review) turns += 1;
+  if (s.reconcile) turns += 1;
   return turns;
 }
 
@@ -336,6 +347,10 @@ const REVIEWER_MODEL = reviewer_model || 'opus';
 // The closer only transcribes reports into handoff state — no deep reasoning.
 const CLOSER_MODEL = 'sonnet';
 const CLOSER_EFFORT = 'medium';
+// The spec-reconciler judges whether a code/spec divergence is intended, which
+// needs more than transcription, but not Opus-grade design reasoning.
+const SPEC_RECONCILER_MODEL = 'sonnet';
+const SPEC_RECONCILER_EFFORT = 'high';
 const MAX_ROUNDS = resolveRoundBudget('max_rounds', max_rounds, 3);
 const INTEGRATION_EXPECTED = resolveIntegrationExpected(integration_expected);
 
@@ -419,6 +434,7 @@ const RESPONSE_LANGUAGE_INSTRUCTION = [
 // Whether the test stage runs (merges old test + integrate flags)
 const HAS_TEST_STAGE = STAGES.test || STAGES.integrate;
 const HAS_REVIEW_STAGE = STAGES.review;
+const HAS_RECONCILE_STAGE = STAGES.reconcile;
 
 // ============================================================
 // Structured output schemas
@@ -679,6 +695,69 @@ const CLOSER_SCHEMA = {
     error: { type: 'string' },
   },
   required: ['tasks_processed'],
+};
+
+// The spec-reconciler's structured result (Stage 3.5). Mirrors the output schema in
+// agents/session-spec-reconciler.md.
+const SPEC_RECONCILER_SCHEMA = {
+  type: 'object',
+  properties: {
+    mode: { type: 'string', enum: ['audit', 'apply'] },
+    reconciled: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          stable_id: { type: 'string' },
+          target: { type: 'string' },
+          change: { type: 'string' },
+          decision_basis: { type: 'string' },
+          applied: { type: 'boolean' },
+        },
+        required: ['stable_id', 'change', 'decision_basis'],
+      },
+    },
+    contract_ambiguities: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string' },
+          stable_id: { type: 'string' },
+          location: { type: 'string' },
+          detail: { type: 'string' },
+        },
+        required: ['detail'],
+      },
+    },
+    trace_updates: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          stable_id: { type: 'string' },
+          op: { type: 'string' },
+          result: { type: 'string' },
+        },
+        required: ['stable_id', 'op'],
+      },
+    },
+    verification_impacts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          stable_id: { type: 'string' },
+          layer: { type: 'string' },
+          reason: { type: 'string' },
+        },
+        required: ['stable_id', 'reason'],
+      },
+    },
+    warnings: { type: 'array', items: { type: 'string' } },
+    report: { type: 'string' },
+  },
+  required: ['reconciled', 'contract_ambiguities', 'trace_updates', 'verification_impacts'],
 };
 
 // ============================================================
@@ -1799,6 +1878,123 @@ function buildCloserPrompt() {
 }
 
 // ============================================================
+// Helper: spec-reconciler prompt + result handling (Stage 3.5)
+// ============================================================
+function buildSpecReconcilerPrompt(mode) {
+  const taskBlocks = tasks
+    .map((t) => {
+      const index = devResults.findIndex((_, i) => dev_assignments[i].tasks.includes(t.id));
+      const report = index >= 0 ? reportText(devResults[index]) : null;
+      const linked = Array.isArray(t.requirement_ids) && t.requirement_ids.length > 0
+        ? JSON.stringify(t.requirement_ids)
+        : 'none pre-linked';
+      return [
+        `### Task: ${t.id} — ${t.title}`,
+        `**done_criteria**: ${JSON.stringify(t.done_criteria)}`,
+        `**requirement_ids**: ${linked}`,
+        `**Instructions** (evidence of intended contract changes):`,
+        t.instructions || 'None',
+        `**Developer report**:`,
+        report || 'ERROR: No report returned',
+      ].join('\n');
+    })
+    .join('\n\n---\n\n');
+
+  const modeLine = mode === 'audit'
+    ? `mode: audit — READ-ONLY. The session ended with unresolved findings, so do not write specs for code that failed verification. Detect and report only.`
+    : `mode: apply — update specs for intended changes, then clear the suspects you resolved.`;
+
+  return [
+    `You are a session-spec-reconciler. Sync the specs with what this session implemented (Stage 3.5, before Close).`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
+    ``,
+    `## Session info`,
+    `- Session: ${session_id}`,
+    `- Branch: ${sessionContext.branch}`,
+    `- Tasks: ${tasks.map((t) => t.id).join(', ')}`,
+    `- Integration verdict: ${normalizeIntegrationVerdict(integrationResult)}`,
+    `- Pending follow-ups (unresolved findings):`,
+    renderPendingFollowupsForCloser(),
+    ``,
+    `## ${modeLine}`,
+    ``,
+    `## Rules`,
+    `- Follow agents/session-spec-reconciler.md: find drift with \`handoff_trace_lint(rules: ["code_drift"])\``,
+    `  and \`handoff_trace_suspect\`, compare basic_spec items with the code, and detect right-hand`,
+    `  impact (system_test / acceptance) as \`verification_impacts\`.`,
+    `- Update a spec only with evidence of an intended change in the task's requirement,`,
+    `  done_criteria, or instructions below. Code that contradicts a spec with no such evidence is`,
+    `  a \`contract_ambiguity\` (set \`task_id\`) — never justify it by describing what the code does.`,
+    `- Do not edit source code. Do not call \`handoff_load_context\`.`,
+    `- Return the structured result: reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[].`,
+    ``,
+    `## Tasks and developer reports`,
+    taskBlocks,
+  ].join('\n');
+}
+
+/**
+ * Fold a spec-reconciler result into the workflow's outputs. Never throws:
+ * a reconciler problem must not fail a session whose work already passed
+ * verification, but it must also never read as "specs are in sync".
+ *
+ *  - contract_ambiguities -> follow-ups (the closer then keeps the named task in `review`)
+ *  - verification_impacts -> manager warnings (right-hand docs may need re-verification)
+ *  - crash / malformed result -> warning + report carrying `error`
+ */
+function foldSpecReconcilerResult(result, mode) {
+  const warnings = [];
+  const followups = [];
+  const arr = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x === 'object') : []);
+
+  if (result === null || result === undefined || typeof result !== 'object') {
+    const report = {
+      mode,
+      error: 'spec-reconciler returned no structured result (crashed or skipped)',
+      reconciled: [],
+      contract_ambiguities: [],
+      trace_updates: [],
+      verification_impacts: [],
+    };
+    warnings.push(
+      `Spec-reconcile failed (${report.error}). Specs were NOT verified against the implementation — check drift manually (handoff_trace_lint rules=["code_drift"]).`,
+    );
+    return { report, warnings, followups };
+  }
+
+  const report = {
+    ...result,
+    mode: result.mode || mode,
+    reconciled: arr(result.reconciled),
+    contract_ambiguities: arr(result.contract_ambiguities),
+    trace_updates: arr(result.trace_updates),
+    verification_impacts: arr(result.verification_impacts),
+  };
+
+  for (const a of report.contract_ambiguities) {
+    const where = [a.stable_id, a.location].filter(Boolean).join(' @ ');
+    followups.push({
+      source: 'spec-reconciler',
+      crashed: false,
+      task_id: typeof a.task_id === 'string' && TASK_IDS.includes(a.task_id) ? a.task_id : '*',
+      severity: 'MAJOR',
+      location: a.location || null,
+      problem: `contract_ambiguity${where ? ` (${where})` : ''}: ${a.detail || '(no description)'}`,
+    });
+  }
+  for (const v of report.verification_impacts) {
+    warnings.push(
+      `Spec-reconcile: ${v.stable_id}${v.layer ? ` (${v.layer})` : ''} may need re-verification: ${v.reason || '(no reason given)'}`,
+    );
+  }
+  if (Array.isArray(result.warnings)) {
+    warnings.push(...result.warnings.map((w) => `Spec-reconcile: ${w}`));
+  }
+  return { report, warnings, followups };
+}
+
+// ============================================================
 // Monotonic clock — graceful degradation in restricted runtimes
 // ============================================================
 // Workflow scripts block Date.now(), new Date(), and Math.random() for
@@ -2478,6 +2674,7 @@ const workflowT0 = _now();
 //   Stage 1 — Implement: all developers in parallel
 //   Stage 2 — Test: single tester (adversarial per-task + integration + E2E)
 //   Stage 3 — Review: single reviewer (full profile only)
+//   Stage 3.5 — Spec-Reconcile: after the loop passes, before Close (standard/full)
 //
 // On any stage failure, rework notes are extracted and the loop restarts at
 // stage 1. No nested loops — one flat loop with sequential stages.
@@ -2676,13 +2873,61 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
 }
 
 // ============================================================
+// STAGE 3.5 — SPEC-RECONCILE (standard, full): sync specs with the implementation
+// ============================================================
+// Runs once, after the implement/test/review loop passed and before Close, so the
+// closer sees any contract_ambiguity as a pending follow-up. Unresolved findings
+// (the loop ran out of rounds) downgrade it to read-only audit: code that failed
+// verification must not be written into a normative spec. A reconciler failure
+// never fails the session; it is surfaced as a warning.
+let specReconcileReport = null;
+let reconcileStageRan = false;
+const reconcileWarnings = [];
+if (sessionPassed && HAS_RECONCILE_STAGE) {
+  phase('Spec-Reconcile');
+  const reconcileMode = pendingFollowups.length > 0 ? 'audit' : 'apply';
+  log(`--- Spec-Reconcile | Session ${session_id} | mode ${reconcileMode} ---`);
+  reconcileStageRan = true;
+
+  let reconcilerResult = null;
+  try {
+    reconcilerResult = await trackedAgent(
+      buildSpecReconcilerPrompt(reconcileMode),
+      {
+        label: 'spec-reconciler',
+        phase: 'Spec-Reconcile',
+        agentType: 'handoff-task-loop:session-spec-reconciler',
+        model: SPEC_RECONCILER_MODEL,
+        effort: SPEC_RECONCILER_EFFORT,
+        schema: SPEC_RECONCILER_SCHEMA,
+      },
+      { round: mainRound, stage: 'spec-reconcile', role: 'spec-reconciler', task_ids: TASK_IDS },
+    );
+  } catch (e) {
+    log(`Spec-reconciler error (non-fatal): ${e}`);
+  }
+
+  const folded = foldSpecReconcilerResult(reconcilerResult, reconcileMode);
+  specReconcileReport = folded.report;
+  reconcileWarnings.push(...folded.warnings);
+  pendingFollowups = pendingFollowups.concat(folded.followups);
+  sessionLog.push({
+    round: mainRound,
+    phase: 'spec-reconcile',
+    mode: reconcileMode,
+    ambiguities: folded.followups.length,
+    error: folded.report.error || null,
+  });
+}
+
+// ============================================================
 // STAGE 4 — CLOSE (standard, full): automated Step 6 processing
 // ============================================================
 // A closer failure never fails the session: the work itself already passed its
 // verification stages. It is surfaced as `warnings` so the manager can finish
 // the close-out by hand instead of silently skipping it.
 let closerResult = null;
-const closerWarnings = [];
+const closerWarnings = [...reconcileWarnings];
 if (sessionPassed && HAS_TEST_STAGE) {
   phase('Close');
   log(`--- Close | Session ${session_id} ---`);
@@ -2739,6 +2984,8 @@ return {
     // Actually executed, not merely permitted by the profile: a last-round
     // test-stage FAIL breaks out before Stage 3 runs even under `full`.
     review: reviewStageRan,
+    // Stage 3.5, likewise reported only when it actually executed.
+    reconcile: reconcileStageRan,
   },
   integration_expected: INTEGRATION_EXPECTED,
   response_language: RESPONSE_LANGUAGE,
@@ -2750,6 +2997,9 @@ return {
   test_reports: [],
   integration_report: integrationResult,
   review_report: reviewResult,
+  // Stage 3.5 result ({ mode, reconciled[], contract_ambiguities[], trace_updates[],
+  // verification_impacts[], error? }); null under express or when the session did not pass.
+  spec_reconcile_report: specReconcileReport,
   // Step 6 automation result (null under express or when the session did not
   // pass), and the manager-facing warnings it produced (closer failure, tasks
   // it skipped, per-task errors it reported).

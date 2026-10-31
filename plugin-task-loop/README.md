@@ -18,6 +18,7 @@ implementation, adversarial testing, and architectural review.
 ### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet),
   session-integration-tester (Sonnet), session-reviewer (Opus),
+  session-spec-reconciler (Sonnet — Stage 3.5: syncs basic_spec/system_test with the implementation, reports contract_ambiguity),
   session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
   requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
   requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check, plus the opt-in ISO 29119 `test_spec` check of scaffolded test specifications; cross-document duplicate/contradiction/omission review),

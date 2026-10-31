@@ -17,8 +17,8 @@
  * turns a session costs — the dominant term in wall-clock latency.
  *
  *   express  — developer                                   (1 serial turn)
- *   standard — developer -> tester -> integrate            (3 serial turns)
- *   full     — developer -> tester -> reviewer             (3 serial turns)
+ *   standard — developer -> tester -> spec-reconcile       (3 serial turns)
+ *   full     — developer -> tester -> reviewer -> spec-reconcile (4 serial turns)
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -50,10 +50,17 @@ const DEFAULT_PROFILE = 'standard';
 // `standard` does get one, and pays a serial turn for it (2 -> 3). That is the
 // deliberate trade: an unwired implementation is exactly what `standard` misses
 // today, because it has no reviewer to notice.
+//
+// `reconcile` (Stage 3.5, Spec-Reconcile) syncs the right-hand specs
+// (basic_spec / system_test) with what was implemented, between Review and
+// Close. `express` skips it for the same reason it skips integrate: it is the
+// "mechanical and self-verifying" lane, and the developer handles any doc
+// touch-up inline. standard/full pay one more serial turn so a spec never
+// silently drifts from the code that closed it.
 const PROFILE_STAGES = Object.freeze({
-  express: Object.freeze({ implement: true, test: false, integrate: false, review: false }),
-  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false }),
-  full: Object.freeze({ implement: true, test: true, integrate: true, review: true }),
+  express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false }),
+  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true }),
+  full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true }),
 });
 
 /**
@@ -83,6 +90,7 @@ function profileStages(profile) {
     test: stages.test,
     integrate: stages.integrate,
     review: stages.review,
+    reconcile: stages.reconcile,
   };
 }
 
@@ -93,6 +101,7 @@ function profileStages(profile) {
  * E2E, wiring) in a single agent invocation alongside per-task adversarial
  * checks, so `test` and `integrate` together cost one serial turn — NOT two.
  * Under `full`, the reviewer runs after the tester, adding one more turn.
+ * The spec-reconciler (Stage 3.5) is always its own serial turn.
  *
  * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
  * `full` and silently misprice the profile.
@@ -104,6 +113,7 @@ function serialTurnsForProfile(profile) {
   // test and integrate are handled by a single integration tester agent.
   if (s.test || s.integrate) turns += 1;
   if (s.review) turns += 1;
+  if (s.reconcile) turns += 1;
   return turns;
 }
 
