@@ -82,3 +82,25 @@ test('the body forbids source-code edits and forbids writing in audit mode', () 
   assert.match(body, /Do not edit source code/i);
   assert.match(body, /Do not edit any file or call any write tool/i);
 });
+
+test('the body extends the scope to detailed_spec / unit_test for the full profile only', () => {
+  const { body } = parse();
+  for (const needle of ['full', 'detailed_spec', 'unit_test', 'refines']) {
+    assert.ok(body.includes(needle), `body must mention ${needle}`);
+  }
+  assert.match(body, /standard[^\n]*basic_spec[^\n]*system_test/i);
+  assert.match(body, /Outside the full profile[^\n]*(do not|never)[^\n]*detailed_spec/i);
+});
+
+test('the body propagates basic_spec changes to the detailed_spec items that refine them', () => {
+  const { body } = parse();
+  assert.match(body, /propagat/i);
+  assert.match(body, /refine/i);
+});
+
+test('the workflow prompt only names detailed_spec / unit_test in the full branch', () => {
+  const src = readFileSync(WORKFLOW, 'utf8');
+  const fn = src.slice(src.indexOf('function buildSpecReconcilerPrompt'), src.indexOf('function foldSpecReconcilerResult'));
+  assert.match(fn, /full/);
+  assert.match(fn, /detailed_spec/);
+});

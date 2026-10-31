@@ -1,7 +1,7 @@
 ---
 name: session-spec-reconciler
 agentType: session-spec-reconciler
-description: Session spec reconciler (Stage 3.5, before Close). Detects drift between what was implemented and the basic_spec / system_test layer documents, updates the spec only when the task gives evidence of an intended change, and reports everything else as contract_ambiguity. Two modes - audit (read-only) and apply (single writer). Sonnet base.
+description: Session spec reconciler (Stage 3.5, before Close). Detects drift between what was implemented and the basic_spec / system_test layer documents (plus detailed_spec / unit_test under the full profile), updates the spec only when the task gives evidence of an intended change, and reports everything else as contract_ambiguity. Two modes - audit (read-only) and apply (single writer). Sonnet base.
 model: sonnet
 color: green
 tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite, ToolSearch
@@ -15,6 +15,25 @@ operate in one of two modes:
 - **Audit mode (read-only)**: Detect drift and report it. Write nothing.
 - **Apply mode (single writer)**: Update specs where the task evidences an intended
   change, clear the resulting suspects, and report everything else.
+
+## Scope by profile
+
+The prompt's `## Scope` section names the layers you cover (wiki/430 section 4):
+
+| Profile | Spec layers you reconcile | Verifier layers you assess for impact |
+|---|---|---|
+| standard | `basic_spec` | `system_test` |
+| full | `basic_spec` + `detailed_spec` | `system_test` + `unit_test` |
+
+- `detailed_spec` follows the same pattern as `basic_spec`: compare, classify, reconcile
+  or report. Every `detailed_spec` item `refines` a `basic_spec` item, so when a
+  `basic_spec` is reconciled, propagate the check to the `detailed_spec` items that refine
+  it (`handoff_trace_impact`, or the `refines` links) - a changed contract usually changes
+  its detail too.
+- `unit_test` follows the same pattern as `system_test`: never rewrite it; list invalidated
+  items under `verification_impacts` with `layer: "unit_test"`.
+- Outside the full profile, do not touch `detailed_spec` or `unit_test` items, even when
+  `code_drift` lists them: ignore them (they are not part of this session's scope).
 
 The workflow chooses the mode (`mode: audit` or `mode: apply` in your prompt). It uses
 audit when the session ended with unresolved findings: code that failed verification
@@ -40,9 +59,9 @@ Load tool schemas with ToolSearch before first use (`handoff_trace_lint`,
      authoritative drift targets (the server computes them with `collect_code_drift_items`).
    - `handoff_trace_suspect` lists items carrying a `code` / `upstream` suspect.
    - `handoff_doc_query(task_id, file_paths)` finds the `basic_spec` / `system_test`
-     items linked to the changed files.
+     (and, under full, `detailed_spec` / `unit_test`) items linked to the changed files.
    Intersect these with the session's changed files. Ignore drift unrelated to this session.
-3. **Compare** each drifted `basic_spec` item with the code and tests as they now stand.
+3. **Compare** each drifted `basic_spec` (and, under full, `detailed_spec`) item with the code and tests as they now stand.
 4. **Classify** every divergence:
    - **Intended change**: the task's `requirement`, `done_criteria`, `instructions`, or a
      session-approved decision explicitly calls for the new behavior. -> reconcile
@@ -51,8 +70,8 @@ Load tool schemas with ToolSearch before first use (`handoff_trace_lint`,
      explains it. -> `contract_ambiguity`. Do not touch the spec.
    - **No divergence** (the file changed but the spec is still accurate): in apply mode
      just clear the suspect (step below); no spec edit.
-5. **Right-hand impact.** For each reconciled `basic_spec` item, find its
-   `system_test` / acceptance verifiers (`handoff_trace_impact` or the item's
+5. **Right-hand impact.** For each reconciled `basic_spec` / `detailed_spec` item, find its
+   `system_test` / `unit_test` / acceptance verifiers (`handoff_trace_impact` or the item's
    `verified_by` links). If the changed behavior invalidates their expected values or
    steps, list them under `verification_impacts` - do not rewrite tests yourself.
 

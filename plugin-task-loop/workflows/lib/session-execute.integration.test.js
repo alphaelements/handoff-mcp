@@ -2019,6 +2019,43 @@ test('Stage 3.5: the reconciler prompt carries tasks, instructions, dev report, 
   assert.match(p, /contract_ambiguity/);
 });
 
+test('Stage 3.5 (full): the reconciler is also scoped to detailed_spec and unit_test', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  const p = promptFor(r, 'spec-reconciler');
+  assert.match(p, /## Scope/);
+  assert.match(p, /detailed_spec/);
+  assert.match(p, /unit_test/);
+  assert.match(p, /basic_spec/);
+  assert.match(p, /system_test/);
+  assert.match(p, /refines/, 'basic_spec drift must be propagated to the detailed_spec items that refine it');
+});
+
+test('Stage 3.5 (standard): detailed_spec and unit_test are out of the reconciler scope', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const p = promptFor(r, 'spec-reconciler');
+  assert.match(p, /basic_spec/);
+  assert.match(p, /system_test/);
+  assert.doesNotMatch(p, /detailed_spec/);
+  assert.doesNotMatch(p, /unit_test/);
+});
+
+test('Stage 3.5: an explicit trace_profile of full widens the reconciler scope on a standard pipeline', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard', trace_profile: 'full' });
+  const p = promptFor(r, 'spec-reconciler');
+  assert.match(p, /detailed_spec/);
+  assert.match(p, /unit_test/);
+});
+
+test('Stage 3.5 (full): audit mode stays read-only while still covering detailed_spec and unit_test', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'full', max_rounds: 1 },
+    { testerVerdict: 'FAIL', testerFindings: [{ task_id: 't1', severity: 'MAJOR', problem: 'broken' }] },
+  );
+  const p = promptFor(r, 'spec-reconciler');
+  assert.match(p, /mode: audit/);
+  assert.match(p, /detailed_spec/);
+});
+
 test('Stage 3.5: unresolved follow-ups downgrade the reconciler to audit (read-only) mode', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 1 },
@@ -2099,6 +2136,34 @@ test('Stage 0: full additionally asks for detailed_spec + unit_test scaffold', a
   assert.match(p, /basic_spec/);
   assert.match(p, /detailed_spec/);
   assert.match(p, /unit_test/);
+});
+
+test('Stage 0 + 3.5 (full) E2E: spec-writer scaffolds then reconciler syncs detailed_spec/unit_test', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'full' },
+    {
+      specWriterResult: specPrepResult({
+        specs_generated: [
+          { stable_id: 'BS-010', layer: 'basic_spec', refines: 'REQ-LAG-010', confidence: 'high', summary: 'Retry interface' },
+          { stable_id: 'DS-010', layer: 'detailed_spec', refines: 'BS-010', confidence: 'high', summary: 'Retry algorithm' },
+        ],
+        scaffolds_created: [
+          { layer: 'system_test', stable_id: 'ST-010', verifies: 'BS-010' },
+          { layer: 'unit_test', stable_id: 'UT-010', verifies: 'DS-010' },
+        ],
+      }),
+      reconcilerResult: {
+        ...DEFAULT_RECONCILER_RESULT,
+        verification_impacts: [{ stable_id: 'UT-010', layer: 'unit_test', reason: 'expected retry count changed' }],
+      },
+    },
+  );
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.equal(r.spec_prep_report.specs_generated[1].layer, 'detailed_spec');
+  assert.equal(r.spec_prep_report.scaffolds_created[1].layer, 'unit_test');
+  assert.match(promptFor(r, 'spec-writer'), /unit_test/);
+  assert.match(promptFor(r, 'spec-reconciler'), /unit_test/);
+  assert.ok(r.warnings.some((w) => /UT-010/.test(w) && /unit_test/.test(w)), 'unit_test impact must surface');
 });
 
 test('Stage 0: express skips Spec-Prep entirely', async () => {

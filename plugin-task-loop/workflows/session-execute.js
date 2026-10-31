@@ -1973,12 +1973,19 @@ function buildCloserPrompt() {
     .join('\n');
 }
 
+// The trace tier (when given) sets the spec scope; otherwise the pipeline profile does.
+// Shared by Stage 0 (spec-writer) and Stage 3.5 (spec-reconciler) so the layers a
+// session generates are exactly the layers it reconciles. `full` adds detailed_spec +
+// unit_test; standard stays at basic_spec + system_test (wiki/430 section 4).
+function specScopeIsFull() {
+  return (TRACE_PROFILE || PROFILE) === 'full';
+}
+
 // ============================================================
 // Helper: spec-writer prompt + result handling (Stage 0)
 // ============================================================
 function buildSpecWriterPrompt() {
-  // The trace tier (when given) sets the scope; otherwise the pipeline profile does.
-  const full = (TRACE_PROFILE || PROFILE) === 'full';
+  const full = specScopeIsFull();
   const taskBlocks = tasks
     .map((t) => {
       const linked = Array.isArray(t.requirement_ids) && t.requirement_ids.length > 0
@@ -2134,6 +2141,17 @@ function buildSpecReconcilerPrompt(mode) {
     ? `mode: audit — READ-ONLY. The session ended with unresolved findings, so do not write specs for code that failed verification. Detect and report only.`
     : `mode: apply — update specs for intended changes, then clear the suspects you resolved.`;
 
+  const scopeLines = specScopeIsFull()
+    ? [
+        `- Reconcile \`basic_spec\` and \`detailed_spec\` items against the code (full profile).`,
+        `- Detect right-hand impact on \`system_test\` and \`unit_test\` items as \`verification_impacts\`.`,
+        `- Every \`detailed_spec\` item \`refines\` a \`basic_spec\` item: when a basic_spec changes, propagate`,
+        `  the check to the detailed_spec items that refine it (and on to their unit_test verifiers).`,
+      ]
+    : [
+        `- Reconcile \`basic_spec\` items against the code; detect right-hand impact on \`system_test\` items.`,
+      ];
+
   return [
     `You are a session-spec-reconciler. Sync the specs with what this session implemented (Stage 3.5, before Close).`,
     ``,
@@ -2148,6 +2166,9 @@ function buildSpecReconcilerPrompt(mode) {
     renderPendingFollowupsForCloser(),
     ``,
     `## ${modeLine}`,
+    ``,
+    `## Scope`,
+    ...scopeLines,
     ``,
     `## Rules`,
     `- Follow agents/session-spec-reconciler.md: find drift with \`handoff_trace_lint(rules: ["code_drift"])\``,
