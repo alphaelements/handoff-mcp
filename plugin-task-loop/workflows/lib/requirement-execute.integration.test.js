@@ -198,7 +198,7 @@ test('requirement-loop.md Phase 5: milestone integration (REQ-MS-PIPE-002) sits 
   // AC3: trace_tasks apply passes default_milestone
   assert.match(phase5, /handoff_trace_tasks\([^)]*default_milestone/);
   // ordering: milestone integration comes before the Tasks step and before the apply guidance
-  assert.ok(step < phase5.indexOf('2. **Tasks**'), 'milestone step precedes Tasks');
+  assert.ok(step < phase5.indexOf('3. **Tasks**'), 'milestone step precedes Tasks');
 });
 
 // ---------------- gate loop ----------------

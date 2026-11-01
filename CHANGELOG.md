@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.2] — 2026-11-01
+
+### Added
+- **Requirement-loop Phase 5 scaffold fallback**: Phase 5 (Roadmap) now
+  includes an explicit scaffold step when the registrar did not run,
+  scaffolding both acceptance and system_test layers under standard/full
+  profiles. Also adds an explicit executes-tasks pass for scaffolded
+  verification items.
+
+### Fixed
+- **`upsert_item` ext attr carry-over**: milestone, mock, golden, viewport,
+  and capture_method attributes are now preserved across edits and can be set
+  via an attrs overlay.
+- **`trace_suspect` dry_run guard**: `action=clear` now rejects `dry_run=true`
+  with guidance to use `action=list` instead.
+- **`TestConfig` round-trip**: Config struct gains `test: TestConfig` with
+  environments BTreeMap, preventing `[test.environments]` loss on config
+  round-trip.
+- **`default_needs` deeper-left pair**: `natural_default_needs()` now includes
+  the deeper-left layer's right-side pair, eliminating ~131 unwanted
+  `unwanted_coverage` info findings where scaffold-generated system_test items
+  were not counted as valid coverage.
+- **Bullet-prefixed AC triggers**: parser now strips bullet markers before
+  keyword matching and accepts `acceptance_criteria` (underscore variant),
+  enabling scaffold to pick up AC blocks in old-format requirement docs.
+
 ## [0.47.1] — 2026-10-30
 
 ### Added

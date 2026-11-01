@@ -650,7 +650,20 @@ Present them at Gate #4 with the other follow-ups and file them as `[req-followu
       matches; an item with no effective milestone is a gap - ask the user rather than guessing.
    5. **Remember the default**: choose the milestone that most of a scope's tasks belong to as that
       scope's `default_milestone`; step 2 passes it to `handoff_trace_tasks` when it applies tasks.
-2. **Tasks**:
+2. **Scaffold verification items** (only when `registered` is `false` — the registrar already
+   did this when `registered: true`):
+   - Read the trace profile: `handoff_get_config` → `[trace] profile`.
+   - **`minimal`/`bugfix`**: skip scaffolding entirely (AC items are the verification items).
+   - **`standard`/`full`**: for each approved requirement document, scaffold into both layers:
+     ```
+     handoff_trace_scaffold(doc=<doc_id>, target_layer="acceptance", mode="apply")
+     handoff_trace_scaffold(doc=<doc_id>, target_layer="system_test", mode="apply")
+     ```
+   - Run the test-spec-worker pattern: for each scaffolded document, complete `(TBD)`
+     placeholders in the generated items (preconditions, steps, environment) — or file a
+     follow-up task if time-constrained.
+   - Run `trace_lint` to confirm no `task_unlinked` findings.
+3. **Tasks**:
    - `handoff_trace_tasks(select={layers:["requirement"]}, parent_id=<parent_task_id>, mode="preview")`.
    - **If the run returned `registered: true` for a scope, call `trace_tasks` for that scope in
      `mode="preview"` only — never `mode="apply"`.** The registrar already created its tasks;
@@ -666,6 +679,11 @@ Present them at Gate #4 with the other follow-ups and file them as `[req-followu
      `handoff_trace_tasks(items=[...], parent_id=<parent_task_id>, mode="apply", default_milestone="<name>")`,
      so each created task gets `schedule.milestone` automatically. Tasks the registrar already created
      inside the workflow have no milestone yet - the "Assign milestones" bullet below backfills them.
+   - **Executes tasks** (only when scaffolding ran — step 2 above or `registered: true`):
+     generate `executes` tasks for the scaffolded verification items (acceptance/system_test):
+     `handoff_trace_tasks(select={layers:["acceptance","system_test"]}, parent_id=<parent_task_id>, mode="preview")`.
+     Review with the user, then `mode="apply"` for planned items. Under `minimal`/`bugfix` (no
+     scaffold), skip this step.
    - Link tasks to requirements: `trace_tasks` already writes the requirement link; additionally
      set `requirement_ids` with `handoff_update_task(task={id, requirement_ids:[...]})` for any task
      the registrar missed (`handoff_trace_next` lists `create_task`/`link` gaps).
@@ -698,12 +716,12 @@ Present them at Gate #4 with the other follow-ups and file them as `[req-followu
    - Then ask the user for priorities and any remaining dependencies; apply them with
      `handoff_update_task` (dependencies always via `handoff_update_task`; priorities may use
      `handoff_bulk_update_tasks(updates=[{task_id, priority}, ...])`).
-3. **Schedule**:
+4. **Schedule**:
    - `handoff_auto_schedule(dry_run=true)`, show the proposed dates, get approval, then
      `handoff_auto_schedule(dry_run=false)` — **after the last task change**.
    **Note**: `auto_schedule` uses raw `estimate_hours` directly. The `settings.ai_estimate_multiplier`
    is applied only in `handoff_get_metrics` / `handoff_get_capacity` reports, never during scheduling.
-4. **Roadmap document**:
+5. **Roadmap document**:
    ```
    handoff_doc_save(doc_type="plan", slug="<project>-roadmap", title="<Project> Roadmap", body="...")
    ```

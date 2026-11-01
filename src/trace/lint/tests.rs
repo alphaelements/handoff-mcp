@@ -2283,3 +2283,144 @@ fn low_confidence_spec_severity_is_overridable_and_can_be_switched_off() {
     let off = evaluate(&graph, &input, &ctx, &config, None);
     assert!(!off.iter().any(|f| f.rule == "low_confidence_spec"));
 }
+
+// ---------------------------------------------------------------------------
+// profile-derived default_needs reaching lint (t421)
+// ---------------------------------------------------------------------------
+
+/// A standard-profile `TraceInput` whose `project_default_needs` come from the
+/// real profile resolver (not hand-written maps), so a regression in how
+/// `default_needs` is derived reaches the lint engine.
+fn resolved_input(profile: &str, layers: &[&str], items: Vec<TraceItemInput>) -> TraceInput {
+    let registry = crate::storage::docs::layer::LayerRegistry::build(&[]);
+    let (resolved, _) = crate::trace::profile::resolve_profile_by_name(
+        profile,
+        &crate::storage::config::TraceConfig::default(),
+        &registry,
+    );
+    let resolved = resolved.expect("builtin profile resolves");
+    TraceInput {
+        items,
+        configured_layers: layers_of(layers),
+        project_default_needs: resolved.default_needs,
+        project_default_profile_name: Some(profile.to_string()),
+        ..Default::default()
+    }
+}
+
+fn lint_all(input: &TraceInput) -> Vec<LintFinding> {
+    let graph = TraceGraph::build(input);
+    evaluate(
+        &graph,
+        input,
+        &empty_ctx(),
+        &crate::storage::config::TraceLintConfig::default(),
+        None,
+    )
+}
+
+/// done_criteria[1]: under the standard profile, a `system_test` that
+/// `verifies` a requirement directly (as scaffold generates) is neither
+/// `unwanted_coverage` nor leaves the requirement `unverified`.
+#[test]
+fn standard_profile_system_test_verifying_a_requirement_is_not_unwanted_coverage() {
+    let input = resolved_input(
+        "standard",
+        &["requirement", "basic_spec", "acceptance", "system_test"],
+        vec![
+            layered("REQ-001", "requirement", &[], &[]),
+            layered("ST-001", "system_test", &[], &["REQ-001"]),
+        ],
+    );
+
+    let findings = lint_all(&input);
+
+    assert!(
+        !findings.iter().any(|f| f.rule == "unwanted_coverage"),
+        "{findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.rule == "unverified" && f.item.as_deref() == Some("REQ-001")),
+        "{findings:?}"
+    );
+}
+
+/// The system_test is still wanted coverage only because the profile derives
+/// it: the same lint with the verifier removed must not flag it either way,
+/// and a requirement with basic_spec but no system_test is not W030-flagged
+/// for the derived (alternative) `system_test` need.
+#[test]
+fn derived_pair_need_is_not_a_missing_profile_layer_for_the_requirement() {
+    let input = resolved_input(
+        "standard",
+        &["requirement", "basic_spec", "acceptance", "system_test"],
+        vec![
+            layered("REQ-001", "requirement", &[], &[]),
+            layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+            layered("ST-001", "system_test", &[], &["BS-001"]),
+        ],
+    );
+
+    let found: Vec<_> = lint_all(&input)
+        .into_iter()
+        .filter(|f| f.rule == "missing_profile_layer")
+        .collect();
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// Full profile: `basic_spec` derives `unit_test` (the pair of
+/// `detailed_spec`) too; a complete chain stays quiet under W030.
+#[test]
+fn full_profile_complete_chain_has_no_missing_profile_layer() {
+    let input = resolved_input(
+        "full",
+        &[
+            "requirement",
+            "basic_spec",
+            "detailed_spec",
+            "acceptance",
+            "system_test",
+            "unit_test",
+        ],
+        vec![
+            layered("REQ-001", "requirement", &[], &[]),
+            layered("BS-001", "basic_spec", &["REQ-001"], &[]),
+            layered("ST-001", "system_test", &[], &["BS-001"]),
+            layered("DS-001", "detailed_spec", &["BS-001"], &[]),
+            layered("UT-001", "unit_test", &[], &["DS-001"]),
+        ],
+    );
+
+    let found: Vec<_> = lint_all(&input)
+        .into_iter()
+        .filter(|f| f.rule == "missing_profile_layer")
+        .collect();
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// An item's own `needs` still demands a non-pair right-side layer outright:
+/// the exemption only covers profile-derived `default_needs`.
+#[test]
+fn own_needs_listing_a_non_pair_right_layer_is_still_required() {
+    let req = TraceItemInput {
+        needs: Some(vec!["system_test".to_string()]),
+        ..layered("REQ-001", "requirement", &[], &[])
+    };
+    let input = resolved_input(
+        "standard",
+        &["requirement", "basic_spec", "acceptance", "system_test"],
+        vec![req],
+    );
+
+    let found: Vec<_> = lint_all(&input)
+        .into_iter()
+        .filter(|f| f.rule == "missing_profile_layer")
+        .collect();
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].message.contains("no verifying system_test item"));
+}

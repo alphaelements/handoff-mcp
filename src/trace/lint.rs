@@ -1212,6 +1212,13 @@ fn effective_profile_needs<'a>(
 ///   `waive-verify` skip the matching side, `derived` is irrelevant here.
 /// - An item outside its effective layer set (`layer_outside_profile`) is
 ///   not checked.
+/// - A right-side layer that a *profile* `default_needs` lists for a left-side
+///   item but that is not the item's own pair (e.g. `system_test` for a
+///   `requirement`) is an alternative verifier, not an extra requirement: the
+///   profile derivation adds it so scaffolded tests that verify the item
+///   directly count towards coverage (see `natural_default_needs`), and the
+///   item's own pair already covers verification. Only an item's own
+///   `needs` demands such a layer outright.
 fn evaluate_missing_profile_layer(
     graph: &TraceGraph,
     trace_input: &TraceInput,
@@ -1246,6 +1253,11 @@ fn evaluate_missing_profile_layer(
         let Some((needs, source)) = effective_profile_needs(item, layer, trace_input) else {
             continue;
         };
+        let own_pair = trace_input
+            .layer_registry
+            .iter()
+            .find(|l| l.id == layer)
+            .map(|l| l.pair.as_str());
         for required in needs {
             if required == ACCEPTANCE_LAYER || required == layer {
                 continue;
@@ -1257,6 +1269,12 @@ fn evaluate_missing_profile_layer(
             else {
                 continue;
             };
+            if item.needs.is_none()
+                && def.side == LayerSide::Right
+                && own_pair != Some(def.id.as_str())
+            {
+                continue;
+            }
             let (axis, waiver, children) = match def.side {
                 LayerSide::Left => (
                     "refining",
