@@ -1322,20 +1322,28 @@ pub(crate) struct AcceptanceBlock {
     pub(crate) raw_items: Vec<String>,
 }
 
-/// §2.2: a line whose text, once emphasis markers and a trailing `:`/`：`
-/// are stripped, case-insensitively equals "受入基準"/"Acceptance criteria"/
-/// "Acceptance".
+/// §2.2: a line whose text, once bullet markers, emphasis markers and a
+/// trailing `:`/`：` are stripped, case-insensitively equals
+/// "受入基準"/"Acceptance criteria"/"Acceptance"/"Acceptance_criteria".
 pub(crate) fn is_ac_trigger_line(line: &str) -> bool {
     let t = line.trim();
+    let t = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+        .unwrap_or(t);
+    let t = t.trim();
     let t = t.trim_matches(|c: char| c == '*' || c == '_' || c == '#');
     let t = t.trim();
     let t = t
         .strip_suffix(':')
         .or_else(|| t.strip_suffix('：'))
         .unwrap_or(t);
+    let t = t.trim_matches(|c: char| c == '*' || c == '_' || c == '#');
     let t = t.trim();
     t == "受入基準"
         || t.eq_ignore_ascii_case("acceptance criteria")
+        || t.eq_ignore_ascii_case("acceptance_criteria")
         || t.eq_ignore_ascii_case("acceptance")
 }
 
@@ -2839,6 +2847,66 @@ mod tests {
                 .all(|w| w.kind != ParseWarningKind::AttrUnknownParent),
             "{:?}",
             result.warnings
+        );
+    }
+
+    #[test]
+    fn is_ac_trigger_recognizes_bullet_prefixed_acceptance_criteria() {
+        assert!(is_ac_trigger_line("- acceptance_criteria:"));
+        assert!(is_ac_trigger_line("- acceptance_criteria："));
+        assert!(is_ac_trigger_line("* acceptance_criteria:"));
+        assert!(is_ac_trigger_line("+ acceptance_criteria:"));
+        assert!(is_ac_trigger_line("  - acceptance_criteria:"));
+        assert!(is_ac_trigger_line("- acceptance:"));
+        assert!(is_ac_trigger_line("- Acceptance Criteria:"));
+        assert!(is_ac_trigger_line("- **acceptance criteria**:"));
+        assert!(!is_ac_trigger_line("- acceptance_criteria_extra:"));
+    }
+
+    #[test]
+    fn bullet_prefixed_ac_block_is_parsed() {
+        let body = "\
+## REQ-001 Feature
+
+- priority: high
+- acceptance_criteria:
+  - AC1(gwt): Given X When Y Then Z
+  - AC2(text): Something else
+
+Statement text.
+";
+        let result = parse(body);
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(
+            item.acceptance.len(),
+            2,
+            "expected 2 AC items, got {:?}",
+            item.acceptance
+        );
+        assert_eq!(item.acceptance[0].label, "AC1");
+        assert_eq!(item.acceptance[1].label, "AC2");
+    }
+
+    #[test]
+    fn bullet_acceptance_with_checkbox_format_is_parsed() {
+        let body = "\
+## REQ-PLA-001 Feature
+
+- acceptance:
+  - [ ] First criterion
+  - [ ] Second criterion
+
+Statement.
+";
+        let result = parse(body);
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(
+            item.acceptance.len(),
+            2,
+            "expected 2 AC items, got {:?}",
+            item.acceptance
         );
     }
 }

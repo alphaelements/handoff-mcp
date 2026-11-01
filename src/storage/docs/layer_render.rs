@@ -186,15 +186,23 @@ pub fn render_attrs_block(attrs: &ItemRenderAttrs) -> String {
 /// comments).
 fn is_ac_trigger_line(line: &str) -> bool {
     let t = line.trim();
+    let t = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+        .unwrap_or(t);
+    let t = t.trim();
     let t = t.trim_matches(|c: char| c == '*' || c == '_' || c == '#');
     let t = t.trim();
     let t = t
         .strip_suffix(':')
         .or_else(|| t.strip_suffix('：'))
         .unwrap_or(t);
+    let t = t.trim_matches(|c: char| c == '*' || c == '_' || c == '#');
     let t = t.trim();
     t == "受入基準"
         || t.eq_ignore_ascii_case("acceptance criteria")
+        || t.eq_ignore_ascii_case("acceptance_criteria")
         || t.eq_ignore_ascii_case("acceptance")
 }
 
