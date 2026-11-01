@@ -413,6 +413,11 @@ shows `under_review`/`approved`.
   `AT-002` link suspect), the same values are projected onto the frozen
   files' own key set by hand, so the additive check keeps comparing like
   with like.
+  t421 is another such case: `natural_default_needs` now also lists the
+  deeper left layer's pair, so every `requirement` item's derived `needs` is
+  `["acceptance", "basic_spec", "system_test"]` under `standard`; the 5
+  `requirement` items in `v2/expected_output.json` and
+  `v2/expected_output_v3.json` were edited by hand to match.
 - `tests/fixtures/trace_report_v3_sample.json` is a report with a DAG (one
   node shared by two parents, a `decision`, an empty `group`), and
   `tests/fixtures/trace_report_v3.schema.json` is the JSON Schema

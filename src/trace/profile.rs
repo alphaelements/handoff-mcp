@@ -90,7 +90,10 @@ const MAX_EXTENDS_DEPTH: usize = 8;
 /// - Every left-side layer in `layers` that has a deeper left-side layer
 ///   also in `layers` (the next `level` down, e.g. `requirement` →
 ///   `basic_spec`) additionally requires refine-coverage from that deeper
-///   layer (vertical "下位層への refines").
+///   layer (vertical "下位層への refines"), plus verify-coverage from that
+///   deeper layer's `pair` when in scope (e.g. `requirement` also needs
+///   `system_test`, because scaffolded system tests verify the requirement
+///   directly).
 /// - A left-side layer with neither in-scope pair nor in-scope deeper layer
 ///   gets no entry at all (no coverage to require).
 /// - Right-side layers never get an entry (`needs`/`default_needs` only
@@ -119,6 +122,13 @@ fn natural_default_needs(
             .min_by_key(|l| l.level)
         {
             required.push(deeper.id.clone());
+            // Scaffold generates right-side items from the AC of upper-left
+            // items (e.g. `system_test` items with `verifies: REQ-xxx`), so
+            // the upper-left item must also count the deeper layer's pair
+            // as a needed verifier, or it is reported as `unwanted_coverage`.
+            if layers.contains(&deeper.pair) && !required.contains(&deeper.pair) {
+                required.push(deeper.pair.clone());
+            }
         }
         if !required.is_empty() {
             out.insert(layer_id.clone(), required);
@@ -560,7 +570,11 @@ mod tests {
         let p = resolved.unwrap();
         assert_eq!(
             p.default_needs.get("requirement"),
-            Some(&vec!["acceptance".to_string(), "basic_spec".to_string()])
+            Some(&vec![
+                "acceptance".to_string(),
+                "basic_spec".to_string(),
+                "system_test".to_string()
+            ])
         );
         assert_eq!(
             p.default_needs.get("basic_spec"),
@@ -569,15 +583,29 @@ mod tests {
     }
 
     /// FR-202: `full` includes all 3 left layers — `requirement` requires
-    /// both its pair (`acceptance`) and its immediate lower layer
-    /// (`basic_spec`, not the further `detailed_spec`).
+    /// its pair (`acceptance`), its immediate lower layer (`basic_spec`, not
+    /// the further `detailed_spec`) and that lower layer's pair
+    /// (`system_test`, scaffolded with `verifies: REQ-xxx`); `basic_spec`
+    /// likewise requires `detailed_spec`'s pair (`unit_test`).
     #[test]
     fn full_profile_requirement_needs_immediate_lower_layer_not_the_deepest() {
         let (resolved, _) = resolve_profile_by_name("full", &TraceConfig::default(), &registry());
         let p = resolved.unwrap();
         assert_eq!(
             p.default_needs.get("requirement"),
-            Some(&vec!["acceptance".to_string(), "basic_spec".to_string()])
+            Some(&vec![
+                "acceptance".to_string(),
+                "basic_spec".to_string(),
+                "system_test".to_string()
+            ])
+        );
+        assert_eq!(
+            p.default_needs.get("basic_spec"),
+            Some(&vec![
+                "system_test".to_string(),
+                "detailed_spec".to_string(),
+                "unit_test".to_string()
+            ])
         );
     }
 
