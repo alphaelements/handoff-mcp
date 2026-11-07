@@ -75,6 +75,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when more were found).
 - `task_summary.by_status` keys are now in ascending order on every call
   (the order used to change from run to run).
+- **`trace update` exits 1 when an op failed**: the CLI used to print the
+  `failed` object and exit 0. A partial success (some ops already written)
+  also exits 1; resend only the ops not listed in `applied`.
+
+### Fixed
+- **Workflow sub-agents can reach handoff**: `session-closer`,
+  `session-spec-writer` and `session-spec-reconciler` list the handoff MCP
+  tools (`mcp__handoff__*` and `mcp__plugin_handoff-mcp_handoff__*`) in their
+  `tools:` allow-list, carry a CLI fallback table (JSON argument form) and a
+  "report failures, never skip silently" section. The workflow's closer result
+  gains per-task `ops_failed` / `unexecuted_ops`; a non-empty one adds a
+  `closer_failed:` warning and the task id to the new `closer_failed_tasks`.
+- `task update --requirement-ids` / `--requirement-roles` were silently
+  dropped; they now reach the task. `doc update-section --seq N` no longer
+  fails with "'seq' is required".
 
 ## [0.47.2] — 2026-11-01
 

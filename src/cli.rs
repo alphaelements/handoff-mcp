@@ -37,9 +37,16 @@ pub fn run(args: &[String]) -> i32 {
     // `trace tree` (wiki/300 SPEC-TREE-009): any failure — an invalid
     // parameter, an unknown root / layer, a missing `.handoff/` — is exit 2.
     let is_trace_tree = is_trace && action == Some("tree");
+    // `trace update` reports a rejected or half-applied batch as a normal
+    // response with a `failed` object; the exit code has to say so too.
+    let is_trace_update = is_trace && action == Some("update");
     let result = dispatch(args);
     match result {
         Ok(output) if is_trace_lint => print_trace_lint_output(&output),
+        Ok(output) if is_trace_update && trace_update_failed(&output) => {
+            println!("{output}");
+            1
+        }
         Ok(output) => {
             println!("{output}");
             0
@@ -57,6 +64,19 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
+}
+
+/// Whether a `trace update` response carries a `failed` op. The handler
+/// answers `Ok` with `{"applied": [...], "failed": {...}}` for both a
+/// validation rejection (nothing written) and a write-time failure (earlier
+/// categories already on disk), so the CLI has to inspect the body. A body
+/// that is not JSON cannot name a failed op, so it counts as "no failure
+/// reported" (the handler always answers JSON on `Ok`).
+fn trace_update_failed(output: &str) -> bool {
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|v| v.get("failed").map(|f| !f.is_null()))
+        .unwrap_or(false)
 }
 
 /// The `trace tree` output format (`--format json|text`).
@@ -532,6 +552,8 @@ fn insert_value(
                 "assignee",
                 "dependencies",
                 "order",
+                "requirement_ids",
+                "requirement_roles",
             ];
             // Fields that go into `task.schedule`.
             let schedule_fields = [
@@ -706,6 +728,9 @@ const NUMERIC_FIELDS: &[&str] = &[
     // limit を NUMERIC_FIELDS に加える" — limit was already numeric above).
     "depth",
     "max_items",
+    // `doc update-section` / `doc get`: section sequence number (integer in the
+    // tool schema; a string "1" is rejected as "'seq' is required").
+    "seq",
 ];
 
 /// Fields whose tool input is always a string array. A single value (no
@@ -749,6 +774,9 @@ const ARRAY_FIELDS: &[&str] = &[
     "task_scope",
     // `task list --ids t75` (no comma) must still be a one-element array.
     "ids",
+    // `task update --requirement-ids FR-1` (no comma) must still be a
+    // one-element array: it REPLACES the task's whole requirement link set.
+    "requirement_ids",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
