@@ -40,6 +40,7 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     // Separate typed keys (settings/dashboard/project) from raw TOML keys
     let typed_keys = [
         "settings.history_limit",
+        "settings.session_prune_limit",
         "settings.done_task_limit",
         "settings.auto_git_summary",
         "settings.require_estimate_hours",
@@ -87,9 +88,46 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         for (key, value) in updates {
             match key.as_str() {
                 "settings.history_limit" => {
-                    if let Some(n) = value.as_u64() {
-                        config.settings.history_limit = n as u32;
+                    // Deprecated since v0.47.3 and inert: a number is still
+                    // stored (DS-V0473-311) but never prunes, and the reply
+                    // says so; null removes the key.
+                    if value.is_null() {
+                        config.settings.history_limit = None;
+                        applied.push("settings.history_limit = null (removed)".to_string());
+                    } else {
+                        let n = value
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "settings.history_limit must be a non-negative integer or null"
+                                )
+                            })?;
+                        config.settings.history_limit = Some(n);
                         applied.push(format!("settings.history_limit = {n}"));
+                        applied.push(
+                            "Warning: settings.history_limit is deprecated and no longer prunes \
+                             sessions; use settings.session_prune_limit (pass null to remove \
+                             history_limit)"
+                                .to_string(),
+                        );
+                    }
+                }
+                "settings.session_prune_limit" => {
+                    if value.is_null() {
+                        config.settings.session_prune_limit = None;
+                        applied.push("settings.session_prune_limit = null (removed)".to_string());
+                    } else {
+                        let n = value
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "settings.session_prune_limit must be a non-negative integer or null"
+                                )
+                            })?;
+                        config.settings.session_prune_limit = Some(n);
+                        applied.push(format!("settings.session_prune_limit = {n}"));
                     }
                 }
                 "settings.done_task_limit" => {

@@ -1,14 +1,36 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
+use super::save_context::{append_session_event, prune_sessions_per_config};
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, enforce_history_limit, write_open_session, SessionData,
+    close_active_sessions, generate_session_id, write_open_session, SessionData,
 };
 use crate::storage::tasks::*;
+
+/// Write an imported session as `open` and record its `session.created`
+/// event (carrying the caller's `agent_id`). The id is assigned here so the
+/// event can name the session the writer creates.
+fn write_imported_session(
+    ctx: &HandlerContext,
+    sessions_dir: &Path,
+    mut data: SessionData,
+) -> Result<()> {
+    let session_id = data.id.get_or_insert_with(generate_session_id).clone();
+    write_open_session(sessions_dir, &data)?;
+    append_session_event(
+        &ctx.handoff_dir,
+        "session.created",
+        Some(&session_id),
+        ctx.agent_id.as_deref(),
+    );
+    Ok(())
+}
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let project_dir = &ctx.project_dir;
@@ -84,6 +106,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .unwrap_or(false);
 
     let mut session_saved = false;
+    let mut prune_lines: Vec<String> = Vec::new();
     if let Some(session) = arguments.get("session") {
         let summary = session
             .get("summary")
@@ -147,16 +170,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             scope: None,
         };
 
-        write_open_session(&sessions_dir, &data)?;
+        write_imported_session(ctx, &sessions_dir, data)?;
 
-        let history_limit = if config_path.exists() {
-            read_config(&config_path)
-                .map(|c| c.settings.history_limit)
-                .unwrap_or(20)
-        } else {
-            20
-        };
-        enforce_history_limit(&sessions_dir, history_limit)?;
+        prune_lines.extend(prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?);
 
         session_saved = true;
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
@@ -199,16 +215,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 scope: None,
             };
 
-            write_open_session(&sessions_dir, &data)?;
+            write_imported_session(ctx, &sessions_dir, data)?;
 
-            let history_limit = if config_path.exists() {
-                read_config(&config_path)
-                    .map(|c| c.settings.history_limit)
-                    .unwrap_or(20)
-            } else {
-                20
-            };
-            enforce_history_limit(&sessions_dir, history_limit)?;
+            prune_lines.extend(prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?);
 
             session_saved = true;
         }
@@ -226,6 +235,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     if session_saved {
         msg.push_str("\n  Session saved: yes");
+    }
+    for line in &prune_lines {
+        msg.push_str("\n  ");
+        msg.push_str(line);
     }
 
     if arguments

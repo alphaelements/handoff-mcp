@@ -179,8 +179,17 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsConfig {
-    #[serde(default = "default_history_limit")]
-    pub history_limit: u32,
+    /// Deprecated (v0.47.3): no longer prunes anything. Still read so an old
+    /// `config.toml` (including the `20` that `handoff_init` used to write)
+    /// parses, and `load_context` warns while it is set. `init` never writes
+    /// it; `handoff_update_config` can delete it with `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_limit: Option<u32>,
+    /// Opt-in cap on closed sessions kept on disk. `None` (the default) keeps
+    /// every session; `0` is treated the same as `None`. Heads are never
+    /// pruned (see `storage::sessions::prune_closed_sessions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_prune_limit: Option<u32>,
     #[serde(default = "default_done_task_limit")]
     pub done_task_limit: u32,
     #[serde(default = "default_auto_git_summary")]
@@ -532,10 +541,6 @@ fn default_merge_strategy() -> String {
 
 fn default_max_concurrent_wts() -> u32 {
     4
-}
-
-fn default_history_limit() -> u32 {
-    20
 }
 
 /// `[trace]` config (wiki/220-vmodel-integration-design.md §2.1, M1
@@ -1037,7 +1042,8 @@ fn default_max_depth() -> usize {
 impl Default for SettingsConfig {
     fn default() -> Self {
         Self {
-            history_limit: default_history_limit(),
+            history_limit: None,
+            session_prune_limit: None,
             done_task_limit: default_done_task_limit(),
             auto_git_summary: default_auto_git_summary(),
             require_estimate_hours: default_require_estimate_hours(),

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::save_context::append_session_event;
 use super::HandlerContext;
 use crate::storage::sessions::{fork_session, read_session_by_id};
 
@@ -62,6 +63,12 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     )?;
 
     let forked_id = forked.id.as_deref().unwrap_or("unknown");
+    append_session_event(
+        handoff,
+        "session.created",
+        forked.id.as_deref(),
+        ctx.agent_id.as_deref(),
+    );
 
     let result = json!({
         "session_id": forked_id,

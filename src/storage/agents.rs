@@ -52,19 +52,36 @@ const GC_RETENTION_DAYS: i64 = 7;
 /// actually hits disk.
 const HEARTBEAT_DEBOUNCE_SECS: u64 = 60;
 
-/// Derive a stable agent identifier.
+/// Environment variable Claude Code sets to the id of the session that
+/// launched this MCP process. Highest priority for [`resolve_agent_id`].
+const ENV_CLAUDE_CODE_SESSION_ID: &str = "CLAUDE_CODE_SESSION_ID";
+
+/// Older / compatible spelling of [`ENV_CLAUDE_CODE_SESSION_ID`].
+const ENV_CLAUDE_SESSION_ID: &str = "CLAUDE_SESSION_ID";
+
+/// Pure agent-id resolution: `env` looks a variable up, `now` seeds the
+/// generated fallback.
 ///
-/// Prefers `CLAUDE_SESSION_ID` (set by the Claude Code CLI) so an agent's
-/// identity survives process restarts within the same CLI session. Falls
-/// back to a locally-generated, filesystem-safe timestamp id.
+/// Order: `CLAUDE_CODE_SESSION_ID`, then `CLAUDE_SESSION_ID` (compat), then a
+/// filesystem-safe timestamp id `a-YYYYMMDD-HHMMSS-ffffff`. An empty variable
+/// counts as unset. Taking the lookup and the clock as parameters keeps this
+/// unit-testable without touching the process environment; the caller (the
+/// server's `main`) runs it once and keeps the result for the process's
+/// lifetime, which is what makes the id stable.
+pub fn resolve_agent_id(env: &dyn Fn(&str) -> Option<String>, now: DateTime<Utc>) -> String {
+    [ENV_CLAUDE_CODE_SESSION_ID, ENV_CLAUDE_SESSION_ID]
+        .iter()
+        .find_map(|key| env(key).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| format!("a-{}", now.format("%Y%m%d-%H%M%S-%6f")))
+}
+
+/// [`resolve_agent_id`] against the real process environment and clock.
+///
+/// Not idempotent when no env var is set (the fallback embeds the current
+/// time), so callers must resolve once and reuse the value — see
+/// `crate::mcp::router::set_agent_id`.
 pub fn generate_agent_id() -> String {
-    if let Ok(session_id) = std::env::var("CLAUDE_SESSION_ID") {
-        if !session_id.is_empty() {
-            return session_id;
-        }
-    }
-    let now = Utc::now();
-    format!("a-{}", now.format("%Y%m%d-%H%M%S-%6f"))
+    resolve_agent_id(&|key| std::env::var(key).ok(), Utc::now())
 }
 
 /// Path to the `.handoff/agents/` directory.

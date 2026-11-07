@@ -135,7 +135,10 @@ fn init_config_has_defaults() {
             .unwrap();
 
     assert_eq!(config.project.name, "defaults-test");
-    assert_eq!(config.settings.history_limit, 20);
+    assert_eq!(config.settings.history_limit, None);
+    assert_eq!(config.settings.session_prune_limit, None);
+    let raw = std::fs::read_to_string(dir.path().join(".handoff/config.toml")).unwrap();
+    assert!(!raw.contains("history_limit"), "init wrote: {raw}");
     assert_eq!(config.settings.done_task_limit, 10);
     assert!(config.settings.auto_git_summary);
 }

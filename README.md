@@ -742,7 +742,8 @@ name = "my-project"
 description = "Project description"
 
 [settings]
-history_limit = 20            # Max closed sessions to keep
+# session_prune_limit = 100   # Opt-in: keep at most N closed sessions (default: keep all; heads are never pruned).
+                              # The old `history_limit` is deprecated and ignored since v0.47.3.
 done_task_limit = 10          # Max completed tasks to show
 auto_git_summary = true       # Capture git state automatically
 require_estimate_hours = true # Require estimate_hours on leaf tasks (default true)

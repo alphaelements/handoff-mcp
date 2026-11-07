@@ -9,9 +9,11 @@ use super::types::{
     ToolsCapability, ToolsListResult, INTERNAL_ERROR, METHOD_NOT_FOUND, PROTOCOL_VERSION,
 };
 
-/// Process-wide agent identity, set once `handoff_load_context` registers
-/// this process as an agent (t240.12). `None` until then, and for any
-/// process (e.g. tests) that never calls `handoff_load_context`.
+/// Process-wide agent identity. The server sets it once in `main.rs` before
+/// the first request (SPEC-V0473-006), so every tool call — even a
+/// `save_context` that precedes any `handoff_load_context` — sees it. It is
+/// `None` only for callers that skip the server startup (the CLI, and
+/// in-process tests until they call `handoff_load_context`).
 ///
 /// A single global is deliberate: one running MCP server process serves
 /// exactly one agent identity for its whole lifetime, and every subsequent
@@ -25,8 +27,8 @@ pub fn set_agent_id(id: String) {
     *AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
 }
 
-/// The agent identity registered by a prior `handoff_load_context` call in
-/// this process, if any.
+/// This process's agent identity (fixed at server startup, or registered by
+/// a prior `handoff_load_context` call in-process), if any.
 pub fn get_agent_id() -> Option<String> {
     AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }

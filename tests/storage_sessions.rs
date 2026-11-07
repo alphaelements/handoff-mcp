@@ -814,3 +814,234 @@ fn close_session_by_id_ambiguous_prefix_errors() {
         "error should list candidate: {err_msg}"
     );
 }
+
+// --- t439.7 (WS4-2): session auto-prune is off by default ---
+
+fn write_closed(sessions_dir: &std::path::Path, n: u32, id: &str, branch: &str) -> String {
+    let name = format!("20260610-{n:06}-s{n}.closed.json");
+    fs::write(
+        sessions_dir.join(&name),
+        format!(r#"{{"version":2,"id":"{id}","summary":"session {n}","branch":"{branch}"}}"#),
+    )
+    .unwrap();
+    name
+}
+
+fn closed_names(sessions_dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".closed.json"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// AC3: a limit of 0 used to delete every closed session.
+#[test]
+fn enforce_history_limit_zero_removes_nothing() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    for i in 1..=4 {
+        write_closed(&sessions_dir, i, &format!("s-{i}"), "main");
+    }
+
+    let removed = enforce_history_limit(&sessions_dir, 0).unwrap();
+
+    assert_eq!(removed, 0);
+    assert_eq!(closed_names(&sessions_dir).len(), 4);
+}
+
+fn ids(set: &[&str]) -> std::collections::HashSet<String> {
+    set.iter().map(|s| s.to_string()).collect()
+}
+
+/// Closed file whose name and body both carry `ended_at`, with a free-form
+/// slug so name order can be made to disagree with age order.
+fn write_closed_at(sessions_dir: &std::path::Path, ended_at: &str, id: &str, slug: &str) {
+    let compact = ended_at[..19].replace(['-', ':'], "").replace('T', "-");
+    fs::write(
+        sessions_dir.join(format!("{compact}-{slug}.closed.json")),
+        format!(r#"{{"version":2,"id":"{id}","ended_at":"{ended_at}","summary":"{slug}"}}"#),
+    )
+    .unwrap();
+}
+
+#[test]
+fn prune_closed_sessions_zero_limit_is_a_noop() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    write_closed(&sessions_dir, 1, "s-1", "main");
+    write_closed(&sessions_dir, 2, "s-2", "main");
+
+    let outcome = prune_closed_sessions(&sessions_dir, 0, &ids(&[])).unwrap();
+
+    assert!(outcome.removed.is_empty());
+    assert_eq!(outcome.retained_for_head, 0);
+    assert_eq!(closed_names(&sessions_dir).len(), 2);
+}
+
+/// DS-V0473-310 AC2: a head passed in by the caller is never removed, even
+/// when it is the oldest, and the overshoot is counted.
+#[test]
+fn prune_closed_sessions_never_removes_a_passed_head() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    write_closed(&sessions_dir, 1, "s-1", "main");
+    write_closed(&sessions_dir, 2, "s-2", "main");
+    write_closed(&sessions_dir, 3, "s-3", "main");
+
+    let outcome = prune_closed_sessions(&sessions_dir, 1, &ids(&["s-1"])).unwrap();
+
+    let removed_ids: Vec<&str> = outcome.removed.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(removed_ids, vec!["s-2", "s-3"]);
+    assert_eq!(outcome.retained_for_head, 0);
+    assert_eq!(closed_names(&sessions_dir).len(), 1);
+
+    // With two heads and limit 1 the overshoot is reported.
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    for i in 1..=3 {
+        write_closed(&sessions_dir, i, &format!("s-{i}"), "main");
+    }
+    let outcome = prune_closed_sessions(&sessions_dir, 1, &ids(&["s-1", "s-3"])).unwrap();
+    let removed_ids: Vec<&str> = outcome.removed.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(removed_ids, vec!["s-2"]);
+    assert_eq!(outcome.retained_for_head, 1);
+    assert_eq!(closed_names(&sessions_dir).len(), 2);
+}
+
+#[test]
+fn prune_closed_sessions_removes_oldest_and_reports_ids() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    for i in 1..=5 {
+        write_closed(&sessions_dir, i, &format!("s-{i}"), "main");
+    }
+
+    let outcome = prune_closed_sessions(&sessions_dir, 3, &ids(&[])).unwrap();
+
+    let removed_ids: Vec<&str> = outcome.removed.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(removed_ids, vec!["s-1", "s-2"]);
+    assert_eq!(outcome.retained_for_head, 0);
+    assert_eq!(closed_names(&sessions_dir).len(), 3);
+}
+
+/// Review finding: two closed saves in the same second share the file-name
+/// timestamp, so name order is slug order. The age order must come from
+/// `ended_at` (sub-second), or the just-saved session is deleted.
+#[test]
+fn prune_order_follows_ended_at_not_file_name_slug() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    // Same second; the NEWER save has the alphabetically SMALLER slug.
+    write_closed_at(
+        &sessions_dir,
+        "2026-06-10T10:00:00.100000000+00:00",
+        "s-old",
+        "zzz-old",
+    );
+    write_closed_at(
+        &sessions_dir,
+        "2026-06-10T10:00:00.900000000+00:00",
+        "s-new",
+        "aaa-new",
+    );
+
+    let heads = provisional_heads(&sessions_dir).unwrap();
+    assert_eq!(heads, ids(&["s-new"]));
+
+    let outcome = prune_closed_sessions(&sessions_dir, 1, &heads).unwrap();
+
+    let removed_ids: Vec<&str> = outcome.removed.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(removed_ids, vec!["s-old"]);
+    let survivors = closed_names(&sessions_dir);
+    assert_eq!(survivors.len(), 1);
+    assert!(survivors[0].contains("aaa-new"), "{survivors:?}");
+
+    // The head the prune protects is the one `previous_session` reads.
+    let latest = read_latest_closed_session(&sessions_dir).unwrap().unwrap();
+    assert_eq!(latest.id.as_deref(), Some("s-new"));
+}
+
+/// Without a readable `ended_at` the timestamp in the id orders the file
+/// (`close_session_id` leaves `ended_at` unset on a session it closes), and a
+/// file with no timestamp at all sorts as the oldest.
+#[test]
+fn prune_order_falls_back_to_id_timestamp_then_oldest() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    // Closed by id: no ended_at, but a fresh id.
+    fs::write(
+        sessions_dir.join("20260901-000000-closed-by-id.closed.json"),
+        r#"{"version":2,"id":"s-20260901-000000-123456","summary":"closed by id"}"#,
+    )
+    .unwrap();
+    write_closed_at(
+        &sessions_dir,
+        "2026-06-10T10:00:00+00:00",
+        "s-dated",
+        "dated",
+    );
+    // No ended_at and an id without a timestamp.
+    fs::write(
+        sessions_dir.join("20260101-000000-undated.closed.json"),
+        r#"{"version":2,"id":"custom-id","summary":"undated"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        provisional_heads(&sessions_dir).unwrap(),
+        ids(&["s-20260901-000000-123456"])
+    );
+    let outcome =
+        prune_closed_sessions(&sessions_dir, 1, &ids(&["s-20260901-000000-123456"])).unwrap();
+    let removed_ids: Vec<&str> = outcome.removed.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(removed_ids, vec!["custom-id", "s-dated"]);
+}
+
+/// SPEC-V0473-110: one chronological lineage, so exactly one head no matter
+/// how many branches or worktrees the history spans.
+#[test]
+fn provisional_heads_is_the_single_newest_closed_session() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    assert!(provisional_heads(&sessions_dir).unwrap().is_empty());
+
+    write_closed(&sessions_dir, 1, "s-1", "branch-a");
+    write_closed(&sessions_dir, 2, "s-2", "branch-b");
+    write_closed(&sessions_dir, 3, "s-3", "branch-c");
+
+    assert_eq!(provisional_heads(&sessions_dir).unwrap(), ids(&["s-3"]));
+    assert!(provisional_heads(&dir.path().join("missing"))
+        .unwrap()
+        .is_empty());
+}
+
+/// DS-V0473-310 AC1: 30 closed sessions over many branches, limit 10 -> the
+/// newest 10 remain and no head warning is needed.
+#[test]
+fn provisional_heads_with_many_branches_leave_exactly_limit() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    for i in 1..=30 {
+        write_closed(&sessions_dir, i, &format!("s-{i}"), &format!("branch-{i}"));
+    }
+
+    let heads = provisional_heads(&sessions_dir).unwrap();
+    let outcome = prune_closed_sessions(&sessions_dir, 10, &heads).unwrap();
+
+    assert_eq!(outcome.removed.len(), 20);
+    assert_eq!(outcome.retained_for_head, 0);
+    assert_eq!(closed_names(&sessions_dir).len(), 10);
+}

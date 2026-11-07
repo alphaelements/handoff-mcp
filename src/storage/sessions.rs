@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -863,34 +864,149 @@ pub struct MergeResult {
     pub closed_sessions: Vec<String>,
 }
 
-pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
-    if !sessions_dir.exists() {
-        return Ok(0);
-    }
+/// One closed session removed by [`prune_closed_sessions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedSession {
+    /// The session id from the file body, or the id synthesized from the
+    /// file name for old files that carry none.
+    pub id: String,
+    pub file_name: String,
+}
 
-    let mut closed_files: Vec<PathBuf> = Vec::new();
+#[derive(Debug, Default)]
+pub struct PruneOutcome {
+    pub removed: Vec<PrunedSession>,
+    /// Closed sessions still on disk above `limit` solely because they are
+    /// heads (see [`prune_closed_sessions`]).
+    pub retained_for_head: u32,
+}
 
+/// A closed session file with the data the prune order and head choice need.
+struct ClosedEntry {
+    path: PathBuf,
+    file_name: String,
+    id: String,
+    ended_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+/// The UTC instant embedded in a session id (`s-YYYYMMDD-HHMMSS-uuuuuu`, or
+/// the `-000000` form synthesized from an old file name).
+fn timestamp_from_id(id: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let rest = id.strip_prefix("s-")?;
+    let naive = chrono::NaiveDateTime::parse_from_str(rest.get(..22)?, "%Y%m%d-%H%M%S-%6f").ok()?;
+    Some(naive.and_utc().fixed_offset())
+}
+
+/// Every `*.closed.json`, oldest first.
+///
+/// Age is the parsed `ended_at` (the same notion of "newest" as
+/// [`read_latest_closed_session`]), with the file name as tie-breaker. The
+/// file name alone is not an age order: it carries the `ended_at` second
+/// followed by the summary slug, so two saves within one second would sort by
+/// slug. When `ended_at` is absent or unreadable the timestamp in the session
+/// id stands in; a file with neither sorts as the oldest.
+fn closed_entries_oldest_first(sessions_dir: &Path) -> Result<Vec<ClosedEntry>> {
+    let mut entries: Vec<ClosedEntry> = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".closed.json") {
-            closed_files.push(entry.path());
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.ends_with(".closed.json") {
+            continue;
         }
+        let path = entry.path();
+        // An unreadable or unparseable file is still a closed session that
+        // counts toward the limit; it just has no id or timestamp of its own.
+        let parsed: Option<SessionData> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok());
+        let (id, ended_at) = match parsed {
+            Some(d) => {
+                let id =
+                    d.id.unwrap_or_else(|| synthesize_id_from_filename(&file_name));
+                // A session closed by id (`close_session_id`) keeps whatever
+                // `ended_at` it had, possibly none; the id embeds its creation
+                // time, which is also what its file name was stamped with.
+                let age = d
+                    .ended_at
+                    .as_deref()
+                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                    .or_else(|| timestamp_from_id(&id));
+                (id, age)
+            }
+            None => (synthesize_id_from_filename(&file_name), None),
+        };
+        entries.push(ClosedEntry {
+            path,
+            file_name,
+            id,
+            ended_at,
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.ended_at
+            .cmp(&b.ended_at)
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
+    Ok(entries)
+}
+
+/// Interim head set (v0.47.3, before sessions record `continues`): the single
+/// newest closed session, i.e. the tip of the one chronological lineage.
+/// Callers hand the result to [`prune_closed_sessions`], so replacing this
+/// rule with a `continues`-based one does not touch the prune loop.
+pub fn provisional_heads(sessions_dir: &Path) -> Result<HashSet<String>> {
+    if !sessions_dir.exists() {
+        return Ok(HashSet::new());
+    }
+    let entries = closed_entries_oldest_first(sessions_dir)?;
+    Ok(entries.last().map(|e| e.id.clone()).into_iter().collect())
+}
+
+/// Prune the oldest closed sessions down to `limit`, never removing a head.
+///
+/// `limit == 0` means "no limit" and removes nothing: a zero used to wipe
+/// every closed session. Sessions whose id is in `heads` are skipped, so the
+/// result can exceed `limit`; the overshoot is reported in
+/// [`PruneOutcome::retained_for_head`]. Only closed sessions are considered.
+pub fn prune_closed_sessions(
+    sessions_dir: &Path,
+    limit: u32,
+    heads: &HashSet<String>,
+) -> Result<PruneOutcome> {
+    let mut outcome = PruneOutcome::default();
+    if limit == 0 || !sessions_dir.exists() {
+        return Ok(outcome);
     }
 
-    closed_files.sort();
-
-    let mut removed = 0u32;
-    while closed_files.len() > limit as usize {
-        if let Some(oldest) = closed_files.first() {
-            std::fs::remove_file(oldest)
-                .with_context(|| format!("Failed to remove old session: {}", oldest.display()))?;
-            closed_files.remove(0);
-            removed += 1;
+    let entries = closed_entries_oldest_first(sessions_dir)?;
+    let mut remaining = entries.len();
+    for entry in &entries {
+        if remaining <= limit as usize {
+            break;
         }
+        if heads.contains(&entry.id) {
+            continue;
+        }
+        std::fs::remove_file(&entry.path)
+            .with_context(|| format!("Failed to remove old session: {}", entry.path.display()))?;
+        outcome.removed.push(PrunedSession {
+            id: entry.id.clone(),
+            file_name: entry.file_name.clone(),
+        });
+        remaining -= 1;
     }
+    outcome.retained_for_head = remaining.saturating_sub(limit as usize) as u32;
 
-    Ok(removed)
+    Ok(outcome)
+}
+
+/// Count-only prune: delete the oldest closed sessions beyond `limit`,
+/// head-agnostic, and return how many were removed. `limit == 0` removes
+/// nothing. Head-aware pruning with events is [`prune_closed_sessions`].
+pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
+    Ok(prune_closed_sessions(sessions_dir, limit, &HashSet::new())?
+        .removed
+        .len() as u32)
 }
 
 pub fn write_session_with_status(

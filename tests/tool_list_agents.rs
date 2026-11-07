@@ -64,6 +64,7 @@ fn list_agents_empty_when_none_registered() {
 /// `handoff_list_agents`.
 #[test]
 fn load_context_registers_agent_visible_in_list_agents() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = setup();
     let project_dir = init(&dir);
 
@@ -89,6 +90,7 @@ fn load_context_registers_agent_visible_in_list_agents() {
 /// `agent_id`.
 #[test]
 fn load_context_response_includes_agent_id() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = setup();
     let project_dir = init(&dir);
 
@@ -108,6 +110,7 @@ fn load_context_response_includes_agent_id() {
 /// `handoff_list_agents` must filter by `status`.
 #[test]
 fn list_agents_filters_by_status() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = setup();
     let project_dir = init(&dir);
 
@@ -218,19 +221,20 @@ fn list_agents_include_tasks_toggle() {
     assert_eq!(tasks[0], "t1");
 }
 
-/// Serializes tests that mutate `CLAUDE_SESSION_ID`, since env vars are
-/// process-global and Rust runs tests in threads.
+/// Serializes every test here that calls `handoff_load_context`: the agent
+/// identity is a process-wide global (`set_agent_id`), and the reconnect test
+/// below pins it, so no other load_context may run in between.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Reconnecting with the same `CLAUDE_SESSION_ID` (i.e. the same derived
-/// `agent_id`, see `generate_agent_id`) must update the existing agent
-/// record in place rather than creating a second one, and must preserve any
-/// `claimed_tasks` already recorded against it.
+/// Reconnecting with the same agent identity (the process-wide `agent_id`,
+/// normally fixed once at server startup from `CLAUDE_CODE_SESSION_ID` /
+/// `CLAUDE_SESSION_ID`) must update the existing agent record in place rather
+/// than creating a second one, and must preserve any `claimed_tasks` already
+/// recorded against it.
 #[test]
 fn load_context_reconnect_updates_existing_record_not_duplicate() {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let saved = std::env::var("CLAUDE_SESSION_ID").ok();
-    std::env::set_var("CLAUDE_SESSION_ID", "s-reconnect-test-fixed-id");
+    handoff_mcp::mcp::router::set_agent_id("s-reconnect-test-fixed-id".to_string());
 
     let dir = setup();
     let project_dir = init(&dir);
@@ -260,17 +264,13 @@ fn load_context_reconnect_updates_existing_record_not_duplicate() {
 
     let count = std::fs::read_dir(&agents_dir).unwrap().count();
     assert_eq!(count, 1, "reconnect must update, not duplicate, the record");
-
-    match saved {
-        Some(v) => std::env::set_var("CLAUDE_SESSION_ID", v),
-        None => std::env::remove_var("CLAUDE_SESSION_ID"),
-    }
 }
 
 /// Full E2E flow: init -> load_context -> list_agents shows the registered
 /// agent as active with no claimed tasks.
 #[test]
 fn e2e_init_load_context_list_agents_flow() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = setup();
     let project_dir = init(&dir);
 

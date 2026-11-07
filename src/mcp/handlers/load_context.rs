@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
+use super::save_context::append_session_event;
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::agents::{
     generate_agent_id, read_agent, write_agent, AgentRecord, AgentStatus,
@@ -14,7 +15,7 @@ use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
     activate_open_sessions, activate_session_by_id, read_active_sessions,
     read_latest_closed_session, read_open_sessions, read_paused_sessions,
-    resume_paused_session_by_id,
+    resume_paused_session_by_id, SessionData,
 };
 use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
 
@@ -82,6 +83,17 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let multi_session = config.settings.multi_session;
 
+    // The process's identity was fixed once at startup (see `main.rs`). Only a
+    // caller that never went through the server's startup (in-process tests)
+    // reaches the fallback, which resolves it now; it is stored below so every
+    // later call in the same process reuses it.
+    let agent_id = ctx.agent_id.clone().unwrap_or_else(generate_agent_id);
+    let record_transition = |event: &str, session: Option<&SessionData>| {
+        if let Some(id) = session.and_then(|s| s.id.as_deref()) {
+            append_session_event(handoff, event, Some(id), Some(&agent_id));
+        }
+    };
+
     let selected_session = if let Some(sid) = target_session_id {
         let already_active = active_sessions
             .iter()
@@ -102,13 +114,17 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 active_ids.join(", ")
             );
         } else if activate_session_by_id(&sessions_dir, sid)?.is_some() {
-            sessions
+            let activated = sessions
                 .into_iter()
-                .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+                .find(|s| s.id.as_deref().is_some_and(|id| id == sid));
+            record_transition("session.activated", activated.as_ref());
+            activated
         } else if resume_paused_session_by_id(&sessions_dir, sid)?.is_some() {
-            paused_sessions
+            let resumed = paused_sessions
                 .into_iter()
-                .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+                .find(|s| s.id.as_deref().is_some_and(|id| id == sid));
+            record_transition("session.resumed", resumed.as_ref());
+            resumed
         } else {
             None
         }
@@ -124,6 +140,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
     } else {
         activate_open_sessions(&sessions_dir)?;
+        for activated in &sessions {
+            record_transition("session.activated", Some(activated));
+        }
         sessions.into_iter().last()
     };
 
@@ -131,7 +150,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         build_task_index_with_expiry(&tasks_dir, config.settings.done_task_limit)?;
 
     let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
-    let agent = register_agent(handoff, project_dir, session_id_for_agent)?;
+    let agent = register_agent(handoff, project_dir, &agent_id, session_id_for_agent)?;
     crate::mcp::router::set_agent_id(agent.agent_id.clone());
     // Best-effort GC of long-disconnected agent records; never let a GC
     // failure fail the whole load_context call.
@@ -151,6 +170,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let mut warnings: Vec<Warning> = Vec::new();
 
     if let Some(warning) = version_mismatch_warning(handoff) {
+        warnings.push(warning.into());
+    }
+
+    if let Some(warning) = history_limit_deprecation_warning(config.settings.history_limit) {
         warnings.push(warning.into());
     }
 
@@ -602,17 +625,17 @@ fn health_guidance_message(
 /// Register (or refresh) this process's agent record under
 /// `.handoff/agents/<agent-id>.json` (spec §7.2).
 ///
-/// The agent id itself is a stable per-process/CLI-session identity (see
-/// [`generate_agent_id`]), so a reconnecting agent — same `CLAUDE_SESSION_ID`,
+/// The agent id itself is the stable per-process identity fixed at startup
+/// (see [`generate_agent_id`]), so a reconnecting agent — same session id env var,
 /// new process — resolves to the *same* record: this updates that existing
 /// record (preserving its `claimed_tasks` and `registered_at`) rather than
 /// creating a fresh one that would forget in-flight claims.
 fn register_agent(
     handoff: &Path,
     project_dir: &Path,
+    agent_id: &str,
     session_id: Option<String>,
 ) -> Result<AgentRecord> {
-    let agent_id = generate_agent_id();
     let now = Utc::now();
     // `capture_git_state` itself never errors (it falls back to "unknown"
     // per-field on git failures); treat that sentinel as "no branch info"
@@ -622,7 +645,7 @@ fn register_agent(
         .map(|g| g.branch)
         .filter(|b| b != "unknown");
 
-    let existing_record = read_agent(handoff, &agent_id)?;
+    let existing_record = read_agent(handoff, agent_id)?;
     let is_new = existing_record.is_none();
 
     let record = if let Some(mut existing) = existing_record {
@@ -635,7 +658,7 @@ fn register_agent(
         existing
     } else {
         AgentRecord {
-            agent_id: agent_id.clone(),
+            agent_id: agent_id.to_string(),
             session_id,
             worktree: project_dir.to_path_buf(),
             branch,
@@ -661,7 +684,7 @@ fn register_agent(
                 ts: now.to_rfc3339(),
                 event: "agent.registered".to_string(),
                 task_id: None,
-                agent_id: Some(agent_id),
+                agent_id: Some(agent_id.to_string()),
                 session_id: record.session_id.clone(),
                 detail: None,
             },
@@ -693,6 +716,28 @@ fn version_mismatch_warning(handoff: &Path) -> Option<String> {
          cause lock fields to be silently ignored. Please update all instances to the same \
          version."
     ))
+}
+
+/// `[settings] history_limit` stopped pruning sessions in v0.47.3 (it is
+/// replaced by the opt-in `session_prune_limit`). A config that still carries
+/// it — typically the `20` older `handoff_init` runs wrote — gets one warning
+/// per `load_context` call, with the exact command that removes the key.
+fn history_limit_deprecation_warning(history_limit: Option<u32>) -> Option<StructuredWarning> {
+    let value = history_limit?;
+    Some(StructuredWarning {
+        severity: "warning".to_string(),
+        code: "DEPRECATED_HISTORY_LIMIT".to_string(),
+        message: format!(
+            "settings.history_limit ({value}) is deprecated and ignored: sessions are no \
+             longer deleted automatically (v0.47.3). Set settings.session_prune_limit to \
+             opt in to pruning."
+        ),
+        fix_hint: Some(
+            "handoff_update_config updates={\"settings.history_limit\": null} removes the key."
+                .to_string(),
+        ),
+        affected_doc_ids: vec![],
+    })
 }
 
 /// Warns when a task the previous (closed) session was working on is still

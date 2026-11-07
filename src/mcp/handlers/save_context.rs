@@ -8,16 +8,16 @@ use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_session_by_id, enforce_history_limit, find_active_primary_session_id,
-    generate_session_id, pause_active_sessions, pause_session_by_id, read_active_sessions,
-    update_active_session, update_and_close_active_session, write_session_with_status, SessionData,
+    close_session_by_id, find_active_primary_session_id, generate_session_id,
+    pause_active_sessions, pause_session_by_id, provisional_heads, prune_closed_sessions,
+    read_active_sessions, update_active_session, update_and_close_active_session,
+    write_session_with_status, SessionData,
 };
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let project_dir = &ctx.project_dir;
     let handoff = &ctx.handoff_dir;
     let sessions_dir = handoff.join("sessions");
-    let config_path = handoff.join("config.toml");
 
     let close_id = arguments.get("close_session_id").and_then(|v| v.as_str());
     let pause_id = arguments.get("pause_session_id").and_then(|v| v.as_str());
@@ -215,27 +215,27 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             let mut data = handoff_updates.clone();
             data.id = Some(new_id.clone());
             let target_status = if keep_active { "active" } else { "closed" };
-            let p = write_session_with_status(&sessions_dir, &data, target_status)?;
-            if keep_active {
-                append_session_event(
-                    handoff,
-                    "session.created",
-                    Some(&new_id),
-                    ctx.agent_id.as_deref(),
-                );
+            if !keep_active {
+                // `handoff_updates` leaves ownership unset for a closing call
+                // so that closing an *existing* session keeps the owner it was
+                // created with. A brand-new closed session has no earlier
+                // owner, so record who created it and where.
+                data.agent_id = ctx.agent_id.clone();
+                data.worktree = Some(call_worktree.clone());
+                data.scope = Some(crate::storage::detect_session_scope(project_dir).to_string());
             }
+            let p = write_session_with_status(&sessions_dir, &data, target_status)?;
+            append_session_event(
+                handoff,
+                "session.created",
+                Some(&new_id),
+                ctx.agent_id.as_deref(),
+            );
             (0, Some(p), Some(new_id))
         }
     };
 
-    let history_limit = if config_path.exists() {
-        read_config(&config_path)
-            .map(|c| c.settings.history_limit)
-            .unwrap_or(20)
-    } else {
-        20
-    };
-    let removed = enforce_history_limit(&sessions_dir, history_limit)?;
+    let prune_lines = prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?;
 
     let file_display = path
         .as_ref()
@@ -272,10 +272,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             ));
         }
     }
-    if removed > 0 {
-        msg.push_str(&format!(
-            "\nRemoved {removed} old session(s) (history_limit: {history_limit})"
-        ));
+    for line in &prune_lines {
+        msg.push('\n');
+        msg.push_str(line);
     }
 
     // FR-503: one metrics snapshot per day, refreshed on every non-pause-only
@@ -292,11 +291,69 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     Ok(msg)
 }
 
-/// Best-effort append of a `session.created`/`session.closed` event (spec
-/// 3.6.3, 4.2 FR-2.5) to `events.jsonl`. Never lets a logging failure fail
-/// the save_context call itself — same fire-and-forget contract as the
-/// other event sites in this codebase (e.g. `claim_release::handle_reclaim`).
-fn append_session_event(
+/// Applies the opt-in `[settings] session_prune_limit` (v0.47.3): without it
+/// nothing is ever deleted. Each removed session is logged as a
+/// `session.pruned` event, and sessions kept above the limit because they are
+/// heads are reported. Returns the human-readable lines for the tool response.
+///
+/// An unreadable `config.toml` is treated as "no limit configured": pruning
+/// deletes user data, so the safe fallback is to delete nothing (the same
+/// broken file already fails every config-reading tool loudly).
+pub(super) fn prune_sessions_per_config(
+    handoff: &Path,
+    agent_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let config_path = handoff.join("config.toml");
+    let Some(limit) = read_config(&config_path)
+        .ok()
+        .and_then(|c| c.settings.session_prune_limit)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let sessions_dir = handoff.join("sessions");
+    let heads = provisional_heads(&sessions_dir)?;
+    let outcome = prune_closed_sessions(&sessions_dir, limit, &heads)?;
+    for pruned in &outcome.removed {
+        // Best-effort like every other event: the delete already happened.
+        let _ = crate::storage::events::append_event(
+            handoff,
+            crate::storage::events::EventRecord {
+                ts: Utc::now().to_rfc3339(),
+                event: "session.pruned".to_string(),
+                task_id: None,
+                agent_id: agent_id.map(String::from),
+                session_id: Some(pruned.id.clone()),
+                detail: Some(format!(
+                    "file={}; session_prune_limit={limit}",
+                    pruned.file_name
+                )),
+            },
+        );
+    }
+
+    let mut lines = Vec::new();
+    if !outcome.removed.is_empty() {
+        lines.push(format!(
+            "Removed {} old session(s) (session_prune_limit: {limit})",
+            outcome.removed.len()
+        ));
+    }
+    if outcome.retained_for_head > 0 {
+        lines.push(format!(
+            "Warning: kept {} session(s) above session_prune_limit ({limit}) because they are heads",
+            outcome.retained_for_head
+        ));
+    }
+    Ok(lines)
+}
+
+/// Best-effort append of a session lifecycle event (`session.created` /
+/// `activated` / `resumed` / `closed`, spec 3.6.3, 4.2 FR-2.5) to
+/// `events.jsonl`. A logging failure never fails the tool call — same
+/// fire-and-forget contract as the other event sites (e.g.
+/// `claim_release::handle_reclaim`).
+pub(super) fn append_session_event(
     handoff: &Path,
     event: &str,
     session_id: Option<&str>,

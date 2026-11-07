@@ -18,23 +18,34 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every env var that feeds [`generate_agent_id`]; cleared for the guard's
+/// lifetime so a developer's own Claude session id never leaks into a test.
+const AGENT_ID_ENV_VARS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"];
+
 struct EnvGuard {
-    saved: Option<String>,
+    saved: Vec<(&'static str, Option<String>)>,
 }
 
 impl EnvGuard {
     fn new() -> Self {
-        let saved = std::env::var("CLAUDE_SESSION_ID").ok();
-        std::env::remove_var("CLAUDE_SESSION_ID");
+        let saved = AGENT_ID_ENV_VARS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in AGENT_ID_ENV_VARS {
+            std::env::remove_var(k);
+        }
         Self { saved }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        match &self.saved {
-            Some(v) => std::env::set_var("CLAUDE_SESSION_ID", v),
-            None => std::env::remove_var("CLAUDE_SESSION_ID"),
+        for (k, v) in &self.saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
     }
 }
@@ -133,6 +144,64 @@ fn generate_agent_id_falls_back_when_empty_string() {
 
     let id = generate_agent_id();
     assert!(id.starts_with("a-"), "id: {id}");
+}
+
+#[test]
+fn generate_agent_id_prefers_claude_code_session_id() {
+    let _lock = env_lock();
+    let _guard = EnvGuard::new();
+    std::env::set_var("CLAUDE_CODE_SESSION_ID", "cc-id");
+    std::env::set_var("CLAUDE_SESSION_ID", "legacy-id");
+
+    assert_eq!(generate_agent_id(), "cc-id");
+}
+
+// --- resolve_agent_id (pure) ---
+
+fn fixed_now() -> chrono::DateTime<Utc> {
+    "2026-11-07T12:34:56.123456Z".parse().unwrap()
+}
+
+fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.to_string())
+    }
+}
+
+#[test]
+fn resolve_agent_id_prefers_claude_code_session_id() {
+    let env = env_of(&[
+        ("CLAUDE_CODE_SESSION_ID", "cc-id"),
+        ("CLAUDE_SESSION_ID", "legacy-id"),
+    ]);
+    assert_eq!(resolve_agent_id(&env, fixed_now()), "cc-id");
+}
+
+#[test]
+fn resolve_agent_id_falls_back_to_legacy_variable() {
+    let env = env_of(&[("CLAUDE_SESSION_ID", "legacy-id")]);
+    assert_eq!(resolve_agent_id(&env, fixed_now()), "legacy-id");
+}
+
+#[test]
+fn resolve_agent_id_treats_empty_primary_as_unset() {
+    let env = env_of(&[
+        ("CLAUDE_CODE_SESSION_ID", ""),
+        ("CLAUDE_SESSION_ID", "legacy-id"),
+    ]);
+    assert_eq!(resolve_agent_id(&env, fixed_now()), "legacy-id");
+}
+
+#[test]
+fn resolve_agent_id_generates_timestamp_id_when_nothing_set() {
+    let env = env_of(&[("CLAUDE_CODE_SESSION_ID", ""), ("CLAUDE_SESSION_ID", "")]);
+    assert_eq!(
+        resolve_agent_id(&env, fixed_now()),
+        "a-20261107-123456-123456"
+    );
 }
 
 // --- CRUD ---

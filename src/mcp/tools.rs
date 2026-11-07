@@ -418,7 +418,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "updates": {
                         "type": "object",
-                        "description": "Key-value pairs to update (dot-notation keys like 'settings.history_limit')"
+                        "description": "Key-value pairs to update (dot-notation keys like 'settings.session_prune_limit')"
                     }
                 },
                 "required": ["updates"]
@@ -2337,7 +2337,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_events".to_string(),
-            description: "Query .handoff/events.jsonl (lease/agent/session lifecycle events: task.claimed, task.released, task.expired, task.reclaimed, agent.registered, session.created, session.closed) with optional filters. Returns matching events oldest-first, most-recent-first when truncated by limit.".to_string(),
+            description: "Query .handoff/events.jsonl (lease/agent/session lifecycle events: task.claimed, task.released, task.expired, task.reclaimed, agent.registered, session.created, session.activated, session.resumed, session.closed, session.pruned) with optional filters. Returns matching events oldest-first, most-recent-first when truncated by limit.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

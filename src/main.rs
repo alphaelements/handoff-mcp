@@ -69,6 +69,11 @@ fn main() {
 
     eprintln!("handoff-mcp v{}", env!("CARGO_PKG_VERSION"));
 
+    // Fix this process's agent identity before the first request so every
+    // tool call (including a `save_context` that precedes any
+    // `load_context`) sees the same `agent_id` for the whole lifetime.
+    handoff_mcp::mcp::router::set_agent_id(handoff_mcp::storage::agents::generate_agent_id());
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let timeout = request_timeout();
