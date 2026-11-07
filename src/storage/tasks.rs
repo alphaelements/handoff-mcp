@@ -282,6 +282,11 @@ pub fn is_terminal_status(status: &str) -> bool {
     status == "done" || status == "skipped"
 }
 
+/// Upper bound (bytes) for the slug part of a task directory name
+/// (`{task_id}-{slug}`). Keeps the whole name under the 255-byte filesystem
+/// limit even for 4-byte characters and long hierarchical IDs.
+pub const TASK_SLUG_MAX_BYTES: usize = 120;
+
 pub fn title_to_slug(title: &str) -> String {
     let slug: String = title
         .chars()
@@ -309,11 +314,37 @@ pub fn title_to_slug(title: &str) -> String {
             prev_dash = false;
         }
     }
+    // Cut on a character boundary so multi-byte titles never split mid-codepoint.
+    let mut cut = result.len().min(TASK_SLUG_MAX_BYTES);
+    while !result.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    result.truncate(cut);
+    let result = result.trim_end_matches('-');
     if result.is_empty() {
         "task".to_string()
     } else {
-        result
+        result.to_string()
     }
+}
+
+/// Create a task directory, reporting the directory-name byte length on
+/// failure (the usual cause is a name over the filesystem's 255-byte limit).
+pub fn create_task_dir_all(task_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(task_dir).with_context(|| {
+        let name = task_dir.file_name().map(|n| n.to_string_lossy());
+        let name_bytes = task_dir.file_name().map_or(0, |n| n.len());
+        // `{task_id}-{slug}`: task IDs never contain `-`, so the slug is
+        // everything after the first one (DS-V0473-011 error rule).
+        let slug_bytes = name
+            .as_deref()
+            .and_then(|n| n.split_once('-'))
+            .map_or(0, |(_, slug)| slug.len());
+        format!(
+            "Failed to create task dir: {} (dir name is {name_bytes} bytes, slug is {slug_bytes} bytes)",
+            task_dir.display()
+        )
+    })
 }
 
 pub fn find_task_file(task_dir: &Path) -> Result<Option<(PathBuf, String)>> {

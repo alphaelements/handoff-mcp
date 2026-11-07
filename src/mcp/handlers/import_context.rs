@@ -329,8 +329,7 @@ fn create_task_recursive(
     let base_dir = parent_dir.unwrap_or(tasks_dir);
     let task_dir = base_dir.join(&dir_name);
 
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
+    create_task_dir_all(&task_dir)?;
 
     let now = Utc::now().to_rfc3339();
     let status = task_status(task_val);

@@ -124,7 +124,7 @@ coverage and state (lint `layer_outside_profile`, info).
 | `[trace.profiles.<name>]` | table | none | custom profile (§4.4) | `[trace.profiles.web]` |
 | `[trace.lint.rules]` `<rule> = "<sev>"` | table of strings | `{}` | per-rule severity override (§7) | `unverified = "error"` |
 | `[[trace.lint.require]]` | array of tables | none | project policy rules (§7) | see §7 |
-| `[trace] auto_layer` | bool | `false` | `doc_save` without a `layer` argument infers one from `doc_type` (§6) | `auto_layer = true` |
+| `[trace] auto_layer` | bool | `false` | `doc_save` without a `layer` argument infers one from `doc_type` (§6) — only when the document is created; an existing document's layer is never changed by `append_body` or a metadata update | `auto_layer = true` |
 | `[trace] plan_default_layer` | string | `"detailed_spec"` | the layer `auto_layer` gives `plan` documents | `plan_default_layer = "basic_spec"` |
 | `[trace.requirement_gate]` | table | unset | quality-gate settings for the requirement workflow (§9) | `[trace.requirement_gate]` |
 

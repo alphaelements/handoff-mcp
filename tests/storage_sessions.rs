@@ -242,6 +242,91 @@ fn generate_session_filename_format() {
 }
 
 #[test]
+fn session_filename_strips_trailing_non_ascii_symbols() {
+    let name = generate_session_filename("設計を実装して—", "20260613-143000");
+    assert_eq!(name, "20260613-143000-設計を実装して");
+    let name = generate_session_filename("完了…", "20260613-143000");
+    assert_eq!(name, "20260613-143000-完了");
+}
+
+#[test]
+fn session_filename_normalizes_inner_punctuation() {
+    let name = generate_session_filename("「設計」、レビュー。", "20260613-143000");
+    assert_eq!(name, "20260613-143000-設計-レビュー");
+}
+
+#[test]
+fn session_filename_symbols_only_falls_back_to_session() {
+    let name = generate_session_filename("—…、。！　", "20260613-143000");
+    assert_eq!(name, "20260613-143000-session");
+}
+
+#[test]
+fn session_filename_keeps_nfc_japanese_with_voiced_marks() {
+    let name = generate_session_filename("バグ修正ガイド", "20260613-143000");
+    assert_eq!(name, "20260613-143000-バグ修正ガイド");
+}
+
+/// FR-V0473-013 AC2: only the filename slug is normalized/truncated; the saved
+/// `summary` keeps the full original text, symbols included.
+#[test]
+fn session_filename_normalization_keeps_full_summary_in_metadata() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let summary =
+        "「設計」、レビュー。長い要約の末尾まで保持されることを確認するための文章—その後も続く…";
+    let data = make_session(summary, "2026-06-13T14:30:00Z");
+    let path = write_open_session(&sessions_dir, &data).unwrap();
+
+    let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        !file_name.contains('「') && !file_name.contains('—'),
+        "{file_name}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(parsed["summary"], summary);
+}
+
+/// DS-V0473-015 AC2: NFD input (base + combining voiced mark) keeps the
+/// combining mark attached instead of turning it into a separator.
+#[test]
+fn session_filename_keeps_nfd_combining_marks() {
+    // か + U+3099 (が), は + U+309A (ぱ), e + U+0301 (é)
+    let name = generate_session_filename("か\u{3099}は\u{309A}e\u{0301}", "20260613-143000");
+    assert_eq!(name, "20260613-143000-か\u{3099}は\u{309A}e\u{0301}");
+}
+
+#[test]
+fn session_filename_drops_leading_combining_mark() {
+    let name = generate_session_filename("\u{3099}\u{0301}バグ", "20260613-143000");
+    assert_eq!(name, "20260613-143000-バグ");
+}
+
+/// SPEC-V0473-013 AC2: a summary far over the 40-char slug limit is saved in
+/// full in the session JSON.
+#[test]
+fn long_summary_is_stored_in_full_in_metadata() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let summary = "long summary ".repeat(20);
+    assert!(summary.chars().count() > 40);
+    let data = make_session(&summary, "2026-06-13T14:30:00Z");
+    let path = write_open_session(&sessions_dir, &data).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(parsed["summary"], summary.as_str());
+}
+
+#[test]
+fn session_filename_full_width_alphanumerics_kept() {
+    let name = generate_session_filename("ＡＢＣ１２３", "20260613-143000");
+    assert_eq!(name, "20260613-143000-ＡＢＣ１２３");
+}
+
+#[test]
 fn read_open_sessions_nonexistent_dir() {
     let dir = setup();
     let sessions_dir = dir.path().join("nonexistent");

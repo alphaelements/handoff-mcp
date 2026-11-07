@@ -957,6 +957,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "type": "object",
                             "properties": {
                                 "task_id": { "type": "string", "description": "Task ID to update." },
+                                "id": { "type": "string", "description": "Alias of task_id. If both are given they must name the same task." },
                                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"], "description": "Moving a leaf task into in_progress/review/done requires schedule.estimate_hours to be present or supplied in the same update. Parent tasks (any task with children) and the statuses todo/blocked/skipped are exempt." },
                                 "priority": { "type": "string", "enum": ["low", "medium", "high"] },
                                 "assignee": { "type": "string" },
@@ -978,7 +979,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     }
                                 }
                             },
-                            "required": ["task_id"]
+                            "anyOf": [
+                                { "required": ["task_id"] },
+                                { "required": ["id"] }
+                            ]
                         }
                     }
                 },

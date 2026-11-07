@@ -16,6 +16,7 @@ use crate::storage::tasks::*;
 /// while the call still reports `applied`, so it is rejected up front instead.
 const SUPPORTED_UPDATE_FIELDS: &[&str] = &[
     "task_id",
+    TASK_ID_ALIAS,
     "status",
     "priority",
     "assignee",
@@ -23,6 +24,29 @@ const SUPPORTED_UPDATE_FIELDS: &[&str] = &[
     "notes_append",
     "schedule",
 ];
+
+/// Accepted alias of `task_id` on an `updates[]` element (FR-V0473-014).
+const TASK_ID_ALIAS: &str = "id";
+
+/// Shape example appended to the `missing task_id` error so a caller sees what
+/// an element should look like (FR-V0473-014).
+const MISSING_TASK_ID_MESSAGE: &str = "missing task_id (each updates[] element needs \"task_id\"; \
+     \"id\" is accepted as an alias. Example: {\"task_id\": \"t1\", \"status\": \"done\"})";
+
+/// Resolves the task id of one `updates[]` element from `task_id` or its
+/// `id` alias. Both given and naming different tasks is an error rather than
+/// a silent preference for one of them.
+fn resolve_update_task_id(update: &Value) -> Result<Option<&str>, String> {
+    let task_id = update.get("task_id").and_then(|v| v.as_str());
+    let alias = update.get(TASK_ID_ALIAS).and_then(|v| v.as_str());
+    match (task_id, alias) {
+        (Some(t), Some(a)) if t != a => Err(format!(
+            "conflicting task ids: task_id '{t}' and id '{a}' differ; pass only task_id"
+        )),
+        (Some(t), _) => Ok(Some(t)),
+        (None, alias) => Ok(alias),
+    }
+}
 
 /// Keys of `updates[].schedule` that `apply_single_update` actually applies.
 const SUPPORTED_SCHEDULE_FIELDS: &[&str] = &[
@@ -82,10 +106,14 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let mut warnings: Vec<Value> = Vec::new();
 
     for update in updates {
-        let task_id = match update.get("task_id").and_then(|v| v.as_str()) {
-            Some(id) => id,
-            None => {
-                errors.push(json!({"task_id": null, "error": "missing task_id"}));
+        let task_id = match resolve_update_task_id(update) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                errors.push(json!({"task_id": null, "error": MISSING_TASK_ID_MESSAGE}));
+                continue;
+            }
+            Err(message) => {
+                errors.push(json!({"task_id": null, "error": message}));
                 continue;
             }
         };

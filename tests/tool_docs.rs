@@ -914,6 +914,82 @@ fn doc_save_auto_layer_respects_explicit_layer_argument() {
     assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"));
 }
 
+/// FR-V0473-012 AC1 (B-5): inference runs only when a document is created.
+/// A layerless existing document (layer cleared on purpose) must not gain a
+/// layer from `append_body`, a metadata-only update or a full body rewrite.
+#[test]
+fn doc_save_auto_layer_does_not_touch_existing_documents() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    // Created with an explicit "" so it is layerless although auto_layer is on.
+    let (doc_id, _) = save_with_doc_type(&dir, "plan", Some(""));
+    assert!(doc_layer(&dir, &doc_id).is_null());
+
+    let appended = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "append_body": "## More\n\nAppended.\n" }),
+    );
+    assert!(!is_error(&appended), "error: {}", payload_text(&appended));
+    assert!(
+        doc_layer(&dir, &doc_id).is_null(),
+        "append_body set a layer"
+    );
+    assert!(
+        !payload(&appended)["warnings"]
+            .to_string()
+            .contains("auto-inferred"),
+        "{}",
+        payload(&appended)["warnings"]
+    );
+
+    let meta = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "tags": ["x"] }),
+    );
+    assert!(!is_error(&meta), "error: {}", payload_text(&meta));
+    assert!(
+        doc_layer(&dir, &doc_id).is_null(),
+        "metadata update set a layer"
+    );
+
+    let rewritten = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "body": "# Auto Layer\n\nRewritten.\n" }),
+    );
+    assert!(!is_error(&rewritten), "error: {}", payload_text(&rewritten));
+    assert!(
+        doc_layer(&dir, &doc_id).is_null(),
+        "body rewrite set a layer"
+    );
+}
+
+/// FR-V0473-012: an already-assigned layer survives an append unchanged, and
+/// FR-V0473-012 AC2: an explicit `layer` on an existing document still sets it.
+#[test]
+fn doc_save_existing_layer_kept_on_append_and_explicit_layer_still_applies() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    let (doc_id, _) = save_with_doc_type(&dir, "plan", Some("requirement"));
+    let appended = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "append_body": "More.\n" }),
+    );
+    assert!(!is_error(&appended), "error: {}", payload_text(&appended));
+    assert_eq!(doc_layer(&dir, &doc_id), json!("requirement"));
+
+    let relayered = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "layer": "basic_spec" }),
+    );
+    assert!(!is_error(&relayered), "error: {}", payload_text(&relayered));
+    assert_eq!(doc_layer(&dir, &doc_id), json!("basic_spec"));
+}
+
 fn save_plain(dir: &std::path::Path, slug: &str, title: &str, extra: Value) -> (String, Value) {
     let mut args = json!({ "slug": slug, "title": title, "body": format!("# {title}\n\nBody.\n") });
     for (k, v) in extra.as_object().expect("extra object") {

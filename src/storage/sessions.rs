@@ -68,19 +68,24 @@ pub fn generate_session_filename(summary: &str, timestamp: &str) -> String {
 }
 
 fn summary_to_slug(summary: &str) -> String {
-    let slug: String = summary
-        .chars()
-        .take(40)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else if !c.is_ascii() {
-                c
-            } else {
-                '-'
+    let mut slug = String::new();
+    for c in summary.chars().take(40) {
+        if matches!(c, '\u{0300}'..='\u{036F}' | '\u{3099}'..='\u{309A}') {
+            // Combining marks (NFD voiced/accent marks) stay attached to the
+            // preceding kept character; one with nothing to attach to is dropped.
+            if slug.chars().last().is_some_and(|p| p != '-') {
+                slug.push(c);
             }
-        })
-        .collect();
+        } else if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !c.is_ascii() && c.is_alphanumeric() {
+            // Letters/digits of any script stay; non-ASCII symbols,
+            // punctuation, spaces and emoji become separators.
+            slug.push(c);
+        } else {
+            slug.push('-');
+        }
+    }
     let slug = slug.trim_matches('-').to_string();
     let mut result = String::new();
     let mut prev_dash = false;

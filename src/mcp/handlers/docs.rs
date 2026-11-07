@@ -1795,8 +1795,10 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     }
     // t391.1 (REQ-VGAP-007): `[trace] auto_layer = true` infers the layer from
     // `doc_type` — only when the caller passed no `layer` argument at all
-    // (an explicit value, including `""`, always wins).
-    if doc.layer.is_none() && layer_arg.is_none() {
+    // (an explicit value, including `""`, always wins). FR-V0473-012: only at
+    // creation — an existing document's layer (or deliberate absence of one)
+    // is never changed by `append_body`, a metadata update or a body rewrite.
+    if doc_id.is_none() && doc.layer.is_none() && layer_arg.is_none() {
         if let Some(inferred) = trace_config.infer_layer(&doc.doc_type) {
             doc.layer = Some(inferred.to_string());
             warnings.push(format!(

@@ -760,8 +760,7 @@ pub(super) fn handle_create(
     // Create the directory only once every validation has passed. A rejected
     // create must leave nothing behind: an orphan dir would burn the task ID,
     // because `next_top_level_id` counts directories, not task files.
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
+    create_task_dir_all(&task_dir)?;
 
     write_task(&task_dir, status, &data)?;
 
@@ -895,8 +894,7 @@ fn handle_upsert_create(
 
     // Create the directory only once every validation has passed, so a rejected
     // upsert-create leaves no orphan dir shadowing the requested ID.
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
+    create_task_dir_all(&task_dir)?;
 
     write_task(&task_dir, status, &data)?;
 
