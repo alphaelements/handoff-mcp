@@ -11,6 +11,8 @@ user-invocable: true
 ## 手順
 
 1. `handoff_load_context` を呼ぶ（引数なし — cwd を使用）
+   - **前回セッション（系統）は自動判定される。** `previous_session.inferred: true`（根拠は `evidence`）が返ったらそのまま使う。`continue_from` は渡さない。次に新規セッションを作る `handoff_save_context` が `continues` に自動で記録する
+   - `ambiguous: true` が返ったとき**だけ**（`previous_session` と `next_actions` は無く、`other_heads` に候補が並ぶ）: 各候補の `summary` をユーザーの依頼内容・これから扱うタスクと照合し、合うものの `id` を `continue_from` に渡して `handoff_load_context` を呼び直す。決められなければユーザーに聞く。`in_flight_by` 付きの候補は他のエージェントの active が既に継いでいる（自分のものなら `session_id` + `adopt: true` で引き継ぐ）
 2. `not_initialized` が返った場合:
    - ディレクトリ名からプロジェクト名を推測
    - `handoff_init` で初期化

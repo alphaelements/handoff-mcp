@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionData {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +64,33 @@ pub struct SessionData {
     /// parameter. `None` for sessions predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Lineage format version (v0.47.3). Present only on sessions created by a
+    /// build that records `continues`; its absence marks old data, which the
+    /// lineage rules treat as one chronological lineage (see
+    /// `storage::lineage`). Never added to an existing session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_v: Option<u32>,
+    /// Ids of the sessions this one continues. `Some(vec![])` (serialized as
+    /// `[]`) is a deliberate new lineage origin; `None` is old data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<Vec<String>>,
+    /// `true` removes a closed session from the head set (written by hand;
+    /// no tool sets it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_end: Option<bool>,
+    /// Which checkout the session was saved from, comparable across machines
+    /// (`main` for the primary checkout, the `.git/worktrees/<name>` name for a
+    /// linked worktree). The absolute `worktree` path differs between a Mac host
+    /// and a container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_key: Option<String>,
+}
+
+impl SessionData {
+    /// The ids in `continues`, empty for old data.
+    pub fn continues_ids(&self) -> &[String] {
+        self.continues.as_deref().unwrap_or_default()
+    }
 }
 
 pub fn generate_session_id() -> String {
@@ -425,10 +452,61 @@ pub fn close_paused_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
     transition_sessions(sessions_dir, "paused", "closed")
 }
 
+/// The newest closed session by [`session_age`] (the order pruning uses). A
+/// session without `ended_at` is placed by the time in its id rather than
+/// treated as the oldest.
 pub fn read_latest_closed_session(sessions_dir: &Path) -> Result<Option<SessionData>> {
-    let mut sessions = read_sessions_by_status(sessions_dir, "closed")?;
-    sessions.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
-    Ok(sessions.into_iter().last())
+    let sessions = read_sessions_by_status(sessions_dir, "closed")?;
+    Ok(sessions
+        .into_iter()
+        .max_by_key(|s| (session_age(s), s.id.clone())))
+}
+
+/// How many closed sessions [`read_recent_closed_sessions`] reads at most.
+pub const RECENT_CLOSED_MAX: usize = 100;
+
+/// The newest `limit` closed sessions, newest file first.
+///
+/// File names start with the `ended_at` second, so name order is age order to
+/// within a second, and only the files that are read are parsed: with
+/// retention unlimited (v0.47.3) the closed set grows without bound while
+/// `load_context` only ever needs the recent lineage.
+pub fn read_recent_closed_sessions(sessions_dir: &Path, limit: usize) -> Result<Vec<SessionData>> {
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = std::fs::read_dir(sessions_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".closed.json"))
+        .collect();
+    names.sort_unstable_by(|a, b| b.cmp(a));
+    names.truncate(limit);
+    names
+        .into_iter()
+        .map(|name| {
+            let path = sessions_dir.join(&name);
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read session: {}", path.display()))?;
+            let mut data: SessionData = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+            if data.id.is_none() {
+                data.id = Some(synthesize_id_from_filename(&name));
+            }
+            Ok(data)
+        })
+        .collect()
+}
+
+/// When a session last ended: the parsed `ended_at`, else the time embedded in
+/// its id (a session closed by id keeps whatever `ended_at` it had, possibly
+/// none). `None` sorts as the oldest. Pruning and head detection share this so
+/// "newest" means the same thing in both.
+pub fn session_age(data: &SessionData) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    data.ended_at
+        .as_deref()
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .or_else(|| data.id.as_deref().and_then(timestamp_from_id))
 }
 
 fn apply_session_updates(
@@ -923,6 +1001,11 @@ pub fn fork_session(
             .map(|_| crate::storage::session_target::OWNER_V),
         worktree: Some(owner.worktree.to_string()),
         scope: Some(owner.scope.to_string()),
+        // A fork continues the session it was forked from.
+        lineage_v: Some(crate::storage::lineage::LINEAGE_V),
+        continues: Some(vec![source_id.to_string()]),
+        lineage_end: None,
+        worktree_key: crate::storage::worktree_key(Path::new(owner.worktree)),
     };
 
     for field in inherit {
@@ -1033,6 +1116,25 @@ pub fn merge_sessions(
                 closed_sessions.push(source_actual_id.to_string());
             }
         }
+    }
+
+    // The target now continues every other source. Old data gets `lineage_v`
+    // with the first appended id, because `continues` alone is ignored without it.
+    let appended: Vec<String> = sources
+        .iter()
+        .filter_map(|s| s.id.clone())
+        .filter(|id| *id != target_actual_id)
+        .collect();
+    if !appended.is_empty() {
+        let continues = target.continues.get_or_insert_with(Vec::new);
+        for id in appended {
+            if !continues.contains(&id) {
+                continues.push(id);
+            }
+        }
+        target
+            .lineage_v
+            .get_or_insert(crate::storage::lineage::LINEAGE_V);
     }
 
     // The merge target is an existing session, not a new one: its owner is
@@ -1182,18 +1284,11 @@ fn closed_entries_oldest_first(sessions_dir: &Path) -> Result<Vec<ClosedEntry>> 
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok());
         let (id, ended_at) = match parsed {
-            Some(d) => {
+            Some(mut d) => {
                 let id =
-                    d.id.unwrap_or_else(|| synthesize_id_from_filename(&file_name));
-                // A session closed by id (`close_session_id`) keeps whatever
-                // `ended_at` it had, possibly none; the id embeds its creation
-                // time, which is also what its file name was stamped with.
-                let age = d
-                    .ended_at
-                    .as_deref()
-                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                    .or_else(|| timestamp_from_id(&id));
-                (id, age)
+                    d.id.get_or_insert_with(|| synthesize_id_from_filename(&file_name))
+                        .clone();
+                (id, session_age(&d))
             }
             None => (synthesize_id_from_filename(&file_name), None),
         };
@@ -1212,16 +1307,34 @@ fn closed_entries_oldest_first(sessions_dir: &Path) -> Result<Vec<ClosedEntry>> 
     Ok(entries)
 }
 
-/// Interim head set (v0.47.3, before sessions record `continues`): the single
-/// newest closed session, i.e. the tip of the one chronological lineage.
-/// Callers hand the result to [`prune_closed_sessions`], so replacing this
-/// rule with a `continues`-based one does not touch the prune loop.
-pub fn provisional_heads(sessions_dir: &Path) -> Result<HashSet<String>> {
+/// The ids of the closed sessions that are lineage heads (see
+/// [`crate::storage::lineage`]), over every closed session on disk. Callers
+/// hand the result to [`prune_closed_sessions`], which never removes them.
+pub fn closed_head_ids(sessions_dir: &Path) -> Result<HashSet<String>> {
     if !sessions_dir.exists() {
         return Ok(HashSet::new());
     }
-    let entries = closed_entries_oldest_first(sessions_dir)?;
-    Ok(entries.last().map(|e| e.id.clone()).into_iter().collect())
+    // Like the prune loop, an unparseable file is skipped rather than failing
+    // the save that triggered pruning: it can only make a head go unnoticed
+    // when the file itself was that head, and a file that cannot be read is not
+    // one `load_context` could return either.
+    let mut closed = Vec::new();
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".closed.json") {
+            continue;
+        }
+        let parsed: Option<SessionData> = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok());
+        if let Some(mut data) = parsed {
+            data.id
+                .get_or_insert_with(|| synthesize_id_from_filename(&name));
+            closed.push(data);
+        }
+    }
+    Ok(crate::storage::lineage::head_ids(&closed))
 }
 
 /// Prune the oldest closed sessions down to `limit`, never removing a head.

@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Research/bug-report sub-agents record progress with `handoff_update_session`
   instead of a closed `handoff_save_context`, which would close the parent's
   session.
+- **`load_context` picks the previous session by lineage, not by date**: a new
+  session records the sessions it continues (`continues`), and
+  `previous_session` is the latest session of *your* lineage. An obvious
+  choice is returned with `inferred: true` and its `evidence`. When two
+  lineages cannot be told apart, `load_context` returns `ambiguous: true` with
+  up to five `other_heads` (no bodies) instead of guessing, and no
+  `previous_session` / `next_actions`; call it again with
+  `continue_from: "<id>"`. The choice is recorded by your next session-creating
+  `save_context` (`continues` / `lineage_token` override it; a guess is flagged
+  `continues_uncertain`). Sessions written by older versions count as one
+  lineage. New sessions record the full commit hash and a `worktree_key`.
+- `session_prune_limit` now keeps every lineage head, so the number of kept
+  sessions can exceed the limit (a warning says by how many).
+- Mixing in a binary older than this version rewrites session files without
+  `continues`; those sessions fall back to one chronological lineage.
 
 ## [0.47.2] — 2026-11-01
 

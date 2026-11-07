@@ -43,6 +43,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "adopt": {
                         "type": "boolean",
                         "description": "Take over a session that is still ACTIVE under another agent (e.g. after a restart, --continue or MCP reconnect gave you a new agent_id). Required together with session_id for another agent's active session; a paused or open session of another agent is resumed by session_id alone. The session's owner, worktree and scope become yours and a session.adopted event is logged."
+                    },
+                    "continue_from": {
+                        "type": "string",
+                        "description": "ID of the closed session your work continues. Normally NOT needed: the previous session is chosen automatically (previous_session.inferred:true). Pass it only when the response has ambiguous:true: pick the entry of other_heads whose summary matches the user's request and call again with its id. Skips the automatic choice; the choice is carried to your next save_context that creates a session."
                     }
                 }
             }),
@@ -82,6 +86,15 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "reason": {
                         "type": "string",
                         "description": "Why force_other_owner is needed (e.g. \"owner window crashed\"). Recorded in the event log."
+                    },
+                    "continues": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ids of the closed sessions a NEWLY CREATED session continues. Normally NOT needed: the session load_context settled on is recorded automatically. Overrides it when given (an empty array starts a new lineage). Ignored when an existing session is updated or closed."
+                    },
+                    "lineage_token": {
+                        "type": "string",
+                        "description": "The lineage_token handoff_load_context returned. Optional: it names which earlier load_context result this new session continues when several conversations or worktrees share one MCP process. Unknown or already-used tokens are ignored with a warning."
                     },
                     "pause_active": {
                         "type": "boolean",

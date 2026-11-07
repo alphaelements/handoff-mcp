@@ -8,6 +8,7 @@ pub mod docs;
 pub mod events;
 pub mod git;
 pub mod layer_status;
+pub mod lineage;
 pub mod memory;
 pub mod metrics_snapshots;
 pub mod referrals;
@@ -440,6 +441,33 @@ pub fn detect_session_scope(project_dir: &Path) -> &'static str {
     match detect_worktree(project_dir) {
         Some(info) if info.is_worktree => "worktree",
         _ => "primary",
+    }
+}
+
+/// Name of the checkout for comparing sessions across machines: `main` for a
+/// primary checkout, the `.git/worktrees/<name>` name for a linked worktree,
+/// `None` outside git. The absolute `worktree` path differs between a Mac host
+/// and a container; this does not.
+///
+/// Reads the `.git` entry only (no `git` process): a directory is a primary
+/// checkout, a file holds `gitdir: <path>` and a linked worktree's path ends in
+/// `worktrees/<name>` (a submodule's points under `modules/` and counts as a
+/// primary checkout of its own repository).
+pub fn worktree_key(project_dir: &Path) -> Option<String> {
+    let dot_git = project_dir.join(".git");
+    if dot_git.is_dir() {
+        return Some("main".to_string());
+    }
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = Path::new(content.trim().strip_prefix("gitdir:")?.trim());
+    match (
+        gitdir.parent().and_then(Path::file_name),
+        gitdir.file_name(),
+    ) {
+        (Some(parent), Some(name)) if parent == "worktrees" => {
+            Some(name.to_string_lossy().to_string())
+        }
+        _ => Some("main".to_string()),
     }
 }
 

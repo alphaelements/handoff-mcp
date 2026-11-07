@@ -139,7 +139,12 @@ after `EnterWorktree`):
 
 1. `handoff_load_context` — registers this agent against the shared `.handoff/`
    (worktrees share storage per Phase 1; this call is what makes the agent
-   visible in `handoff_list_agents` / `handoff_overview`).
+   visible in `handoff_list_agents` / `handoff_overview`). The lineage is decided
+   automatically: use `previous_session.inferred: true` as is; only when the
+   response says `ambiguous: true`, match each `other_heads[].summary` against
+   this WT's tasks and call `handoff_load_context(continue_from="<id>")` (ask the
+   user if you cannot decide). A WT's own session continues its parent session
+   and is not a lineage head.
 2. For every task assigned to this WT's group in the approved plan, call
    `handoff_claim_task(task_id, session_id)`.
    - **Claim failure** (task already held by another agent with a

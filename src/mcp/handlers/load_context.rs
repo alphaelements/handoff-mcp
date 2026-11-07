@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
+use super::lineage::{self, Previous};
 use super::save_context::{
     ambiguous_message, append_session_event, append_session_event_with_detail, entry_for,
 };
@@ -19,8 +20,8 @@ use crate::storage::session_target::{
     Relation, Resolution, TargetOp, EVENT_ADOPTED,
 };
 use crate::storage::sessions::{
-    adopt_session, read_latest_closed_session, read_session_entries, transition_session_file,
-    OwnerStamp, SessionData, SessionEntry,
+    adopt_session, read_session_entries, transition_session_file, OwnerStamp, SessionData,
+    SessionEntry,
 };
 use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
 
@@ -88,6 +89,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .get("adopt")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    let continue_from = arguments
+        .get("continue_from")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
 
     let multi_session = config.settings.multi_session;
 
@@ -238,6 +244,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "task_tree": task_tree,
         "task_summary": task_summary,
     });
+    let mut claimed_tasks: Vec<String> = Vec::new();
     if let Some(id) = agent_id.as_deref() {
         let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
         let agent = register_agent(handoff, project_dir, id, session_id_for_agent)?;
@@ -247,6 +254,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         let _ = crate::storage::agents::gc_agents(handoff);
         result["agent_id"] = serde_json::json!(agent.agent_id);
         result["claimed_tasks"] = serde_json::json!(agent.claimed_tasks);
+        claimed_tasks = agent.claimed_tasks;
     } else {
         result["claimed_tasks"] = serde_json::json!([]);
     }
@@ -271,8 +279,41 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     }
 
-    let previous_closed_session = read_latest_closed_session(&sessions_dir)?;
-    if let Some(prev) = previous_closed_session.as_ref() {
+    // Which closed session this one continues. Only a session that was really
+    // returned feeds `incomplete_tasks_warning`; an ambiguous choice returns none.
+    let mut lineage_warnings: Vec<String> = Vec::new();
+    let previous = lineage::resolve_previous(
+        &lineage::PreviousRequest {
+            ctx,
+            sessions_dir: &sessions_dir,
+            entries: &entries,
+            own_active: selected_session.as_ref(),
+            continue_from,
+            claimed: &claimed_tasks,
+        },
+        &mut lineage_warnings,
+    )?;
+    warnings.extend(lineage_warnings.into_iter().map(Warning::from));
+    let mut lineage_token: Option<String> = None;
+    match &previous {
+        Previous::Confirmed { session, .. } | Previous::Explicit(session) => {
+            if let Some(id) = session.id.as_deref() {
+                lineage_token = Some(lineage::retain(handoff, &worktree, id));
+            }
+        }
+        // Nothing for the next creation to carry over: it decides for itself
+        // (or continues the active session it is updating).
+        Previous::FromActive(_) | Previous::Ambiguous { .. } | Previous::None => {
+            lineage::forget(handoff, &worktree);
+        }
+    }
+    let previous_closed_session: Option<&SessionData> = match &previous {
+        Previous::Confirmed { session, .. }
+        | Previous::Explicit(session)
+        | Previous::FromActive(session) => Some(session),
+        Previous::Ambiguous { .. } | Previous::None => None,
+    };
+    if let Some(prev) = previous_closed_session {
         if let Some(warning) = incomplete_tasks_warning(&prev.related_task_ids, &task_tree) {
             warnings.push(warning.into());
         }
@@ -319,7 +360,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
 
     if let Some(prev) = previous_closed_session {
-        let prev_val = serde_json::to_value(&prev).unwrap_or_default();
+        let prev_val = serde_json::to_value(prev).unwrap_or_default();
         let mut prev_obj = serde_json::json!({
             "summary": prev.summary,
             "ended_at": prev.ended_at,
@@ -348,7 +389,38 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 prev_obj["environment"] = env.clone();
             }
         }
+        match &previous {
+            Previous::Confirmed { evidence, .. } => {
+                prev_obj["inferred"] = serde_json::json!(true);
+                prev_obj["evidence"] = evidence.clone();
+            }
+            Previous::Explicit(_) => {
+                prev_obj["inferred"] = serde_json::json!(false);
+                prev_obj["explicit"] = serde_json::json!(true);
+            }
+            _ => prev_obj["inferred"] = serde_json::json!(false),
+        }
         result["previous_session"] = prev_obj;
+        if let Some(token) = &lineage_token {
+            result["lineage_token"] = serde_json::json!(token);
+        }
+    }
+    if let Previous::Ambiguous {
+        other_heads,
+        stale,
+        in_flight,
+        in_flight_here,
+        ..
+    } = &previous
+    {
+        result["ambiguous"] = serde_json::json!(true);
+        result["other_heads"] = serde_json::json!(other_heads);
+        result["message"] = serde_json::json!(ambiguous_message_text(
+            other_heads.len(),
+            *stale,
+            *in_flight,
+            *in_flight_here
+        ));
     }
 
     let notes_sources: Vec<&Value> = [
@@ -527,6 +599,53 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     result["docs_health"] = docs_health;
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// The instruction that goes with `ambiguous: true`: the server could not tell
+/// which lineage the caller continues, so the caller (an AI with the user's
+/// request in hand) chooses and says so with `continue_from`. The `adopt` hint
+/// is only offered when an in-flight session belongs to the caller's own
+/// checkout; adopting any other would pull someone else's session in.
+fn ambiguous_message_text(
+    candidates: usize,
+    stale: bool,
+    in_flight: bool,
+    in_flight_here: bool,
+) -> String {
+    let mut msg = if candidates > 1 {
+        String::from(
+            "More than one earlier session could be the one you are continuing, and the server \
+             cannot tell which. Compare each other_heads summary with the user's request and the \
+             tasks you are about to work on, then call handoff_load_context again with \
+             continue_from=<id> of the matching one. If you cannot decide, ask the user.",
+        )
+    } else {
+        String::from(
+            "Only one earlier session could be the one you are continuing, but the server will \
+             not assume it is yours. Compare the other_heads summary with the user's request and \
+             the tasks you are about to work on; if it matches, call handoff_load_context again \
+             with continue_from=<id>. If you cannot decide, ask the user.",
+        )
+    };
+    if in_flight {
+        msg.push_str(
+            " A candidate with in_flight_by is already continued by another agent's active \
+             session.",
+        );
+        if in_flight_here {
+            msg.push_str(
+                " If that session is yours (after a restart, --continue or an MCP reconnect), \
+                 resume it with handoff_load_context(session_id=<id>, adopt:true) instead.",
+            );
+        }
+    }
+    if stale {
+        msg.push_str(
+            " Every candidate ended more than 30 days ago: confirm with the user that this old \
+             lineage is the one to continue.",
+        );
+    }
+    msg
 }
 
 /// Reads `.handoff/docs/_trace_report.json` (written by

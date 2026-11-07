@@ -105,6 +105,14 @@ Skipping this breaks the handoff chain.
 ```
 handoff_load_context
 -> Review previous session's decisions / context_pointers / next_actions / handoff_notes
+-> The lineage is decided automatically: `previous_session.inferred: true` is used as is
+   (the next session-creating save records it in `continues`). Only if the response says
+   `ambiguous: true` (no `previous_session`/`next_actions`; candidates in `other_heads`):
+   match each candidate's `summary` against the user's request and this session's tasks,
+   then call `handoff_load_context(continue_from="<id>")`. If you cannot decide, ask the
+   user. Never pass `continue_from` otherwise.
+-> `/clear` does not close the handoff session: `handoff_save_context` (close) BEFORE
+   `/clear` if you want a boundary
 -> If no active session (= previous session was properly closed):
   handoff_save_context(
     session_status="active",

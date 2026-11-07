@@ -14,8 +14,12 @@ pub fn capture_git_state(project_dir: &Path) -> Result<GitState> {
     let branch = run_git(project_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let commit = run_git(project_dir, &["rev-parse", "--short", "HEAD"])
-        .unwrap_or_else(|_| "unknown".to_string());
+    // The full hash: lineage matching compares it by prefix against the
+    // `rev-list` history, and a 7-character abbreviation can become ambiguous
+    // as the repository grows. Older sessions keep their short hash and are
+    // matched by prefix.
+    let commit =
+        run_git(project_dir, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".to_string());
 
     let dirty_output = run_git(project_dir, &["status", "--porcelain"]).unwrap_or_default();
 
@@ -30,6 +34,35 @@ pub fn capture_git_state(project_dir: &Path) -> Result<GitState> {
         commit,
         dirty_files,
     })
+}
+
+/// The checked-out branch, or `None` on a detached `HEAD` or any git failure.
+pub fn current_branch(project_dir: &Path) -> Option<String> {
+    let name = run_git(project_dir, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    (name != "HEAD" && !name.is_empty()).then_some(name)
+}
+
+/// Up to `limit` full commit hashes reachable from `HEAD`, newest first (the
+/// index is the distance from `HEAD`). Empty on any git failure.
+pub fn head_history(project_dir: &Path, limit: usize) -> Vec<String> {
+    run_git(project_dir, &["rev-list", "-n", &limit.to_string(), "HEAD"])
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Subjects of the latest `limit` commits on `HEAD`. Empty on any git failure.
+pub fn recent_commit_subjects(project_dir: &Path, limit: usize) -> Vec<String> {
+    run_git(
+        project_dir,
+        &["log", "-n", &limit.to_string(), "--format=%s"],
+    )
+    .map(|out| out.lines().map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
+/// The repository's top-level directory, `None` outside git.
+pub fn repo_root(project_dir: &Path) -> Option<String> {
+    run_git(project_dir, &["rev-parse", "--show-toplevel"]).ok()
 }
 
 /// `git rev-parse --short HEAD` in `project_dir`, or an empty string on any

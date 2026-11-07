@@ -23,6 +23,7 @@ pub mod get_session;
 pub mod get_task;
 pub mod import_context;
 pub mod init;
+pub mod lineage;
 pub mod list_agents;
 pub mod list_sessions;
 pub mod list_tasks;

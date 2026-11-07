@@ -35,6 +35,7 @@ fn session(id: &str, owner: Option<&str>, owner_v: bool, worktree: Option<&str>)
         owner_v: if owner_v { Some(OWNER_V) } else { None },
         worktree: worktree.map(String::from),
         scope: None,
+        ..Default::default()
     }
 }
 

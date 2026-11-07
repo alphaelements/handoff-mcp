@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use super::save_context::{append_session_event, prune_sessions_per_config};
-use super::HandlerContext;
+use super::{lineage, HandlerContext};
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::session_target::{own_active_group, Caller, OWNER_V};
@@ -22,8 +22,31 @@ fn write_imported_session(
     ctx: &HandlerContext,
     sessions_dir: &Path,
     mut data: SessionData,
+    closed_active: Option<String>,
 ) -> Result<()> {
     let session_id = data.id.get_or_insert_with(generate_session_id).clone();
+    // The import replaces the caller's own active session, so it continues
+    // that one; with none to replace it decides like any other creation.
+    let continues = match closed_active {
+        Some(id) => {
+            lineage::forget(&ctx.handoff_dir, &ctx.project_dir.to_string_lossy());
+            vec![id]
+        }
+        None => {
+            let entries = read_session_entries(sessions_dir)?;
+            lineage::continues_for_new(&lineage::NewSessionLineage {
+                ctx,
+                sessions_dir,
+                entries: &entries,
+                explicit: None,
+                token: None,
+                parent: None,
+                scope: crate::storage::detect_session_scope(&ctx.project_dir),
+            })?
+            .continues
+        }
+    };
+    lineage::stamp_new(&mut data, continues, &ctx.project_dir);
     write_open_session(sessions_dir, &data)?;
     append_session_event(
         &ctx.handoff_dir,
@@ -36,14 +59,16 @@ fn write_imported_session(
 
 /// Close the caller's own active sessions (and ownerless ones) before an
 /// imported session replaces them. Another agent's active session is never
-/// closed by an import.
-fn close_own_active_sessions(ctx: &HandlerContext, sessions_dir: &Path) -> Result<()> {
+/// closed by an import. Returns the id of the most recently updated session it
+/// closed, which the import continues.
+fn close_own_active_sessions(ctx: &HandlerContext, sessions_dir: &Path) -> Result<Option<String>> {
     let worktree = ctx.project_dir.to_string_lossy().to_string();
     let caller = Caller {
         agent_id: ctx.agent_id.as_deref(),
         worktree: &worktree,
     };
     let entries = read_session_entries(sessions_dir)?;
+    let mut latest: Option<(Option<&str>, &str)> = None;
     for entry in own_active_group(&entries, &caller) {
         transition_session_file(&entry.path, "closed")?;
         append_session_event(
@@ -52,8 +77,14 @@ fn close_own_active_sessions(ctx: &HandlerContext, sessions_dir: &Path) -> Resul
             entry.data.id.as_deref(),
             ctx.agent_id.as_deref(),
         );
+        if let Some(id) = entry.data.id.as_deref() {
+            let key = (entry.data.ended_at.as_deref(), id);
+            if latest.is_none_or(|l| key > l) {
+                latest = Some(key);
+            }
+        }
     }
-    Ok(())
+    Ok(latest.map(|(_, id)| id.to_string()))
 }
 
 /// Ownership of a session written by this call: the caller's identity (none
@@ -152,9 +183,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 anyhow::anyhow!("'session.summary' is required when session is provided")
             })?;
 
-        if !skip_session_close {
-            close_own_active_sessions(ctx, &sessions_dir)?;
-        }
+        let closed_active = if skip_session_close {
+            None
+        } else {
+            close_own_active_sessions(ctx, &sessions_dir)?
+        };
         let git_state = capture_git_state(project_dir)?;
         let now = Utc::now().to_rfc3339();
 
@@ -207,18 +240,21 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             owner_v: owner.1,
             worktree: owner.2,
             scope: owner.3,
+            ..Default::default()
         };
 
-        write_imported_session(ctx, &sessions_dir, data)?;
+        write_imported_session(ctx, &sessions_dir, data, closed_active)?;
 
         prune_lines.extend(prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?);
 
         session_saved = true;
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
         if !raw_notes.is_empty() {
-            if !skip_session_close {
-                close_own_active_sessions(ctx, &sessions_dir)?;
-            }
+            let closed_active = if skip_session_close {
+                None
+            } else {
+                close_own_active_sessions(ctx, &sessions_dir)?
+            };
             let git_state = capture_git_state(project_dir)?;
             let now = Utc::now().to_rfc3339();
 
@@ -254,9 +290,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 owner_v: owner.1,
                 worktree: owner.2,
                 scope: owner.3,
+                ..Default::default()
             };
 
-            write_imported_session(ctx, &sessions_dir, data)?;
+            write_imported_session(ctx, &sessions_dir, data, closed_active)?;
 
             prune_lines.extend(prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?);
 

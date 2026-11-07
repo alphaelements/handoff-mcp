@@ -8,6 +8,18 @@ description: "Session handoff — load context at start, save at end, track task
 ## Session Start
 
 1. Call `handoff_load_context` (uses current working directory).
+   **Which earlier session you continue is decided automatically.** With
+   `previous_session.inferred: true` (and its `evidence`) use it as is — pass
+   nothing extra, and your next `handoff_save_context` that creates a session
+   records it in `continues` on its own. Only when the response says
+   `ambiguous: true` (no `previous_session`, no `next_actions`, a list of
+   `other_heads`) compare each candidate's `summary` with the user's request
+   and the tasks you are about to work on, then call `handoff_load_context`
+   again with `continue_from: "<id>"` of the matching one. If you cannot
+   decide, ask the user. A candidate with `in_flight_by` is already continued
+   by another agent's active session — if that is yours (after a restart),
+   resume it with `session_id` + `adopt: true` instead. Never pass
+   `continue_from` when `inferred: true` came back.
 2. If the project is not initialized, call `handoff_init` with the project name
    derived from the directory name.
 3. If `paused_sessions` are returned, show them to the user (ID, summary,

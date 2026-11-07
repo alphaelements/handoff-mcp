@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
 
-use super::HandlerContext;
+use super::{lineage, HandlerContext};
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::session_target::{
@@ -12,7 +12,7 @@ use crate::storage::session_target::{
     EVENT_CLOSE_REFUSED,
 };
 use crate::storage::sessions::{
-    find_active_primary_session_id, generate_session_id, provisional_heads, prune_closed_sessions,
+    closed_head_ids, find_active_primary_session_id, generate_session_id, prune_closed_sessions,
     read_session_entries, transition_session_file, update_session_at, write_session_with_status,
     SessionData, SessionEntry,
 };
@@ -191,16 +191,35 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         agent_id,
         worktree: worktree.clone(),
         scope,
+        // Lineage fields are stamped only on a session this call creates
+        // (`lineage::stamp_new`); updates never carry them.
+        ..Default::default()
     };
 
     // Write a brand-new session for this caller. A closed one records its
     // creator and place explicitly, because `handoff_updates` leaves ownership
     // unset for a closing call so that closing an *existing* session keeps the
-    // owner it was created with.
-    let create_new = || -> Result<(std::path::PathBuf, String)> {
+    // owner it was created with. A new session also records which sessions it
+    // continues (`lineage`); updating or closing an existing one never does.
+    let explicit_continues: Option<Vec<String>> = arguments
+        .get("continues")
+        .and_then(|v| v.as_array())
+        .map(|_| extract_string_array(arguments, "continues"));
+    let lineage_token = arguments.get("lineage_token").and_then(|v| v.as_str());
+    let create_new = || -> Result<(std::path::PathBuf, String, lineage::NewContinues)> {
         let new_id = generate_session_id();
         let mut data = handoff_updates.clone();
         data.id = Some(new_id.clone());
+        let continues = lineage::continues_for_new(&lineage::NewSessionLineage {
+            ctx,
+            sessions_dir: &sessions_dir,
+            entries: &entries,
+            explicit: explicit_continues.clone(),
+            token: lineage_token,
+            parent: data.parent_session_id.as_deref(),
+            scope: &detected_scope,
+        })?;
+        lineage::stamp_new(&mut data, continues.continues.clone(), project_dir);
         let target_status = if keep_active { "active" } else { "closed" };
         if !keep_active {
             data.agent_id = ctx.agent_id.clone();
@@ -218,7 +237,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             Some(&new_id),
             ctx.agent_id.as_deref(),
         );
-        Ok((p, new_id))
+        Ok((p, new_id, continues))
     };
 
     let op = if close_id.is_some() || !keep_active {
@@ -228,6 +247,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     };
     let explicit_id = close_id.or(target_session_id);
 
+    let mut created_continues: Option<Vec<String>> = None;
     let (total_closed, path, session_id) = if pause_id.is_some() || pause_all {
         (0, None, None)
     } else {
@@ -281,7 +301,12 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 }
             }
             Resolution::NoTarget => {
-                let (p, new_id) = create_new()?;
+                let (p, new_id, continues) = create_new()?;
+                notes.extend(continues.warnings);
+                if continues.uncertain {
+                    notes.push("continues_uncertain: true".to_string());
+                }
+                created_continues = Some(continues.continues);
                 (0, Some(p), Some(new_id))
             }
             Resolution::NotFound => match (close_id, target_session_id) {
@@ -332,6 +357,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     if keep_active {
         msg.push_str("\nSession kept active (session_status: active)");
+    }
+    if let Some(continues) = created_continues.filter(|c| !c.is_empty()) {
+        msg.push_str(&format!("\nContinues: {}", continues.join(", ")));
     }
 
     if total_paused > 0 {
@@ -398,7 +426,7 @@ pub(super) fn prune_sessions_per_config(
     };
 
     let sessions_dir = handoff.join("sessions");
-    let heads = provisional_heads(&sessions_dir)?;
+    let heads = closed_head_ids(&sessions_dir)?;
     let outcome = prune_closed_sessions(&sessions_dir, limit, &heads)?;
     for pruned in &outcome.removed {
         // Best-effort like every other event: the delete already happened.
