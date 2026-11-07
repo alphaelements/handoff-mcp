@@ -14,10 +14,11 @@ use super::HandlerContext;
 use crate::context::injection::{filter_already_injected, rank_with_semantic, RankConfig};
 use crate::semantic::semantic_model;
 use crate::storage::config::{read_config, SettingsConfig};
+use crate::storage::events::{append_event, EventRecord, EVENT_MEMORY_MERGED};
 use crate::storage::memory::{
     delete_memory, gc_injected_sets, is_valid_memory_kind, new_memory_id, now_rfc3339,
-    read_all_memories, read_injected_set, read_memory_by_id, write_injected_set, write_memory,
-    MemoryEntry, VALID_MEMORY_KINDS,
+    read_all_memories, read_injected_set, read_memory_by_id, strip_usage_stats, write_injected_set,
+    write_memory, MemoryEntry, VALID_MEMORY_KINDS,
 };
 
 /// Bonus added to a memory's BM25 score when one of its `scope_paths` is a
@@ -314,8 +315,9 @@ fn commit_merge(
 /// (spec D): when `session_id` is given, memories already injected this session
 /// with the same `content_hash` are filtered out, while an edited memory (new
 /// hash) is re-injected. With `mark_injected` (default true) the survivors are
-/// recorded in the session sidecar and their `hit_count` / `last_referenced_at`
-/// are bumped. Without `session_id` this degrades to plain relevance ranking.
+/// recorded in the session sidecar (local state, git-ignored). The memory files
+/// themselves are never written by a query. Without `session_id` this degrades
+/// to plain relevance ranking.
 pub fn handle_query(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
@@ -431,8 +433,8 @@ pub fn handle_query(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .map(|item| memories[item.index].id.as_str())
         .collect();
 
-    // Bookkeeping: record survivors in the sidecar and bump usage stats. Only
-    // when we have a session id and marking is enabled (the hook's normal path).
+    // Bookkeeping: record survivors in the sidecar. Only when we have a session
+    // id and marking is enabled (the hook's normal path).
     if mark_injected && !fresh.is_empty() {
         if let Some(sid) = session_id {
             mark_injected_memories(handoff, sid, &memories, &fresh, &now)?;
@@ -456,16 +458,13 @@ pub fn handle_query(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     Ok(to_json(&result))
 }
 
-/// Append the freshly-injected memories to the session sidecar and bump each
-/// one's `hit_count` / `last_referenced_at`.
+/// Append the freshly-injected memories to the session sidecar.
 ///
-/// Ordering matters: the **sidecar is written first**, before the per-memory
-/// stat bumps. The sidecar is what suppresses re-injection, so it must be
-/// recorded even if a later stat write fails — otherwise a failed bump would
-/// skip the sidecar and re-spam the session on the next query (and double-count
-/// any memory whose stats were already persisted before the failure). The stat
-/// bumps are therefore strictly best-effort: a failure on one memory must not
-/// drop the sidecar record or abort the rest.
+/// This is the only thing a query writes: the sidecar suppresses re-injection
+/// within one hook session and is local state under `memory/injected/` (ignored
+/// by Git). The memory files themselves are never touched, so reading memories
+/// cannot produce a Git diff. A failure to write the sidecar is surfaced — the
+/// session's injection state is then unknown.
 fn mark_injected_memories(
     handoff: &std::path::Path,
     session_id: &str,
@@ -479,22 +478,7 @@ fn mark_injected_memories(
         let m = &memories[item.index];
         set.mark(&m.id, &m.content_hash);
     }
-    // (1) Persist the suppression record first — this is the correctness-critical
-    // write. If it fails, surface the error (the session state is now unknown).
     write_injected_set(handoff, &set)?;
-
-    // (2) Best-effort usage stats. Re-read each memory so we don't clobber a
-    // concurrent edit's other fields. A failure here is non-fatal: the sidecar
-    // already recorded the injection, so the worst case is a slightly stale
-    // hit_count — never a re-spam or a double count.
-    for item in fresh {
-        let m = &memories[item.index];
-        if let Ok(Some(mut entry)) = read_memory_by_id(handoff, &m.id) {
-            entry.hit_count = entry.hit_count.saturating_add(1);
-            entry.last_referenced_at = Some(now.to_string());
-            let _ = write_memory(handoff, &entry);
-        }
-    }
     Ok(())
 }
 
@@ -524,16 +508,19 @@ pub fn handle_delete(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
 ///
 /// Three independent passes over the memory store:
 ///
-/// 1. **Exact duplicates** (identical `content_hash`) are merged *silently and
-///    losslessly*: the oldest memory in each hash group is kept, the others are
-///    deleted and recorded in its `superseded_ids`. This is the only mutating
-///    pass, gated by `apply_exact_merges` (default true).
+/// 1. **Exact duplicates** (identical `content_hash`) are merged losslessly when
+///    — and only when — `apply_exact_merges` is true (default **false**, so the
+///    SessionStart hook never rewrites or deletes a tracked memory): the oldest
+///    memory in each hash group is kept, the others are deleted and recorded in
+///    its `superseded_ids`, and a `memory.merged` event is appended. This is the
+///    only pass that touches memory files.
 /// 2. **Near-duplicate clusters** (Jaccard ≥ threshold, grouped by union-find)
-///    and **stale** memories (`last_referenced_at` — or `created_at` if never
-///    referenced — older than `stale_days`) are returned as *recommendations*
-///    for the AI to act on with `memory_save(merge_into=…)` / `memory_delete`.
-///    This pass never writes.
-/// 3. The `injected/` sidecars older than the gc window are removed.
+///    and **stale** memories (`updated_at` older than `stale_days`) are
+///    returned as *review candidates* for the AI or a human to look at; a
+///    merge is committed with `memory_save(merge_into=…)`. Staleness is only an
+///    age signal — it never proposes deletion. This pass never writes.
+/// 3. The `injected/` sidecars older than the gc window are removed
+///    (`memory_injected_gc_days = 0` disables this).
 ///
 /// Returns a JSON string
 /// `{"auto_merged_exact":n,"cleanup_recommendations":{"similar_clusters":[…],
@@ -548,7 +535,7 @@ pub fn handle_cleanup(ctx: &HandlerContext, arguments: &Value) -> Result<String>
     let apply_exact_merges = arguments
         .get("apply_exact_merges")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     let stale_days = arguments
         .get("stale_days")
         .and_then(|v| v.as_i64())
@@ -558,10 +545,10 @@ pub fn handle_cleanup(ctx: &HandlerContext, arguments: &Value) -> Result<String>
     let now = chrono::Utc::now();
     let now_str = now.to_rfc3339();
 
-    // (1) Exact-duplicate auto-merge (lossless). Re-reads memories afterward so
-    // later passes see the merged store.
+    // (1) Exact-duplicate merge (lossless, opt-in). Re-reads memories afterward
+    // so later passes see the merged store.
     let auto_merged_exact = if apply_exact_merges {
-        merge_exact_duplicates(handoff, &now_str)?
+        merge_exact_duplicates(handoff, &now_str, ctx.agent_id.as_deref())?
     } else {
         0
     };
@@ -588,25 +575,49 @@ pub fn handle_cleanup(ctx: &HandlerContext, arguments: &Value) -> Result<String>
     })))
 }
 
+/// `memory_strip_usage_stats` — opt-in migration that removes the obsolete
+/// `hit_count` / `last_referenced_at` keys from existing memory files. Dry-run
+/// unless `apply` is true; the report holds counts only.
+pub fn handle_strip_usage_stats(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    if !memory_settings(handoff)?.memory_enabled {
+        return Ok(disabled_payload());
+    }
+    let apply = arguments
+        .get("apply")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let report = strip_usage_stats(handoff, apply)?;
+    Ok(to_json(&json!({
+        "mode": if apply { "apply" } else { "dry_run" },
+        "scanned": report.scanned,
+        "with_usage_stats": report.with_usage_stats,
+        "stripped": report.stripped,
+        "skipped_unparseable": report.skipped_unparseable,
+    })))
+}
+
 /// Merge memories that share an identical `content_hash`. The oldest entry in
 /// each group (by parsed `created_at`, ties broken by id) is kept; the rest are
 /// absorbed into it and their files deleted. Returns the number of memories
-/// absorbed (files removed).
+/// absorbed (files removed). One `memory.merged` event is appended per group.
 ///
 /// "Lossless" means **no signal is dropped**, not byte-identical text: the
 /// canonical content is identical by construction (same hash over the tokenized
 /// text), so the keeper's body already represents every absorbed memory's
 /// meaning. To avoid losing the *other* fields, the keeper inherits the union of
-/// every absorbed memory's `tags` / `scope_paths` / `superseded_ids`, the sum of
-/// their `hit_count`, and the latest `last_referenced_at`.
+/// every absorbed memory's `tags` / `keywords` / `scope_paths` / `superseded_ids`.
 ///
-/// Failure safety (mirrors `mark_injected_memories`): the keeper is rewritten
-/// with the full merged metadata and `superseded_ids` **before** any duplicate
-/// file is deleted, so the audit trail is durable even if a later delete fails.
-/// Per-duplicate deletes are then best-effort — a failure on one leaves an
-/// orphaned-but-superseded file (re-absorbed on the next run) rather than a lost
-/// record.
-fn merge_exact_duplicates(handoff: &std::path::Path, now: &str) -> Result<usize> {
+/// Failure safety: the keeper is rewritten with the full merged metadata and
+/// `superseded_ids` **before** any duplicate file is deleted, so the audit
+/// trail is durable even if a later delete fails. Per-duplicate deletes are
+/// then best-effort — a failure on one leaves an orphaned-but-superseded file
+/// (re-absorbed on the next run) rather than a lost record.
+fn merge_exact_duplicates(
+    handoff: &std::path::Path,
+    now: &str,
+    agent_id: Option<&str>,
+) -> Result<usize> {
     use std::collections::BTreeMap;
 
     let memories = read_all_memories(handoff)?;
@@ -632,7 +643,7 @@ fn merge_exact_duplicates(handoff: &std::path::Path, now: &str) -> Result<usize>
         let mut keeper = group.remove(0);
 
         // Fold every absorbed memory's signal into the keeper (union of tags /
-        // scope_paths / superseded_ids; summed hit_count; latest reference).
+        // keywords / scope_paths / superseded_ids).
         for dup in &group {
             if !keeper.superseded_ids.contains(&dup.id) {
                 keeper.superseded_ids.push(dup.id.clone());
@@ -657,11 +668,6 @@ fn merge_exact_duplicates(handoff: &std::path::Path, now: &str) -> Result<usize>
                     keeper.scope_paths.push(s.clone());
                 }
             }
-            keeper.hit_count = keeper.hit_count.saturating_add(dup.hit_count);
-            keeper.last_referenced_at = latest_timestamp(
-                keeper.last_referenced_at.take(),
-                dup.last_referenced_at.clone(),
-            );
         }
         keeper.updated_at = now.to_string();
 
@@ -671,11 +677,32 @@ fn merge_exact_duplicates(handoff: &std::path::Path, now: &str) -> Result<usize>
         // (2) Best-effort delete the absorbed files. A failure here is non-fatal:
         // the keeper already records the absorption, so a surviving dup is simply
         // re-absorbed next run.
+        let mut deleted_ids: Vec<&str> = Vec::new();
         for dup in &group {
             if matches!(delete_memory(handoff, &dup.id), Ok(true)) {
                 absorbed_total += 1;
+                deleted_ids.push(&dup.id);
             }
         }
+
+        // (3) Audit line. Best-effort like every other event: the merge has
+        // already been committed to disk, so losing the log line must not fail
+        // (or undo) it.
+        let _ = append_event(
+            handoff,
+            EventRecord {
+                ts: now.to_string(),
+                event: EVENT_MEMORY_MERGED.to_string(),
+                task_id: None,
+                agent_id: agent_id.map(String::from),
+                session_id: None,
+                detail: Some(format!(
+                    "keeper={}; absorbed={}",
+                    keeper.id,
+                    deleted_ids.join(",")
+                )),
+            },
+        );
     }
     Ok(absorbed_total)
 }
@@ -687,22 +714,6 @@ fn parse_instant(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::DateTime::<chrono::Utc>::MIN_UTC)
-}
-
-/// Return the later of two optional RFC3339 timestamps (an unparseable one loses;
-/// `None` loses to `Some`).
-fn latest_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
-    match (a, b) {
-        (Some(x), Some(y)) => {
-            if parse_instant(&y) > parse_instant(&x) {
-                Some(y)
-            } else {
-                Some(x)
-            }
-        }
-        (Some(x), None) => Some(x),
-        (None, b) => b,
-    }
 }
 
 /// Group memories into near-duplicate clusters via a hybrid lexical+semantic
@@ -808,9 +819,10 @@ fn similar_clusters(memories: &[MemoryEntry], dup_threshold: f64) -> Vec<Value> 
     out
 }
 
-/// Flag memories not referenced for `stale_days` (using `last_referenced_at`, or
-/// `created_at` when never referenced). Recommendation only — the AI decides
-/// whether a stale memory is obsolete or simply rarely relevant.
+/// List memories whose `updated_at` is older than `stale_days` as **review
+/// candidates**. Age is the only signal (usage is not tracked), so an old memory
+/// is not evidence that it is obsolete: this is a display aid for a human or AI
+/// that is already reviewing the store, and it never proposes deletion.
 fn stale_memories(
     memories: &[MemoryEntry],
     stale_days: i64,
@@ -819,9 +831,7 @@ fn stale_memories(
     let cutoff = now - chrono::Duration::days(stale_days);
     let mut out: Vec<(chrono::DateTime<chrono::Utc>, Value)> = Vec::new();
     for m in memories {
-        // The reference point: last injection if any, else creation time.
-        let stamp = m.last_referenced_at.as_deref().unwrap_or(&m.created_at);
-        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(stamp) else {
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&m.updated_at) else {
             continue; // unparseable timestamp → can't judge age, skip
         };
         let parsed = parsed.with_timezone(&chrono::Utc);
@@ -832,9 +842,8 @@ fn stale_memories(
                     "id": m.id,
                     "text": m.text,
                     "kind": m.kind,
-                    "hit_count": m.hit_count,
-                    "last_referenced_at": m.last_referenced_at,
                     "created_at": m.created_at,
+                    "updated_at": m.updated_at,
                 }),
             ));
         }
@@ -946,7 +955,9 @@ mod tests {
         assert_eq!(round2(1.23456), 1.23);
     }
 
-    fn mem(id: &str, text: &str, created: &str, last_ref: Option<&str>) -> MemoryEntry {
+    /// Build a memory created at `created`; `updated` (when given) overrides
+    /// `updated_at`, which is what the stale review list is keyed on.
+    fn mem(id: &str, text: &str, created: &str, updated: Option<&str>) -> MemoryEntry {
         let mut m = MemoryEntry::new(
             id.to_string(),
             text.to_string(),
@@ -956,7 +967,9 @@ mod tests {
             vec![],
             created.to_string(),
         );
-        m.last_referenced_at = last_ref.map(str::to_string);
+        if let Some(updated) = updated {
+            m.updated_at = updated.to_string();
+        }
         m
     }
 
@@ -1075,29 +1088,31 @@ mod tests {
     }
 
     #[test]
-    fn stale_uses_last_referenced_then_created() {
+    fn stale_is_keyed_on_updated_at() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-27T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        // Never referenced, created 100 days ago → stale.
+        // Created and last updated 100 days ago → review candidate.
         let old = mem("m-old", "ancient rule", "2026-03-19T00:00:00Z", None);
-        // Created long ago but referenced yesterday → NOT stale.
-        let touched = mem(
+        // Created long ago but edited yesterday → NOT a candidate.
+        let edited = mem(
             "m-fresh",
-            "recently used rule",
+            "recently edited rule",
             "2026-01-01T00:00:00Z",
             Some("2026-06-26T00:00:00Z"),
         );
-        let stale = stale_memories(&[old, touched], 60, now);
+        let stale = stale_memories(&[old, edited], 60, now);
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0]["id"], "m-old");
+        assert_eq!(stale[0]["updated_at"], "2026-03-19T00:00:00Z");
+        assert!(stale[0].get("hit_count").is_none());
+        assert!(stale[0].get("last_referenced_at").is_none());
     }
 
     #[test]
     fn stale_skips_unparseable_timestamp() {
         let now = chrono::Utc::now();
-        let mut bad = mem("m-bad", "x", "not-a-date", None);
-        bad.created_at = "not-a-date".to_string();
+        let bad = mem("m-bad", "x", "not-a-date", None);
         assert!(stale_memories(&[bad], 0, now).is_empty());
     }
 }

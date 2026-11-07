@@ -21,6 +21,13 @@ pub fn is_valid_memory_kind(kind: &str) -> bool {
 ///
 /// Token sets are intentionally **not** stored — they are recomputed from `text`
 /// on every read so the index can never drift from the body.
+///
+/// The file only changes through an explicit operation (save / merge / delete).
+/// v0.47.2 and earlier also stored `hit_count` / `last_referenced_at` and
+/// rewrote the file on every injection; those fields no longer exist. Files that
+/// still carry them load fine (serde ignores unknown keys) and the keys are
+/// dropped the next time the file is explicitly rewritten, or in bulk by
+/// `handoff-mcp memory strip-usage-stats`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     /// Schema version (= [`MEMORY_SCHEMA_VERSION`]).
@@ -52,13 +59,6 @@ pub struct MemoryEntry {
     pub created_at: String,
     /// RFC3339 last-update timestamp.
     pub updated_at: String,
-    /// RFC3339 timestamp of the last time this memory was injected into a
-    /// session, if ever.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_referenced_at: Option<String>,
-    /// Number of times this memory has been injected.
-    #[serde(default)]
-    pub hit_count: u64,
     /// Ids of memories merged into this one (audit trail for AI-driven merges).
     #[serde(default)]
     pub superseded_ids: Vec<String>,
@@ -89,8 +89,6 @@ impl MemoryEntry {
             content_hash,
             created_at: now.clone(),
             updated_at: now,
-            last_referenced_at: None,
-            hit_count: 0,
             superseded_ids: Vec::new(),
         }
     }
@@ -123,5 +121,27 @@ impl MemoryEntry {
             }
         }
         tokens
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_usage_stat_fields_are_ignored_on_load_and_never_written() {
+        let legacy = serde_json::json!({
+            "version": 2, "id": "m-1", "text": "t", "kind": "rule",
+            "tags": [], "keywords": [], "scope_paths": [],
+            "content_hash": "h",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
+            "hit_count": 87, "last_referenced_at": "2026-05-01T00:00:00Z",
+            "superseded_ids": []
+        });
+        let entry: MemoryEntry = serde_json::from_value(legacy).expect("legacy file loads");
+        assert_eq!(entry.updated_at, "2026-01-02T00:00:00Z");
+        let back = serde_json::to_value(&entry).unwrap();
+        assert!(back.get("hit_count").is_none());
+        assert!(back.get("last_referenced_at").is_none());
     }
 }

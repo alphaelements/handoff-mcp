@@ -47,6 +47,8 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "settings.require_estimate_hours",
         "settings.ai_estimate_multiplier",
         "settings.default_estimate_hours",
+        "settings.schedule_stale_notice",
+        "settings.layer_missing_notice",
         "settings.context_files",
         "settings.memory_enabled",
         "settings.memory_dup_threshold",
@@ -160,6 +162,20 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                         config.settings.require_estimate_hours = b;
                         applied.push(format!("settings.require_estimate_hours = {b}"));
                     }
+                }
+                "settings.schedule_stale_notice" => {
+                    let Some(b) = value.as_bool() else {
+                        anyhow::bail!("settings.schedule_stale_notice must be a boolean");
+                    };
+                    config.settings.schedule_stale_notice = b;
+                    applied.push(format!("settings.schedule_stale_notice = {b}"));
+                }
+                "settings.layer_missing_notice" => {
+                    let Some(b) = value.as_bool() else {
+                        anyhow::bail!("settings.layer_missing_notice must be a boolean");
+                    };
+                    config.settings.layer_missing_notice = b;
+                    applied.push(format!("settings.layer_missing_notice = {b}"));
                 }
                 "settings.ai_estimate_multiplier" => {
                     if let Some(n) = value.as_f64() {

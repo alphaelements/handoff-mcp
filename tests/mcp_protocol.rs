@@ -64,6 +64,7 @@ fn tools_list_returns_all_tools() {
         "handoff_memory_query",
         "handoff_memory_delete",
         "handoff_memory_cleanup",
+        "handoff_memory_strip_usage_stats",
     ];
 
     let tool_names: Vec<&str> = tools

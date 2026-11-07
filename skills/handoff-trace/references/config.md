@@ -136,6 +136,15 @@ coverage and state (lint `layer_outside_profile`, info).
 | `required_checks` | string array | `[]` | checks that must run: `iso29148`, `nfr`, `completeness` |
 | `skip_checks` | string array | `[]` | checks the gate skips (same names; a check cannot be in both lists) |
 
+Two advisory switches live under `[settings]`, not `[trace]`; both are
+booleans that default to `true`, and `handoff_update_config` rejects any
+non-boolean value:
+
+| key | effect when `false` |
+|---|---|
+| `[settings] layer_missing_notice` | `doc_save` no longer returns the `DIAG-D001` warning for a `spec`/`design` document saved without a `layer`. Nothing else about the save changes |
+| `[settings] schedule_stale_notice` | `update_task` no longer ends its response with `schedule_stale: true`, and `doc_save` returns `schedule_stale: false`, for projects that do not run `handoff_auto_schedule` |
+
 `[[trace.layer]]` entry:
 
 | key | type | required | meaning |

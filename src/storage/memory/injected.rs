@@ -141,6 +141,11 @@ pub fn read_injected_set(handoff_dir: &Path, session_id: &str, now: &str) -> Inj
 
 /// Write a session's injected set atomically, creating `injected/` lazily.
 pub fn write_injected_set(handoff_dir: &Path, set: &InjectedSet) -> Result<PathBuf> {
+    // Per-session cache: machine-local, so keep it out of `.handoff/`'s git.
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff_dir,
+        crate::storage::gitignore::MEMORY_INJECTED_DIR,
+    )?;
     let dir = injected_dir(handoff_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create injected dir: {}", dir.display()))?;
@@ -155,11 +160,18 @@ pub fn write_injected_set(handoff_dir: &Path, set: &InjectedSet) -> Result<PathB
 /// Returns the number of files removed. A sidecar with an unparseable
 /// `updated_at` is left alone (we can't tell its age). `now` is supplied so the
 /// caller controls the clock (testable).
+///
+/// `max_age_days <= 0` disables the GC entirely ("never delete injection
+/// records"). It used to mean cutoff = now, which deleted every sidecar and
+/// broke re-injection suppression whenever the hook ran cleanup.
 pub fn gc_injected_sets(
     handoff_dir: &Path,
     max_age_days: i64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<usize> {
+    if max_age_days <= 0 {
+        return Ok(0);
+    }
     let dir = injected_dir(handoff_dir);
     if !dir.exists() {
         return Ok(0);
@@ -328,6 +340,22 @@ mod tests {
         assert_eq!(removed, 1, "only the January sidecar is past 14 days");
         assert!(read_injected_set(&h, "old", "now").injected.is_empty());
         assert!(injected_path(&h, "fresh").exists());
+    }
+
+    #[test]
+    fn gc_with_zero_days_never_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let old = InjectedSet::new("old".to_string(), "2020-01-01T00:00:00Z".to_string());
+        write_injected_set(&h, &old).unwrap();
+
+        let now = chrono::Utc::now();
+        assert_eq!(gc_injected_sets(&h, 0, now).unwrap(), 0);
+        assert!(injected_path(&h, "old").exists(), "0 = never delete");
+        // A negative value (only reachable by hand-editing config.toml) must not
+        // turn into a cutoff in the future that deletes everything either.
+        assert_eq!(gc_injected_sets(&h, -3, now).unwrap(), 0);
+        assert!(injected_path(&h, "old").exists());
     }
 
     #[test]

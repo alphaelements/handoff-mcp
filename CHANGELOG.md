@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Machine-local files under `.handoff/` are git-ignored**: `handoff_init`
+  now writes a recommended `.handoff/.gitignore`, and on existing projects
+  handoff-mcp appends any missing line the first time it writes that kind of
+  file (your own lines are kept, nothing is duplicated, and the project's own
+  repository and `.gitignore` are never touched). New ignore targets:
+  `*.lock` (task, agent, test-run and brainstorm lock files), `/agents/`,
+  `/timer/`, `/memory/injected/` and `/docs/injected/`, next to the derived
+  files that were already ignored (`/docs/_task_ids_rebuild.json`,
+  `/docs/_requirements_summary.json`, `/docs/_trace_report.json`,
+  `/runs/_latest.json`, `/trace/baselines/_index.json`). Files that are already
+  tracked stay tracked; stop tracking them once with
+  `git -C .handoff rm -r --cached --ignore-unmatch -q -- '*.lock' agents timer memory/injected docs/injected`
+  and commit. The README has a new "Managing `.handoff/` in Git" section
+  (independent repository recommended, what to track, sharing across clones).
+- **`schedule_stale: true` can be switched off**: set
+  `settings.schedule_stale_notice = false` (`handoff_update_config`) in
+  projects that do not use `handoff_auto_schedule`. Default `true`, unchanged.
+- **`DIAG-D001` can be switched off**: set `settings.layer_missing_notice =
+  false` to stop `handoff_doc_save` warning that a `spec`/`design` document has
+  no `layer`. Default `true`, unchanged.
+- The warning for a dependency on a task ID that does not exist yet now adds
+  that the dependency may become circular if the ID is later assigned to a
+  different task. The dependency is still accepted.
 - **Sessions are owned by the agent that created them**: a closed save, a
   `keep_active` update, `update_session`, `import_context`, `fork_session`,
   `merge_sessions` and `load_context` now act on the caller's own sessions
@@ -78,6 +101,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`trace update` exits 1 when an op failed**: the CLI used to print the
   `failed` object and exit 0. A partial success (some ops already written)
   also exits 1; resend only the ops not listed in `applied`.
+- **Reading memories never changes a memory file**: `memory_query` used to
+  rewrite `memory/m-*.json` on every injection to bump `hit_count` and
+  `last_referenced_at` (one memory reached `hit_count=87`), which put noise in
+  every Git diff of `.handoff/`. Both fields are gone: usage is no longer
+  tracked, and a query only writes the git-ignored per-session sidecar. Files
+  that still carry the fields load fine and drop them the next time they are
+  saved. Reads of `memory_query`, `memory_cleanup` and `doc_query` leave every
+  tracked file byte-identical. Known exceptions: `load_context` (registers the
+  agent, moves an `open` session to `active`) and `list_tasks` / `dashboard`
+  (reclaim an expired task lease and log `task.expired`). On a project whose
+  `.handoff/.gitignore` predates this release, the first query that records an
+  injection also appends the missing ignore line to `.handoff/.gitignore`,
+  once.
+- **`memory_cleanup` is read-only by default**: `apply_exact_merges` now
+  defaults to `false`, so the `SessionStart` cleanup hook deletes and rewrites
+  no memory. Pass `apply_exact_merges: true` to merge exact duplicates; each
+  merge is logged as a `memory.merged` event.
+- **`stale` memories are review candidates, not deletion candidates**: they are
+  listed by `updated_at` older than `memory_stale_days` (previously by last
+  injection), carry `created_at` / `updated_at` instead of usage counters, and
+  nothing in the tool text or the `handoff-memory` skill suggests deleting them.
+- **`memory_injected_gc_days = 0` now means "never delete injection records"**
+  (it used to delete every sidecar on each cleanup, defeating re-injection
+  suppression). The default stays 14.
+- Saving or closing a session never deletes memories (covered by a regression
+  test).
+
+### Added
+- **`handoff-mcp memory strip-usage-stats`** (MCP tool
+  `handoff_memory_strip_usage_stats`): opt-in migration that removes the
+  obsolete `hit_count` / `last_referenced_at` keys from existing memory files.
+  It is a dry run unless `--apply` is given, reports counts only
+  (`scanned`, `with_usage_stats`, `stripped`, `skipped_unparseable`), changes
+  nothing but those two keys (`updated_at` is kept, so the review list is not
+  reset), and skips unparseable files. Never run automatically, because it
+  rewrites every affected file. Mixing in a binary from v0.47.2 or earlier
+  writes the counters back.
 
 ### Fixed
 - **Workflow sub-agents can reach handoff**: `session-closer`,

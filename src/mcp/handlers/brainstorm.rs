@@ -1122,6 +1122,10 @@ fn with_session_lock<T>(handoff: &Path, id: &str, f: impl FnOnce() -> Result<T>)
     let dir = brainstorm_dir(handoff);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create brainstorm dir: {}", dir.display()))?;
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::LOCK_FILES,
+    )?;
     let lock_path = dir.join(format!("{id}.lock"));
     let lock = std::fs::OpenOptions::new()
         .create(true)

@@ -723,9 +723,17 @@ pub fn adopt_session(
 ) -> Result<AdoptOutcome> {
     use fs2::FileExt;
 
-    let lock_dir = sessions_dir.parent().unwrap_or(sessions_dir).join("agents");
+    let handoff = sessions_dir.parent().unwrap_or(sessions_dir);
+    let lock_dir = handoff.join("agents");
     std::fs::create_dir_all(&lock_dir)
         .with_context(|| format!("Failed to create lock dir: {}", lock_dir.display()))?;
+    crate::storage::gitignore::ensure_gitignore_entries(
+        handoff,
+        &[
+            crate::storage::gitignore::AGENTS_DIR,
+            crate::storage::gitignore::LOCK_FILES,
+        ],
+    )?;
     let lock_path = lock_dir.join("_sessions.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)

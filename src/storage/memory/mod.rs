@@ -134,6 +134,82 @@ pub fn delete_memory(handoff_dir: &Path, id: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The two per-memory usage-statistic keys that v0.47.2 and earlier wrote into
+/// `memory/m-*.json` on every injection and that no longer exist in
+/// [`MemoryEntry`].
+pub const USAGE_STAT_KEYS: [&str; 2] = ["hit_count", "last_referenced_at"];
+
+/// Counts reported by [`strip_usage_stats`]. Counts only — no ids or bodies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StripUsageStatsReport {
+    /// `.json` files examined in `memory/`.
+    pub scanned: usize,
+    /// Files that carry at least one of [`USAGE_STAT_KEYS`].
+    pub with_usage_stats: usize,
+    /// Files rewritten without the keys (always 0 for a dry run).
+    pub stripped: usize,
+    /// Files that could not be read, are not valid JSON, or are not a JSON
+    /// object. They are left untouched.
+    pub skipped_unparseable: usize,
+}
+
+/// Remove [`USAGE_STAT_KEYS`] from every memory file (migration for projects
+/// upgraded from v0.47.2 or earlier).
+///
+/// Works on `serde_json::Value` so nothing else in a file is interpreted or
+/// changed, and **`updated_at` is deliberately left alone**: bumping it would
+/// reset every memory's age and wipe the stale review list. Files without the
+/// keys are not rewritten. With `apply == false` nothing is written. Unparseable
+/// files are skipped and counted rather than aborting the migration.
+pub fn strip_usage_stats(handoff_dir: &Path, apply: bool) -> Result<StripUsageStatsReport> {
+    let mut report = StripUsageStatsReport::default();
+    let dir = memory_dir(handoff_dir);
+    if !dir.exists() {
+        return Ok(report);
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .with_context(|| format!("Failed to read memory dir: {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_file() || !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        report.scanned += 1;
+        let Some(mut value) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        else {
+            report.skipped_unparseable += 1;
+            continue;
+        };
+        let Some(object) = value.as_object_mut() else {
+            report.skipped_unparseable += 1;
+            continue;
+        };
+        let mut removed_any = false;
+        for key in USAGE_STAT_KEYS {
+            removed_any |= object.remove(key).is_some();
+        }
+        if !removed_any {
+            continue;
+        }
+        report.with_usage_stats += 1;
+        if apply {
+            let content =
+                serde_json::to_string_pretty(&value).context("Failed to serialize memory")?;
+            crate::storage::atomic_write(&path, content.as_bytes())
+                .with_context(|| format!("Failed to write memory: {}", path.display()))?;
+            report.stripped += 1;
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

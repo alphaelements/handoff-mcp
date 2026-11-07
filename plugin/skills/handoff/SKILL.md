@@ -289,6 +289,9 @@ Before assigning dates to tasks, check available capacity:
   - The response always carries `milestone_summary` (per milestone: `milestone`, `date`, `task_count`, `total_estimate_hours`, `latest_due`, `overdue`) for the tasks scheduled in this run. A task due after its milestone `date` also adds a `warnings` entry.
   - A task without `estimate_hours` is scheduled with `settings.default_estimate_hours` (config.toml `[settings]`, default `8.0`; set via `handoff_update_config` with `settings.default_estimate_hours`, a number > 0). When any task fell back to that default, `warnings` gains one entry: `N tasks have no estimate_hours — using default Xh each. Set estimate_hours on tasks or settings.default_estimate_hours in config.toml.` No such entry appears when every scheduled task has an estimate.
 
+  - `handoff_update_task` ends its response with `schedule_stale: true` after a change that moves the schedule (status, dependencies, dates, estimate). Projects that do not auto-schedule can silence it with `settings.schedule_stale_notice = false` (`handoff_update_config`, boolean, default `true`); `handoff_doc_save` then returns `schedule_stale: false`.
+  - A dependency on a task ID that does not exist yet is accepted with a `DANGLING_DEPENDENCY` warning, which also says the dependency may become circular if that ID is later assigned to a different task.
+
 ### Team & Assignee Management
 
 - `handoff_list_assignees` — lists all team members from config.toml with task counts, active task counts, and effort hours.

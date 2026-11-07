@@ -93,7 +93,7 @@ fn baselines_dir(handoff: &Path) -> PathBuf {
 }
 
 /// `.handoff/.gitignore` line for the derived `_index.json` cache.
-const INDEX_GITIGNORE_ENTRY: &str = "/trace/baselines/_index.json";
+const INDEX_GITIGNORE_ENTRY: &str = crate::storage::gitignore::TRACE_BASELINES_INDEX;
 
 fn index_path(handoff: &Path) -> PathBuf {
     baselines_dir(handoff).join("_index.json")
@@ -244,7 +244,7 @@ fn write_index(handoff: &Path, index: &BaselineIndex) -> Result<()> {
         .with_context(|| format!("Failed to write {}", path.display()))?;
     // A derived cache (rebuilt from `baselines/*.json` whenever missing); the
     // baseline records themselves are the source of truth and stay tracked.
-    crate::storage::runs::ensure_gitignore_entry(handoff, INDEX_GITIGNORE_ENTRY)
+    crate::storage::gitignore::ensure_gitignore_entry(handoff, INDEX_GITIGNORE_ENTRY)
 }
 
 /// Appends `record`'s index entry to `_index.json` (wiki/270 §2.4: "ベース

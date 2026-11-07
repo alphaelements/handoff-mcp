@@ -164,6 +164,7 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_memory_query" => memory::handle_query(ctx, arguments),
         "handoff_memory_delete" => memory::handle_delete(ctx, arguments),
         "handoff_memory_cleanup" => memory::handle_cleanup(ctx, arguments),
+        "handoff_memory_strip_usage_stats" => memory::handle_strip_usage_stats(ctx, arguments),
         "handoff_fork_session" => fork_session::handle(ctx, arguments),
         "handoff_merge_sessions" => merge_sessions::handle(ctx, arguments),
         "handoff_timer_start" => timer::handle_start(ctx, arguments),

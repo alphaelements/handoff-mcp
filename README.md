@@ -436,7 +436,83 @@ manual configuration alternative.
 
 4. **Save context** at session end — the agent calls `handoff_save_context` to close the active session with handoff data (summary, decisions, blockers, references).
 
-> Add `.handoff/` to your `.gitignore` — it contains local working state, not code.
+## Managing `.handoff/` in Git
+
+`.handoff/` holds your project's tasks, documents, memory and session history,
+which are worth versioning and sharing. It also holds a few machine-local files
+(lock files, agent records, timer state, injection caches) that must never be
+committed. Pick one of three setups:
+
+| Pattern | How | Good | Watch out for |
+|---|---|---|---|
+| **A. Independent repo (recommended)** | Add `/.handoff/` to the project's `.gitignore`, then run `git init` inside `.handoff/` | `.handoff/` has its own history; project diffs and reviews stay clean; you can commit handoff state as often as you like | One more repository to back up and push |
+| **B. Part of the project repo** | Commit `.handoff/` with the project, and add the recommended `.handoff/.gitignore` below | One repo, handoff state versioned together with the code | Frequent handoff commits mix into code history; automatically updated files collide when several people or clones work at once |
+| **C. Not tracked** | Add `/.handoff/` to the project's `.gitignore` and do not create a repo for it | Nothing to maintain | Local only: no history, no backup, no sharing |
+
+### Recommended `.handoff/.gitignore`
+
+`handoff_init` writes this file. On projects that already exist, handoff-mcp
+appends any missing line the first time it writes the matching kind of file
+(lines you added yourself are kept, nothing is duplicated, and only
+`.handoff/.gitignore` is ever changed — never the project's own repository or
+`.gitignore`).
+
+```gitignore
+# Lock files used to serialize concurrent writers (tasks, agents, test runs, brainstorm).
+*.lock
+# One record per running agent / window; only meaningful on this machine.
+/agents/
+# Timer state shared with the editor extension on this machine.
+/timer/
+# Per-session "already injected" records of handoff_memory_query.
+/memory/injected/
+# Per-session "already injected" records of handoff_doc_query.
+/docs/injected/
+# Derived cache, rebuilt from the documents and tasks.
+/docs/_task_ids_rebuild.json
+# Derived cache, rebuilt from the documents.
+/docs/_requirements_summary.json
+# Derived output of handoff_trace_report.
+/docs/_trace_report.json
+# Derived cache of the latest recorded test results.
+/runs/_latest.json
+# Derived index of the trace baselines (the baseline records themselves are tracked).
+/trace/baselines/_index.json
+```
+
+### What to track
+
+| Track | Do not track |
+|---|---|
+| `config.toml` | `*.lock` files |
+| `tasks/` (task records) | `agents/`, `timer/` |
+| `docs/` (your documents) | `docs/injected/`, `memory/injected/` |
+| `memory/` (saved memories) | The derived files listed above |
+| `sessions/`, `events.jsonl`, `time_log.jsonl` | `exports/` (generated PDFs; handoff-mcp warns until it is ignored) |
+| `runs/`, `test_runs/`, `trace/baselines/` (records) | |
+| `brainstorm/`, `referrals/`, `reports/` | |
+
+### If lock files or caches are already tracked
+
+Untrack them once (the files stay on disk), then commit:
+
+```bash
+git -C .handoff rm -r --cached --ignore-unmatch -q -- '*.lock' agents timer memory/injected docs/injected
+git -C .handoff commit -m "Stop tracking machine-local handoff files"
+```
+
+This works for pattern A and pattern B alike.
+
+### Sharing `.handoff/` across clones or people
+
+- Do not use a script that runs "add everything, commit and push" on a timer:
+  it sweeps automatically updated files into the commit and is the usual cause
+  of conflicts.
+- Run `git pull --rebase` before every push, and do not use `--force`.
+- Keep every clone on the same handoff-mcp version. A binary from v0.47.2 or
+  earlier that works on the same `.handoff/` rewrites files in the old shape:
+  it can drop the session `continues` link and write back the memory usage
+  counters (`hit_count`, `last_referenced_at`) that newer versions removed.
 
 ## Tools
 
@@ -533,7 +609,8 @@ rename) so a concurrent reader never sees a partially-written file.
 | `handoff_memory_save` | Save a durable project memory (lesson/rule/convention/gotcha); detects exact and near-duplicate memories and hands near-duplicates back for AI-driven merge |
 | `handoff_memory_query` | Return the memories most relevant to the current prompt/file (BM25 + scope-path boost); with a `session_id`, suppresses repeats already injected this session |
 | `handoff_memory_delete` | Delete a memory by id (full id or unique prefix) |
-| `handoff_memory_cleanup` | Manual/CLI housekeeping: silently merge exact duplicates, return near-duplicate/stale recommendations, gc old injection sidecars |
+| `handoff_memory_cleanup` | Housekeeping that deletes and rewrites no memory by default: returns near-duplicate clusters and old memories (by `updated_at`) as review candidates, gc's old injection sidecars; exact duplicates are merged only with `apply_exact_merges=true` (logged as `memory.merged`) |
+| `handoff_memory_strip_usage_stats` | Opt-in migration (CLI: `handoff-mcp memory strip-usage-stats [--apply]`): remove the obsolete `hit_count` / `last_referenced_at` keys from existing memory files; dry-run unless `apply=true`, counts only |
 
 For usage best practices (granularity, scope_paths, conflict handling, cleanup), see `skills/handoff-memory/SKILL.md`.
 See [Project Memory](#project-memory-1) below for what it is and how to wire automatic injection.
@@ -780,6 +857,8 @@ require_estimate_hours = true # Require estimate_hours on leaf tasks (default tr
 multi_session = true          # Allow multiple active sessions (default true for new projects)
 ai_estimate_multiplier = 0.2  # Multiplier turning human estimates into AI-effort hours
 # default_estimate_hours = 2.0  # auto_schedule's assumed hours for tasks without an estimate (default 8.0)
+# schedule_stale_notice = false # Stop adding `schedule_stale: true` to update_task / doc_save responses (default true)
+# layer_missing_notice = false  # Stop the DIAG-D001 warning for layer-less spec/design documents (default true)
 timer_provider = "auto"       # "auto" | "vscode" | "mcp" | "off"
 timer_authority_ttl_secs = 30 # Heartbeat freshness TTL for authority.json
 timer_idle_timeout_minutes = 10 # Idle pause threshold for MCP fallback timer
@@ -847,6 +926,26 @@ from the **AI-effort hours** used in scheduling and metrics:
   `handoff_auto_schedule` assumes for a task with no `estimate_hours`. When any task
   falls back to it, the response `warnings` says how many and which value was used.
 
+### Warning noise
+
+- **`schedule_stale_notice`** (default `true`) — when a `handoff_update_task`
+  call changes a task's status, dependencies or schedule, the response ends with
+  `schedule_stale: true` (and `handoff_doc_save` returns `schedule_stale: true`
+  when the document's `task_ids` change) to suggest re-running
+  `handoff_auto_schedule`. Set `false` in projects that do not use
+  auto-scheduling and the signal is never added (`handoff_auto_schedule` itself
+  still reports `schedule_stale: false`).
+- **`layer_missing_notice`** (default `true`) — `handoff_doc_save` warns with
+  `DIAG-D001` when a `spec`/`design` document is saved without a V-model
+  `layer`. Set `false` to stop that warning for projects that keep plain
+  documents on purpose; other warnings are unaffected.
+- A dependency on a task ID that does not exist yet is accepted with a
+  `DANGLING_DEPENDENCY` warning, which also notes that the dependency may become
+  circular if that ID is later assigned to a different task.
+
+Both keys are set with `handoff_update_config` (for example
+`settings.schedule_stale_notice`) and must be booleans.
+
 ## Project Memory
 
 Sessions answer *"what was I doing last time?"*. **Memory** answers a longer-lived
@@ -873,7 +972,11 @@ The agent can call the memory tools at any time:
   with `force=true`. **handoff-mcp never merges for you** — it surfaces both
   bodies and lets the agent decide.
 - `handoff_memory_query` — fetch the memories most relevant to some text and/or files.
-- `handoff_memory_delete` / `handoff_memory_cleanup` — prune and de-duplicate the store.
+- `handoff_memory_delete` / `handoff_memory_cleanup` — delete a memory you have
+  confirmed is wrong or obsolete; list near-duplicate clusters and old memories to
+  review. Reading memories (`handoff_memory_query`, `handoff_memory_cleanup`) never
+  changes a memory file, so it never produces a Git diff: only `memory_save`,
+  a `merge_into` save and `memory_delete` do.
 
 ### Automatic injection via hooks
 
@@ -893,8 +996,17 @@ then full text as relevance/budget allows.
 | `UserPromptSubmit` | `handoff_memory_query` (prompt text), `handoff_doc_query` (prompt text) | Inject memories and documents relevant to the prompt |
 | `PreToolUse` (`Edit\|Write\|MultiEdit`) | `handoff_memory_query` (file path), `handoff_doc_query` (file path) | Inject memories and documents scoped to the file being edited |
 
-`handoff_memory_cleanup` (merge exact duplicates, gc old sidecars) is not wired
-to a hook — call it manually or from a CLI/cron job when you want housekeeping.
+`handoff_memory_cleanup` (review candidates, gc old sidecars) is not wired
+to a hook by default — call it manually or from a CLI/cron job when you want
+housekeeping. A `SessionStart` cleanup hook is safe: with the default
+`apply_exact_merges=false` it deletes and rewrites no memory.
+
+Memory files from v0.47.2 and earlier carry `hit_count` / `last_referenced_at`
+usage counters that are no longer written or read. They load fine and are
+dropped the next time that memory is saved. To remove them from every file in one
+step, run `handoff-mcp memory strip-usage-stats` (dry-run, prints counts only) and
+then `handoff-mcp memory strip-usage-stats --apply`. It changes only those two
+keys and leaves `updated_at` as it is; it is never run automatically.
 
 > The bundled `plugin-hooks/hooks/hooks.json` (used by the "Handoff MCP — Memory
 > & Document Hooks" plugin) already wires both `handoff_memory_query` and
@@ -1050,8 +1162,8 @@ All under `[settings]` in `.handoff/config.toml`, all with safe defaults
 | `memory_dup_threshold` | `0.72` | Jaccard similarity at/above which a save is a near-duplicate conflict and cleanup groups a cluster |
 | `memory_query_min_score` | `0.5` | BM25 relevance floor for `handoff_memory_query` results |
 | `memory_query_limit` | `5` | Max memories returned per query |
-| `memory_stale_days` | `60` | Days without a reference before a memory is flagged stale |
-| `memory_injected_gc_days` | `14` | Age at which per-session injection sidecars are garbage-collected |
+| `memory_stale_days` | `60` | Days since a memory's `updated_at` before `handoff_memory_cleanup` lists it as a review candidate (an age signal only; nothing is deleted) |
+| `memory_injected_gc_days` | `14` | Age at which per-session injection sidecars are garbage-collected; `0` = never delete them |
 
 ## CLI API
 

@@ -1578,7 +1578,10 @@ fn write_trace_report(
         .context("failed to write _trace_report.json")?;
     record_derived_write_for_test(&path, body.len());
     // Derived snapshot (rebuilt on demand) — keep it out of `.handoff/`'s git.
-    crate::storage::runs::ensure_gitignore_entry(handoff, "/docs/_trace_report.json")
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::DOCS_TRACE_REPORT,
+    )
 }
 
 /// Key under which `handoff_trace_lint(action="nfr_check")` records its

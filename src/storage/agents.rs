@@ -105,6 +105,18 @@ fn safe_file_stem(agent_id: &str) -> String {
         .collect()
 }
 
+/// Agent records and their lock files are per-machine coordination state, not
+/// project data: keep them out of `.handoff/`'s git before writing any.
+fn ensure_agents_dir_ignored(handoff_dir: &Path) -> Result<()> {
+    crate::storage::gitignore::ensure_gitignore_entries(
+        handoff_dir,
+        &[
+            crate::storage::gitignore::AGENTS_DIR,
+            crate::storage::gitignore::LOCK_FILES,
+        ],
+    )
+}
+
 fn agent_path(handoff_dir: &Path, agent_id: &str) -> PathBuf {
     agents_dir(handoff_dir).join(format!("{}.json", safe_file_stem(agent_id)))
 }
@@ -116,6 +128,7 @@ pub fn write_agent(handoff_dir: &Path, record: &AgentRecord) -> Result<()> {
     let dir = agents_dir(handoff_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create agents dir: {}", dir.display()))?;
+    ensure_agents_dir_ignored(handoff_dir)?;
 
     let path = agent_path(handoff_dir, &record.agent_id);
     let content = serde_json::to_string_pretty(record).context("Failed to serialize agent")?;
@@ -262,6 +275,7 @@ fn open_agent_lock_file(handoff_dir: &Path, agent_id: &str) -> Result<std::fs::F
     let dir = agents_dir(handoff_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create agents dir: {}", dir.display()))?;
+    ensure_agents_dir_ignored(handoff_dir)?;
     let lock_path = dir.join(format!("{}.lock", safe_file_stem(agent_id)));
     std::fs::OpenOptions::new()
         .create(true)
@@ -400,5 +414,35 @@ mod tests {
 
         let record = read_agent(&handoff_dir, "agent-1").unwrap().unwrap();
         assert!(record.claimed_tasks.is_empty());
+    }
+
+    #[test]
+    fn writing_an_agent_record_gitignores_the_agents_dir_and_lock_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(handoff_dir.join(".gitignore"), "my-notes/").unwrap();
+
+        write_agent(&handoff_dir, &test_record("agent-1")).unwrap();
+        write_agent(&handoff_dir, &test_record("agent-1")).unwrap();
+
+        let gitignore = std::fs::read_to_string(handoff_dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            gitignore.lines().collect::<Vec<_>>(),
+            vec!["my-notes/", "/agents/", "*.lock"]
+        );
+    }
+
+    #[test]
+    fn claiming_a_task_gitignores_the_agent_lock_even_without_a_prior_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+
+        add_claimed_task(&handoff_dir, "ghost-agent", "t1").unwrap();
+
+        let gitignore = std::fs::read_to_string(handoff_dir.join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|l| l == "/agents/"), "{gitignore}");
+        assert!(gitignore.lines().any(|l| l == "*.lock"), "{gitignore}");
     }
 }

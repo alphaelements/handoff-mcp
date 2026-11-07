@@ -596,6 +596,10 @@ where
     if !path.is_file() {
         anyhow::bail!("Test run not found: {test_run_id}");
     }
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::LOCK_FILES,
+    )?;
     let lock_path = dir.join(format!("{test_run_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -651,6 +655,10 @@ pub fn delete_test_run(handoff: &Path, test_run_id: &str) -> Result<()> {
     if !path.is_file() {
         anyhow::bail!("Test run not found: {test_run_id}");
     }
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::LOCK_FILES,
+    )?;
     let lock_path = dir.join(format!("{test_run_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -771,6 +779,19 @@ mod tests {
             approved_by: None,
             approved_at: None,
         }
+    }
+
+    #[test]
+    fn update_test_run_gitignores_its_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let persisted = write_test_run_record(&handoff, sample("lock", vec!["ST-1"])).unwrap();
+
+        update_test_run(&handoff, &persisted.test_run_id, |_| Ok(())).unwrap();
+
+        let gitignore = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
+        assert_eq!(gitignore.lines().collect::<Vec<_>>(), vec!["*.lock"]);
     }
 
     #[test]

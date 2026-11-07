@@ -1810,8 +1810,10 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     }
     // t390.2 (REQ-VGAP-002): only `spec`/`design` documents take part in
     // V-model traceability; `adr`/`guide`/`note` never take a layer.
+    // `[settings] layer_missing_notice = false` opts out of this advisory.
     let layer_missing_warning = (doc.layer.is_none()
-        && LAYERABLE_DOC_TYPES.contains(&doc.doc_type.as_str()))
+        && LAYERABLE_DOC_TYPES.contains(&doc.doc_type.as_str())
+        && crate::storage::config::layer_missing_notice_enabled(handoff))
     .then(|| StructuredWarning {
         severity: "warning".to_string(),
         code: "DIAG-D001".to_string(),
@@ -2060,7 +2062,9 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // REQ-PLA-005: `task_ids` is the plan's schedule input, so a changed set
     // (judged on the post-resolution `doc.task_ids`, which drops ids that
     // could not be linked) means `handoff_auto_schedule` is worth re-running.
-    let schedule_stale = doc.task_ids.iter().cloned().collect::<BTreeSet<_>>() != task_ids_before;
+    // `[settings] schedule_stale_notice = false` opts out of the advisory.
+    let schedule_stale = doc.task_ids.iter().cloned().collect::<BTreeSet<_>>() != task_ids_before
+        && crate::storage::config::schedule_stale_notice_enabled(handoff);
 
     let mut out = json!({
         "doc_id": id,
@@ -4156,7 +4160,10 @@ pub(crate) fn write_requirements_summary_with_inputs(
         .context("failed to write _requirements_summary.json")?;
     record_derived_write_for_test(&path, body.len());
     // Derived cache (rebuilt from the documents) — keep it out of `.handoff/`'s git.
-    crate::storage::runs::ensure_gitignore_entry(handoff_dir, "/docs/_requirements_summary.json")?;
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff_dir,
+        crate::storage::gitignore::DOCS_REQUIREMENTS_SUMMARY,
+    )?;
 
     // Record what we just wrote so the next call in this process can skip
     // both the read and any (de)serialization.
@@ -5655,7 +5662,10 @@ fn write_task_ids_rebuild_fingerprint(handoff: &Path, inputs: &DerivedInputs) ->
         .context("Failed to serialize task_ids rebuild fingerprint")?;
     crate::storage::atomic_write(&path, json.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))?;
-    crate::storage::runs::ensure_gitignore_entry(handoff, "/docs/_task_ids_rebuild.json")
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::DOCS_TASK_IDS_REBUILD,
+    )
 }
 
 /// t360.7 (wiki/220 §2.5 "全再構築", §4.3 r3): the full, all-tasks-scanning

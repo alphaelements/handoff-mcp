@@ -7,6 +7,7 @@ pub mod deltas;
 pub mod docs;
 pub mod events;
 pub mod git;
+pub mod gitignore;
 pub mod layer_status;
 pub mod lineage;
 pub mod memory;
@@ -541,6 +542,9 @@ pub fn init_handoff(project_dir: &Path, project_name: &str, description: &str) -
 
     let config = config::Config::new(project_name, description);
     config::write_config(&dir.join("config.toml"), &config)?;
+    // Only `.handoff/.gitignore`; the project's own repo and `.gitignore` are
+    // never touched.
+    gitignore::ensure_recommended_gitignore(&dir)?;
 
     Ok(())
 }

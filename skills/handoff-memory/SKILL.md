@@ -91,19 +91,31 @@ does this automatically if configured). Optional arguments:
 
 | Param | Default | Description |
 |---|---|---|
-| `apply_exact_merges` | `true` | Set `false` to skip auto-merging and only return recommendations |
-| `stale_days` | from config (default 60) | Override the staleness threshold in days |
+| `apply_exact_merges` | `false` | Set `true` to merge exact duplicates (lossless; oldest kept, others deleted and logged as a `memory.merged` event). Off by default so cleanup never rewrites or deletes a memory file |
+| `stale_days` | from config (default 60) | Override the review-candidate age threshold in days |
+
+Reading memories never changes a memory file: `handoff_memory_query` only writes a
+git-ignored per-session sidecar, and `handoff_memory_cleanup` is read-only unless
+you pass `apply_exact_merges=true`.
 
 It performs three passes:
 
-1. **Exact duplicates** — silently auto-merged (lossless; oldest entry kept, others absorbed). Skipped when `apply_exact_merges` is `false`
-2. **Near-duplicate clusters** — returned as recommendations for AI-driven merge
-3. **Stale memories** — memories not referenced for `stale_days`, returned as recommendations
+1. **Exact duplicates** — merged only when `apply_exact_merges` is `true`
+2. **Near-duplicate clusters** — returned as review candidates for AI-driven merge
+3. **Old memories** — memories whose `updated_at` is older than `stale_days`, listed as review candidates (key `stale`)
 
 ### Acting on Cleanup Recommendations
 
 - **similar_clusters**: Review each cluster. If the memories are truly redundant, merge them with `handoff_memory_save(merge_into=..., absorb_ids=[...])`. If distinct, leave them.
-- **stale**: Consider whether the memory is obsolete (delete with `handoff_memory_delete`) or simply rarely triggered (leave it — low hit_count doesn't mean low value).
+- **stale**: A review list, not a deletion list. Usage is not tracked, so an old `updated_at` says nothing about whether a memory is still relevant. Re-read each one and keep it, update it (`handoff_memory_save(merge_into=...)` refreshes `updated_at`), or — only when you have confirmed it is wrong or obsolete — delete it with `handoff_memory_delete`.
+
+### Migrating from v0.47.2 or earlier
+
+Older memory files carry `hit_count` / `last_referenced_at`. They still load and are
+dropped when a memory is next saved. To strip them from all files at once, run
+`handoff-mcp memory strip-usage-stats` (dry-run, counts only) and then add `--apply`
+(MCP tool `handoff_memory_strip_usage_stats`). It removes only those two keys and
+keeps `updated_at`.
 
 ### Manual Deletion
 
@@ -120,7 +132,7 @@ initiative, configure Claude Code hooks:
 |---|---|---|
 | `UserPromptSubmit` | `handoff_memory_query` (prompt text) | Inject memories relevant to each user prompt |
 | `PreToolUse` (`Edit\|Write\|MultiEdit`) | `handoff_memory_query` (file path) | Inject memories scoped to the file being edited |
-| `SessionStart` | `handoff_memory_cleanup` | Auto-merge exact duplicates, surface recommendations |
+| `SessionStart` | `handoff_memory_cleanup` | Surface review candidates (deletes nothing by default) |
 
 Run `handoff-mcp setup` to install these hooks automatically, or
 `handoff-mcp setup --uninstall` to remove them. See the README for the full hook

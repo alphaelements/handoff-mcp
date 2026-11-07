@@ -334,6 +334,11 @@ fn read_docs_injected_set(handoff: &Path, session_id: &str, now: &str) -> DocInj
 }
 
 fn write_docs_injected_set(handoff: &Path, set: &DocInjectedSet) -> Result<()> {
+    // Per-session cache: machine-local, so keep it out of `.handoff/`'s git.
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::DOCS_INJECTED_DIR,
+    )?;
     std::fs::create_dir_all(docs_injected_dir(handoff))?;
     let path = docs_injected_path(handoff, &set.session_id);
     let content = serde_json::to_string_pretty(set)?;

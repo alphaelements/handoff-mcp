@@ -293,6 +293,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("memory", "query") => "handoff_memory_query",
         ("memory", "delete") => "handoff_memory_delete",
         ("memory", "cleanup") => "handoff_memory_cleanup",
+        ("memory", "strip-usage-stats") => "handoff_memory_strip_usage_stats",
 
         // referral
         ("referral", "send" | "refer") => "handoff_refer",
@@ -851,7 +852,10 @@ pub const GROUPS: &[(&str, &str)] = &[
         "Session management (load, save, list, get, update)",
     ),
     ("config", "Configuration (get, update)"),
-    ("memory", "Project memory (save, query, delete, cleanup)"),
+    (
+        "memory",
+        "Project memory (save, query, delete, cleanup, strip-usage-stats)",
+    ),
     (
         "referral",
         "Cross-project referrals (send, list, get, update)",
@@ -936,6 +940,7 @@ pub fn print_group_help(group: &str) {
             ("query", "Query memories (--text, --limit, --session-id)"),
             ("delete", "Delete a memory (--id)"),
             ("cleanup", "Housekeep memory store (--apply-exact-merges, --stale-days)"),
+            ("strip-usage-stats", "Remove obsolete hit_count/last_referenced_at keys from memory files (dry-run unless --apply)"),
         ],
         "referral" => &[
             ("send", "Send a referral to another project (--summary, --target-project, ...)"),

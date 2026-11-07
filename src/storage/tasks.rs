@@ -858,6 +858,7 @@ where
 /// not used directly because its filename changes with status
 /// (`_task.<status>.json`); the directory-scoped `.lock` file stays stable.
 pub fn open_lock_file(task_dir: &Path) -> Result<std::fs::File> {
+    crate::storage::gitignore::ensure_task_lock_ignored(task_dir)?;
     let lock_path = task_dir.join(".lock");
     std::fs::OpenOptions::new()
         .create(true)
@@ -2871,5 +2872,19 @@ mod task_index_cache_tests {
             "a stale TaskIndexFields cache entry must not mask a directory that now \
              resolves to a different task id"
         );
+    }
+
+    #[test]
+    fn opening_a_task_lock_gitignores_lock_files_in_the_handoff_dir() {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        let dir = handoff.join("tasks").join("t1-first");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        open_lock_file(&dir).unwrap();
+        open_lock_file(&dir).unwrap();
+
+        let gitignore = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
+        assert_eq!(gitignore.lines().collect::<Vec<_>>(), vec!["*.lock"]);
     }
 }
