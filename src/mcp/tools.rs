@@ -28,7 +28,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_load_context".to_string(),
-            description: "Load handoff context for the current project. Call at session start to resume work. Can also resume a paused session by ID.".to_string(),
+            description: "Load handoff context for the current project. Call at session start to resume work. Can also resume a paused session by ID. The returned task_tree is compact by default (only the tasks that belong to this session, with scope_reason; task_tree_meta counts the rest); pass task_tree:'full' for every task.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -47,6 +47,17 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "continue_from": {
                         "type": "string",
                         "description": "ID of the closed session your work continues. Normally NOT needed: the previous session is chosen automatically (previous_session.inferred:true). Pass it only when the response has ambiguous:true: pick the entry of other_heads whose summary matches the user's request and call again with its id. Skips the automatic choice; the choice is carried to your next save_context that creates a session."
+                    },
+                    "task_tree": {
+                        "type": "string",
+                        "enum": ["compact", "full"],
+                        "default": "compact",
+                        "description": "Which tasks task_tree lists. 'compact' (default): the tasks that belong to this session, each with a scope_reason (active = in_progress/blocked/review, scope = task_scope, previous_session, sibling, unblocked, branch = named by the branch/recent commits, milestone, priority); everything else is only counted in task_tree_meta (included, omitted_total, omitted_by_status, omitted_without_milestone, truncated, hint). The number of tasks beyond the active ones is capped by config settings.compact_task_limit (default 40). 'full': every task, as before v0.47.3. task_summary always counts every task. To fetch tasks compact left out, use handoff_list_tasks."
+                    },
+                    "task_scope": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Task IDs (e.g. ['t75','t439.1']) whose unfinished subtrees compact task_tree includes with scope_reason 'scope', regardless of compact_task_limit. Use it when the session works on specific tasks. Unknown IDs are reported in warnings. Ignored by task_tree:'full'."
                     }
                 }
             }),
@@ -259,6 +270,25 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "include_children": {
                         "type": "boolean",
                         "description": "If true, recursively scan project_dir for child .handoff/ projects and include their tasks. Each task gets project_name, project_dir, and task_ref fields (task_ref is a composite '{project_name}-{hash}:{id}' identifier unique across projects). The original 'id' field is left unchanged so it stays usable with handoff_get_task/handoff_update_task/dependencies when paired with the task's own project_dir. Default: false."
+                    },
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Return only these task ids (exact match; whitespace is trimmed, blanks and duplicates dropped; unknown ids are silently absent) plus the ancestors of each match so the tree stays connected. A matched parent keeps only the children that are themselves in ids, unless include_descendants is true. [] matches nothing. Combined with the other filters (AND). task_summary still counts every task. When fields is given, children is always kept for an ids selection, so a requested subtask never disappears behind its ancestor. Use this instead of listing all todo tasks when the task ids are already known."
+                    },
+                    "include_descendants": {
+                        "type": "boolean",
+                        "description": "Only meaningful with ids; default false. If true, a task matched by ids keeps its whole subtree (all depths), still narrowed by the other filters: ids=[\"t439\"], status_filter=\"todo\" returns t439 (as the path) with every todo subtask below it, which is how a parent task id selects its unfinished subtasks. Without ids it has no effect. Must be a boolean."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Return at most this many top-level task_tree nodes (after the filters and ids), keeping each kept node's descendants. With include_children it applies per project. task_summary is unaffected. Omit for no cap."
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Keys to keep on each task node (duplicates collapse). Allowed: id, title, status, schedule, dependencies, order, assignee, lock, children. id is always kept. Keys a task does not have are omitted, never null. Without 'children' nodes carry no nested children, so include it to keep the tree. project_name/project_dir/task_ref from include_children are always kept. An unknown name is an error that lists the allowed names. Omit or [] for all keys."
                     }
                 }
             }),
@@ -1584,7 +1614,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: document must have every listed tag (AND)." },
                     "task_id": { "type": "string", "description": "Filter: only documents linked to this task." },
                     "include_body": { "type": "boolean", "description": "Include each document's full body.", "default": false },
-                    "query": { "type": "string", "description": "BM25 text search over title + tags + body." }
+                    "query": { "type": "string", "description": "BM25 text search over title + tags + body." },
+                    "doc_id": { "type": "string", "description": "Exact match on the document id (case-sensitive, not trimmed; an empty string matches nothing). Combined with the other filters (AND). To fetch one known document, prefer this or slug over listing everything." },
+                    "slug": { "type": "string", "description": "Exact match on the document slug (case-sensitive, not trimmed; an empty string matches nothing). Combined with the other filters (AND)." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Return at most this many documents, taken from the front of the result (after filters and, when query is given, relevance ranking). Omit for no cap." },
+                    "fields": { "type": "array", "items": { "type": "string" }, "description": "Metadata keys to keep on each document (duplicates collapse). Allowed: id, slug, title, doc_type, tags, scope_paths, parent_id, children, related, auto_inject, task_ids, layer, trace_profile, milestone, has_bom, line_ending, sections, section_count, created_at, updated_at, content_hash. An unknown name is an error that lists the allowed names. include_body still adds body after the projection. Omit or [] for all keys." }
                 }
             }),
         },

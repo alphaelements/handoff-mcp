@@ -332,6 +332,68 @@ fn session_load_via_cli() {
 }
 
 #[test]
+fn session_load_task_tree_and_task_scope_flags_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+    for title in ["Alpha", "Beta"] {
+        let task = serde_json::json!({
+            "title": title,
+            "status": "done",
+            "priority": "low",
+            "schedule": { "estimate_hours": 1 },
+        })
+        .to_string();
+        let (stdout, _, code) = run(&["task", "update", "--project-dir", dir, "--task", &task]);
+        assert_eq!(code, 0, "task update failed: {stdout}");
+    }
+
+    // Compact is the default; a single --task-scope value is a one-item list,
+    // and a done task named by it is not included.
+    let (stdout, _, code) = run(&[
+        "session",
+        "load",
+        "--project-dir",
+        dir,
+        "--task-scope",
+        "t1",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let compact: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(compact["task_tree_meta"]["mode"], "compact");
+    assert_eq!(compact["task_tree"].as_array().unwrap().len(), 0);
+    assert_eq!(compact["task_tree_meta"]["omitted_total"], 2);
+
+    let (stdout, _, code) = run(&[
+        "session",
+        "load",
+        "--project-dir",
+        dir,
+        "--task-tree",
+        "full",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let full: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(full["task_tree_meta"]["mode"], "full");
+    assert_eq!(full["task_tree"].as_array().unwrap().len(), 2);
+
+    let (stdout, stderr, code) = run(&[
+        "session",
+        "load",
+        "--project-dir",
+        dir,
+        "--task-tree",
+        "wide",
+    ]);
+    assert_ne!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("compact") && stdout.contains("full")
+            || stderr.contains("compact") && stderr.contains("full"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn config_get_via_cli() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().to_str().unwrap();

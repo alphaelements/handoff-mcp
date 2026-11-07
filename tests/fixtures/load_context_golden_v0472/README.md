@@ -6,8 +6,8 @@
 
 | file | project |
 |---|---|
-| `small.json` | 29 tasks: parent/child/grandchild, every status (todo/in_progress/blocked/review/done/skipped), dependencies, one closed previous session |
-| `todo300.json` | 300 tasks (299 todo + 1 in_progress parent with 240 children), one closed previous session whose `related_task_ids` has 299 IDs |
+| `small.json` | 29 tasks with dotted ids (`t1`, `t1.2`, `t1.2.1`) and every status (todo/in_progress/blocked/review/done/skipped), dependencies, one closed previous session. The tasks were created flat, without `parent_id`, so `task_tree` has no `children` |
+| `todo300.json` | 300 flat tasks (299 todo + 1 in_progress `t1` with 240 dotted-id `t1.N` tasks), one closed previous session whose `related_task_ids` has 299 IDs |
 
 All data is synthetic. No real `.handoff` data is included.
 
@@ -40,3 +40,6 @@ recorded here is just whatever that run produced. Compare arrays (`task_tree`,
 When comparing against a newer binary, normalize its output with the same script
 first. Only `task_tree` and `task_summary` are expected to be identical under
 `task_tree: "full"`; other keys may legitimately change in v0.47.3.
+
+The golden does not cover nested `children`; `tests/load_context_compact_e2e.rs` checks a real hierarchy
+(built with `parent_id`) separately.

@@ -2125,3 +2125,409 @@ fn notes_append_multiple_times() {
     assert!(notes.contains("Block 2"));
     assert!(notes.contains("Block 3"));
 }
+
+// ---------------------------------------------------------------------
+// list_tasks: ids / limit / fields (v0.47.3 WS3, FR-V0473-005)
+// ---------------------------------------------------------------------
+
+fn create_task_titled(pd: &str, title: &str, parent: Option<&str>) {
+    let mut args = json!({ "project_dir": pd, "task": { "title": title } });
+    if let Some(p) = parent {
+        args["parent_id"] = json!(p);
+    }
+    let resp = call_tool("handoff_update_task", args);
+    assert!(!is_error(&resp), "create failed: {}", get_text(&resp));
+}
+
+/// t1..t6 top-level, t2.1 child of t2, t2.1.1 child of t2.1 (so t2.1.1's
+/// ancestors are t2.1 and t2).
+fn setup_list_fixture() -> (TempDir, String) {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    for i in 1..=6 {
+        create_task_titled(&pd, &format!("Top {i}"), None);
+    }
+    create_task_titled(&pd, "Child of t2", Some("t2"));
+    create_task_titled(&pd, "Grandchild", Some("t2.1"));
+    (dir, pd)
+}
+
+fn list(pd: &str, extra: Value) -> Value {
+    let mut args = json!({ "project_dir": pd });
+    for (k, v) in extra.as_object().unwrap() {
+        args[k] = v.clone();
+    }
+    let resp = call_tool("handoff_list_tasks", args);
+    assert!(!is_error(&resp), "list_tasks failed: {}", get_text(&resp));
+    serde_json::from_str(&get_text(&resp)).unwrap()
+}
+
+fn collect_ids(nodes: &Value, out: &mut Vec<String>) {
+    for n in nodes.as_array().unwrap() {
+        out.push(n["id"].as_str().unwrap().to_string());
+        if let Some(c) = n.get("children") {
+            collect_ids(c, out);
+        }
+    }
+}
+
+fn top_ids(parsed: &Value) -> Vec<String> {
+    parsed["task_tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn list_tasks_ids_returns_only_requested_tasks_and_ancestors() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "ids": ["t1", "t2.1.1"] }));
+    assert_eq!(top_ids(&parsed), vec!["t1", "t2"]);
+    let mut all = Vec::new();
+    collect_ids(&parsed["task_tree"], &mut all);
+    all.sort();
+    // t1 + t2.1.1 matched; t2.1 and t2 kept as ancestors.
+    assert_eq!(all, vec!["t1", "t2", "t2.1", "t2.1.1"]);
+}
+
+#[test]
+fn list_tasks_ids_normalizes_whitespace_blank_and_duplicates() {
+    let (_dir, pd) = setup_list_fixture();
+    let messy = list(&pd, json!({ "ids": [" t3 ", "t3", ""] }));
+    let clean = list(&pd, json!({ "ids": ["t3"] }));
+    assert_eq!(messy, clean);
+    assert_eq!(top_ids(&clean), vec!["t3"]);
+}
+
+#[test]
+fn list_tasks_ids_unknown_id_is_silently_absent_and_empty_ids_match_nothing() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "ids": ["t1", "t999"] }));
+    assert_eq!(top_ids(&parsed), vec!["t1"]);
+    let none = list(&pd, json!({ "ids": [] }));
+    assert!(none["task_tree"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn list_tasks_ids_keeps_task_summary_of_all_tasks() {
+    let (_dir, pd) = setup_list_fixture();
+    let all = list(&pd, json!({}));
+    let some = list(&pd, json!({ "ids": ["t1"] }));
+    assert_eq!(all["task_summary"], some["task_summary"]);
+    assert_eq!(some["task_summary"]["total"], 8);
+}
+
+#[test]
+fn list_tasks_ids_combines_with_status_filter() {
+    let (_dir, pd) = setup_list_fixture();
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t2", "status": "in_progress" } }),
+    );
+    let parsed = list(
+        &pd,
+        json!({ "ids": ["t1", "t2"], "status_filter": "in_progress" }),
+    );
+    assert_eq!(top_ids(&parsed), vec!["t2"]);
+}
+
+#[test]
+fn list_tasks_ids_rejects_non_string_elements() {
+    let (_dir, pd) = setup_list_fixture();
+    let resp = call_tool(
+        "handoff_list_tasks",
+        json!({ "project_dir": &pd, "ids": ["t1", 3] }),
+    );
+    assert!(is_error(&resp));
+    assert!(get_text(&resp).contains("ids"), "{}", get_text(&resp));
+}
+
+#[test]
+fn list_tasks_limit_caps_top_level_nodes_in_original_order() {
+    let (_dir, pd) = setup_list_fixture();
+    let full = list(&pd, json!({}));
+    let limited = list(&pd, json!({ "limit": 3 }));
+    assert_eq!(limited["task_tree"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        limited["task_tree"],
+        json!(full["task_tree"].as_array().unwrap()[..3])
+    );
+    // The summary still describes every task.
+    assert_eq!(limited["task_summary"], full["task_summary"]);
+}
+
+#[test]
+fn list_tasks_limit_must_be_integer_at_least_one() {
+    let (_dir, pd) = setup_list_fixture();
+    for bad in [json!(0), json!(-1), json!("3"), json!(1.5)] {
+        let resp = call_tool(
+            "handoff_list_tasks",
+            json!({ "project_dir": &pd, "limit": bad }),
+        );
+        assert!(is_error(&resp), "limit {bad} should error");
+        assert!(
+            get_text(&resp).contains("'limit' must be an integer >= 1"),
+            "{}",
+            get_text(&resp)
+        );
+    }
+}
+
+#[test]
+fn list_tasks_fields_projects_nodes_and_always_keeps_id() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "fields": ["status"] }));
+    for node in parsed["task_tree"].as_array().unwrap() {
+        let keys: Vec<&String> = node.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["id", "status"], "node: {node}");
+    }
+}
+
+#[test]
+fn list_tasks_fields_omits_absent_optional_fields_instead_of_null() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "fields": ["id", "schedule"] }));
+    for node in parsed["task_tree"].as_array().unwrap() {
+        assert_eq!(node.as_object().unwrap().len(), 1, "node: {node}");
+    }
+}
+
+#[test]
+fn list_tasks_fields_children_controls_nesting() {
+    let (_dir, pd) = setup_list_fixture();
+    let without = list(&pd, json!({ "fields": ["id"] }));
+    let mut ids = Vec::new();
+    collect_ids(&without["task_tree"], &mut ids);
+    assert_eq!(ids.len(), 6, "no children key -> only top-level nodes");
+
+    let with = list(&pd, json!({ "fields": ["id", "children"] }));
+    let mut ids = Vec::new();
+    collect_ids(&with["task_tree"], &mut ids);
+    assert_eq!(ids.len(), 8);
+    let t2 = &with["task_tree"][1];
+    assert_eq!(t2["children"][0]["id"], "t2.1");
+    assert_eq!(
+        t2["children"][0]["children"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["id"]
+    );
+}
+
+#[test]
+fn list_tasks_fields_unknown_name_errors_with_allowed_list() {
+    let (_dir, pd) = setup_list_fixture();
+    let resp = call_tool(
+        "handoff_list_tasks",
+        json!({ "project_dir": &pd, "fields": ["id", "bogus"] }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("bogus"), "{text}");
+    assert!(text.contains("Allowed fields"), "{text}");
+    for allowed in [
+        "id",
+        "title",
+        "status",
+        "schedule",
+        "dependencies",
+        "order",
+        "assignee",
+        "lock",
+        "children",
+    ] {
+        assert!(text.contains(allowed), "missing {allowed}: {text}");
+    }
+}
+
+#[test]
+fn list_tasks_fields_rejects_non_string_elements() {
+    let (_dir, pd) = setup_list_fixture();
+    let resp = call_tool(
+        "handoff_list_tasks",
+        json!({ "project_dir": &pd, "fields": ["id", 3] }),
+    );
+    assert!(is_error(&resp));
+}
+
+#[test]
+fn list_tasks_ids_limit_fields_apply_in_that_order() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(
+        &pd,
+        json!({ "ids": ["t2", "t4", "t5"], "limit": 2, "fields": ["id", "title"] }),
+    );
+    assert_eq!(top_ids(&parsed), vec!["t2", "t4"]);
+    for node in parsed["task_tree"].as_array().unwrap() {
+        let keys: Vec<&String> = node.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["id", "title"]);
+    }
+}
+
+fn tree_ids(parsed: &Value) -> Vec<String> {
+    let mut all = Vec::new();
+    collect_ids(&parsed["task_tree"], &mut all);
+    all.sort();
+    all
+}
+
+#[test]
+fn list_tasks_ids_match_without_include_descendants_drops_unlisted_children() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "ids": ["t2"] }));
+    assert_eq!(tree_ids(&parsed), vec!["t2"]);
+    let explicit = list(&pd, json!({ "ids": ["t2"], "include_descendants": false }));
+    assert_eq!(parsed, explicit);
+}
+
+#[test]
+fn list_tasks_include_descendants_keeps_whole_subtree_of_matched_ids() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "ids": ["t2"], "include_descendants": true }));
+    assert_eq!(top_ids(&parsed), vec!["t2"]);
+    assert_eq!(tree_ids(&parsed), vec!["t2", "t2.1", "t2.1.1"]);
+}
+
+#[test]
+fn list_tasks_include_descendants_only_expands_matched_nodes() {
+    let (_dir, pd) = setup_list_fixture();
+    // t2.1 is matched: its subtree is kept; its ancestor t2 is kept for
+    // connectivity; the unrelated t1 is absent.
+    let parsed = list(
+        &pd,
+        json!({ "ids": ["t1", "t2.1"], "include_descendants": true }),
+    );
+    assert_eq!(tree_ids(&parsed), vec!["t1", "t2", "t2.1", "t2.1.1"]);
+    // t3 has no children and t4 is not requested.
+    let parsed = list(&pd, json!({ "ids": ["t3"], "include_descendants": true }));
+    assert_eq!(tree_ids(&parsed), vec!["t3"]);
+}
+
+#[test]
+fn list_tasks_include_descendants_is_still_narrowed_by_status_filter() {
+    let (_dir, pd) = setup_list_fixture();
+    // The session-loop shape: an in_progress parent with todo subtasks.
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t2", "status": "in_progress" } }),
+    );
+    let parsed = list(
+        &pd,
+        json!({ "ids": ["t2"], "include_descendants": true, "status_filter": "todo" }),
+    );
+    assert_eq!(tree_ids(&parsed), vec!["t2", "t2.1", "t2.1.1"]);
+
+    // An already finished descendant does not come back.
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t2.1.1", "status": "skipped" } }),
+    );
+    let parsed = list(
+        &pd,
+        json!({ "ids": ["t2"], "include_descendants": true, "status_filter": "todo" }),
+    );
+    assert_eq!(tree_ids(&parsed), vec!["t2", "t2.1"]);
+}
+
+#[test]
+fn list_tasks_include_descendants_without_ids_changes_nothing() {
+    let (_dir, pd) = setup_list_fixture();
+    let plain = list(&pd, json!({}));
+    assert_eq!(plain, list(&pd, json!({ "include_descendants": true })));
+    assert_eq!(plain, list(&pd, json!({ "include_descendants": null })));
+}
+
+#[test]
+fn list_tasks_include_descendants_rejects_non_boolean() {
+    let (_dir, pd) = setup_list_fixture();
+    let resp = call_tool(
+        "handoff_list_tasks",
+        json!({ "project_dir": &pd, "ids": ["t2"], "include_descendants": "yes" }),
+    );
+    assert!(is_error(&resp));
+    assert!(
+        get_text(&resp).contains("include_descendants"),
+        "{}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn list_tasks_include_descendants_with_fields_and_limit() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(
+        &pd,
+        json!({
+            "ids": ["t1", "t2", "t3"],
+            "include_descendants": true,
+            "limit": 2,
+            "fields": ["id", "status"]
+        }),
+    );
+    // limit caps top-level nodes; the subtree of t2 is not capped, and the
+    // descendants survive the projection even though `children` was not asked.
+    assert_eq!(top_ids(&parsed), vec!["t1", "t2"]);
+    assert_eq!(tree_ids(&parsed), vec!["t1", "t2", "t2.1", "t2.1.1"]);
+}
+
+#[test]
+fn list_tasks_ids_match_survives_fields_without_children() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({ "ids": ["t2.1"], "fields": ["id"] }));
+    // The requested task must not vanish behind its ancestor.
+    assert_eq!(tree_ids(&parsed), vec!["t2", "t2.1"]);
+    assert_eq!(parsed["task_tree"][0]["children"][0]["id"], "t2.1");
+    // Without ids, `fields` still drops nesting unless `children` is asked.
+    let no_ids = list(&pd, json!({ "fields": ["id"] }));
+    assert!(no_ids["task_tree"][1].get("children").is_none());
+}
+
+#[test]
+fn list_tasks_null_new_arguments_equal_no_arguments() {
+    let (_dir, pd) = setup_list_fixture();
+    let plain = list(&pd, json!({}));
+    let nulls = list(&pd, json!({ "ids": null, "limit": null, "fields": null }));
+    assert_eq!(plain, nulls);
+    // Empty `fields` applies no projection either.
+    assert_eq!(plain, list(&pd, json!({ "fields": [] })));
+}
+
+#[test]
+fn list_tasks_without_new_arguments_keeps_the_legacy_shape() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(&pd, json!({}));
+    let t2 = &parsed["task_tree"][1];
+    assert_eq!(t2["id"], "t2");
+    assert_eq!(t2["title"], "Top 2");
+    assert_eq!(t2["status"], "todo");
+    assert_eq!(t2["children"][0]["id"], "t2.1");
+    assert_eq!(t2["children"][0]["children"][0]["id"], "t2.1.1");
+    assert_eq!(parsed["task_tree"].as_array().unwrap().len(), 6);
+    assert_eq!(parsed["task_summary"]["total"], 8);
+}
+
+#[test]
+fn list_tasks_include_children_applies_projection_but_keeps_project_annotations() {
+    let (_dir, pd) = setup_list_fixture();
+    let parsed = list(
+        &pd,
+        json!({ "include_children": true, "ids": ["t1"], "fields": ["status"] }),
+    );
+    let nodes = parsed["task_tree"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    let mut keys: Vec<&str> = nodes[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["id", "project_dir", "project_name", "status", "task_ref"]
+    );
+}

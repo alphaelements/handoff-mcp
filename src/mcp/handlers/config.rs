@@ -42,6 +42,7 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "settings.history_limit",
         "settings.session_prune_limit",
         "settings.done_task_limit",
+        "settings.compact_task_limit",
         "settings.auto_git_summary",
         "settings.require_estimate_hours",
         "settings.ai_estimate_multiplier",
@@ -135,6 +136,18 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                         config.settings.done_task_limit = n as u32;
                         applied.push(format!("settings.done_task_limit = {n}"));
                     }
+                }
+                "settings.compact_task_limit" => {
+                    let n = value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "settings.compact_task_limit must be a non-negative integer"
+                            )
+                        })?;
+                    config.settings.compact_task_limit = n;
+                    applied.push(format!("settings.compact_task_limit = {n}"));
                 }
                 "settings.auto_git_summary" => {
                     if let Some(b) = value.as_bool() {

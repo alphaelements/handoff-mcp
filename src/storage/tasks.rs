@@ -236,7 +236,9 @@ pub struct TaskIndex {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub total: u32,
-    pub by_status: std::collections::HashMap<String, u32>,
+    /// Ordered by status name so the serialized key order is the same on every
+    /// run (a `HashMap` iterates in a different order each time).
+    pub by_status: std::collections::BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_estimate_hours: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1649,7 +1651,7 @@ fn build_task_index_impl(
     let mut tree = Vec::new();
     let mut summary = TaskSummary {
         total: 0,
-        by_status: HashMap::new(),
+        by_status: std::collections::BTreeMap::new(),
         total_estimate_hours: None,
         total_actual_hours: None,
         completion_rate: None,

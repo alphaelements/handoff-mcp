@@ -15,6 +15,7 @@ pub mod referrals;
 pub mod runs;
 pub mod session_target;
 pub mod sessions;
+pub mod task_scope;
 pub mod tasks;
 pub mod test_results;
 pub mod test_runs;

@@ -192,6 +192,11 @@ pub struct SettingsConfig {
     pub session_prune_limit: Option<u32>,
     #[serde(default = "default_done_task_limit")]
     pub done_task_limit: u32,
+    /// How many tasks beyond the active ones the compact `task_tree` of
+    /// `handoff_load_context` adds (previous-session, sibling, unblocked,
+    /// branch, milestone and priority tasks together).
+    #[serde(default = "default_compact_task_limit")]
+    pub compact_task_limit: u32,
     #[serde(default = "default_auto_git_summary")]
     pub auto_git_summary: bool,
     /// Require `estimate_hours` when creating/updating leaf tasks. Default true.
@@ -979,6 +984,10 @@ fn default_done_task_limit() -> u32 {
     10
 }
 
+fn default_compact_task_limit() -> u32 {
+    40
+}
+
 fn default_auto_git_summary() -> bool {
     true
 }
@@ -1045,6 +1054,7 @@ impl Default for SettingsConfig {
             history_limit: None,
             session_prune_limit: None,
             done_task_limit: default_done_task_limit(),
+            compact_task_limit: default_compact_task_limit(),
             auto_git_summary: default_auto_git_summary(),
             require_estimate_hours: default_require_estimate_hours(),
             ai_estimate_multiplier: default_ai_estimate_multiplier(),

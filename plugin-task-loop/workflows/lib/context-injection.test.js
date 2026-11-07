@@ -352,6 +352,21 @@ test('the raw handoff_load_context response shape is accepted verbatim', () => {
   assert.match(s, /TOP_ACTION/);
 });
 
+// `handoff_load_context` returns a compact `task_tree` by default (v0.47.3). The
+// prompt builder never reads `task_tree` / `task_tree_meta`, so the default
+// change cannot starve an agent of tasks: agents get their task from the
+// manager's prompt, not from this block.
+test('task_tree and task_tree_meta of the raw response are not rendered, compact or full', () => {
+  const raw = {
+    task_tree: [{ id: 't77', title: 'TREE_TASK_TITLE', status: 'todo', scope_reason: 'priority' }],
+    task_tree_meta: { mode: 'compact', omitted_total: 12, hint: 'TREE_META_HINT' },
+    next_actions: ['KEEP_ME'],
+  };
+  const s = buildInjectedContextSection({ handoff_context: raw });
+  assert.match(s, /KEEP_ME/);
+  assert.doesNotMatch(s, /TREE_TASK_TITLE|TREE_META_HINT|scope_reason|omitted_total/);
+});
+
 test('the previous session summary is picked up from previous_session.summary', () => {
   const s = buildInjectedContextSection({
     handoff_context: { previous_session: { summary: 'NESTED_SUMMARY' } },

@@ -23,6 +23,7 @@ use crate::storage::sessions::{
     adopt_session, read_session_entries, transition_session_file, OwnerStamp, SessionData,
     SessionEntry,
 };
+use crate::storage::task_scope;
 use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
@@ -83,6 +84,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     } else {
         anyhow::bail!("config.toml not found");
     };
+
+    // Rejected before any session is touched: a bad argument must not leave
+    // a half-applied load behind.
+    let task_tree_mode = task_tree_mode(arguments)?;
+    let explicit_scope = task_scope_ids(arguments)?;
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
     let adopt = arguments
@@ -239,12 +245,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let (task_tree, task_summary, _expired_ids) =
         build_task_index_with_expiry(&tasks_dir, config.settings.done_task_limit)?;
 
-    let mut result = serde_json::json!({
-        "project": config.project.name,
-        "task_tree": task_tree,
-        "task_summary": task_summary,
-    });
     let mut claimed_tasks: Vec<String> = Vec::new();
+    let mut registered_agent_id: Option<String> = None;
     if let Some(id) = agent_id.as_deref() {
         let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
         let agent = register_agent(handoff, project_dir, id, session_id_for_agent)?;
@@ -252,11 +254,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         // Best-effort GC of long-disconnected agent records; never let a GC
         // failure fail the whole load_context call.
         let _ = crate::storage::agents::gc_agents(handoff);
-        result["agent_id"] = serde_json::json!(agent.agent_id);
-        result["claimed_tasks"] = serde_json::json!(agent.claimed_tasks);
+        registered_agent_id = Some(agent.agent_id);
         claimed_tasks = agent.claimed_tasks;
-    } else {
-        result["claimed_tasks"] = serde_json::json!([]);
     }
 
     // Accumulate every independent warning condition and join them, so one
@@ -318,6 +317,46 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             warnings.push(warning.into());
         }
     }
+    let previous_related: &[String] = previous_closed_session
+        .map(|prev| prev.related_task_ids.as_slice())
+        .unwrap_or_default();
+
+    let (task_tree_json, task_tree_meta) = match task_tree_mode {
+        TaskTreeMode::Full => (
+            serde_json::to_value(&task_tree).context("serialize task_tree")?,
+            task_scope::full_meta(&task_tree),
+        ),
+        TaskTreeMode::Compact => {
+            let branch_ids = lineage::git_named_task_ids(project_dir);
+            let current_milestone = task_scope::current_milestone(&config.milestones, &task_tree);
+            let view = task_scope::compact_view(
+                &task_tree,
+                &task_summary,
+                &task_scope::ScopeRequest {
+                    explicit_scope: &explicit_scope,
+                    previous_related,
+                    branch_ids: &branch_ids,
+                    current_milestone: current_milestone.as_deref(),
+                    limit: config.settings.compact_task_limit as usize,
+                },
+            )?;
+            for id in &view.unknown_scope {
+                warnings.push(format!("task_scope id '{id}' is not a task of this project").into());
+            }
+            (Value::Array(view.tree), view.meta)
+        }
+    };
+
+    let mut result = serde_json::json!({
+        "project": config.project.name,
+        "task_tree": task_tree_json,
+        "task_tree_meta": task_tree_meta,
+        "task_summary": task_summary,
+    });
+    if let Some(id) = registered_agent_id {
+        result["agent_id"] = serde_json::json!(id);
+    }
+    result["claimed_tasks"] = serde_json::json!(claimed_tasks);
 
     if !warnings.is_empty() {
         result["warnings"] = serde_json::to_value(&warnings).context("serialize warnings")?;
@@ -542,8 +581,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     }
                 }
             }
-            if let Some(task_ids) = collect_active_task_ids(&task_tree) {
+            let (task_ids, truncated) =
+                task_scope::related_task_ids(&task_tree, previous_related, &claimed_tasks);
+            if !task_ids.is_empty() {
                 suggested["related_task_ids"] = serde_json::json!(task_ids);
+                if truncated {
+                    suggested["related_task_ids_truncated"] = serde_json::json!(true);
+                }
             }
             guidance["suggested_fields"] = suggested;
         }
@@ -1128,25 +1172,47 @@ fn session_summary_json(s: &crate::storage::sessions::SessionData) -> Value {
     obj
 }
 
-fn collect_active_task_ids(task_tree: &[TaskIndex]) -> Option<Vec<String>> {
-    let mut ids = Vec::new();
-    collect_active_ids_recursive(task_tree, &mut ids);
-    if ids.is_empty() {
-        None
-    } else {
-        Some(ids)
+/// The two shapes of the `task_tree` the response carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskTreeMode {
+    /// The tasks that belong to this session (the default).
+    Compact,
+    /// Every task, as before v0.47.3.
+    Full,
+}
+
+/// Values `task_tree` accepts, in the error message when it gets another.
+const TASK_TREE_MODES: &str = "\"compact\", \"full\"";
+
+fn task_tree_mode(arguments: &Value) -> Result<TaskTreeMode> {
+    match arguments.get("task_tree") {
+        None | Some(Value::Null) => Ok(TaskTreeMode::Compact),
+        Some(Value::String(mode)) if mode == "compact" => Ok(TaskTreeMode::Compact),
+        Some(Value::String(mode)) if mode == "full" => Ok(TaskTreeMode::Full),
+        Some(other) => anyhow::bail!("task_tree must be one of {TASK_TREE_MODES}, got {other}"),
     }
 }
 
-fn collect_active_ids_recursive(tasks: &[TaskIndex], ids: &mut Vec<String>) {
-    for task in tasks {
-        if matches!(
-            task.status.as_str(),
-            "in_progress" | "blocked" | "todo" | "review"
-        ) {
-            ids.push(task.id.clone());
-        }
-        collect_active_ids_recursive(&task.children, ids);
+/// `task_scope`: a list of task ids. A string is taken as a comma-separated
+/// list (`"t75,t78"`, the way a session-loop task selection is written).
+fn task_scope_ids(arguments: &Value) -> Result<Vec<String>> {
+    match arguments.get("task_scope") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(ids)) => Ok(ids
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    anyhow::anyhow!("task_scope must be an array of task id strings")
+                })
+            })
+            .collect(),
+        Some(_) => anyhow::bail!("task_scope must be an array of task id strings"),
     }
 }
 

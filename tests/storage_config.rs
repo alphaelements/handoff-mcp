@@ -46,6 +46,27 @@ fn config_has_correct_defaults() {
 }
 
 #[test]
+fn compact_task_limit_defaults_to_forty_when_the_key_is_absent() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+
+    // A config.toml written before the key existed.
+    fs::write(
+        &path,
+        "[project]\nname = \"old\"\n\n[settings]\ndone_task_limit = 5\n",
+    )
+    .unwrap();
+    assert_eq!(read_config(&path).unwrap().settings.compact_task_limit, 40);
+
+    fs::write(
+        &path,
+        "[project]\nname = \"new\"\n\n[settings]\ncompact_task_limit = 12\n",
+    )
+    .unwrap();
+    assert_eq!(read_config(&path).unwrap().settings.compact_task_limit, 12);
+}
+
+#[test]
 fn config_with_custom_values() {
     let dir = setup();
     let path = dir.path().join("config.toml");

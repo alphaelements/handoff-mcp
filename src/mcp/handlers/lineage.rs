@@ -316,16 +316,30 @@ fn find_closed(
     Ok(pick(&read_sessions_by_status(sessions_dir, "closed")?))
 }
 
-/// Git facts for scoring. Anything git cannot answer stays empty and scores 0.
-fn gather_git_facts(project_dir: &Path) -> GitFacts {
-    let branch = current_branch(project_dir);
+/// Task ids named by `branch` and by the latest [`SUBJECT_DEPTH`] commit
+/// subjects.
+fn task_ids_named(project_dir: &Path, branch: Option<&str>) -> BTreeSet<String> {
     let mut task_ids = BTreeSet::new();
-    if let Some(b) = &branch {
+    if let Some(b) = branch {
         task_ids.extend(extract_task_ids(b));
     }
     for subject in recent_commit_subjects(project_dir, SUBJECT_DEPTH) {
         task_ids.extend(extract_task_ids(&subject));
     }
+    task_ids
+}
+
+/// Task ids the current branch and the latest commits name (`fix/t431-x`,
+/// `feat(t439.6): ...`); empty outside a git repository and on a detached
+/// `HEAD` for the branch part.
+pub fn git_named_task_ids(project_dir: &Path) -> BTreeSet<String> {
+    task_ids_named(project_dir, current_branch(project_dir).as_deref())
+}
+
+/// Git facts for scoring. Anything git cannot answer stays empty and scores 0.
+fn gather_git_facts(project_dir: &Path) -> GitFacts {
+    let branch = current_branch(project_dir);
+    let task_ids = task_ids_named(project_dir, branch.as_deref());
     // `capture_git_state` degrades to placeholders itself and never fails.
     let dirty_paths = capture_git_state(project_dir)
         .map(|g| dirty_paths_from_porcelain(&g.dirty_files))

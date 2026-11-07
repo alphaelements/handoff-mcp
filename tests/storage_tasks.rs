@@ -1534,3 +1534,40 @@ fn validate_dependencies_self_dependency_is_cycle_not_dangling() {
     let err = validate_dependencies(&tasks_dir, "t1", &["t1".to_string()]).unwrap_err();
     assert!(err.to_string().contains("Circular dependency"), "{err}");
 }
+
+#[test]
+fn task_summary_by_status_serializes_in_ascending_key_order_every_time() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    for (i, status) in [
+        "todo",
+        "done",
+        "review",
+        "in_progress",
+        "blocked",
+        "skipped",
+        "todo",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("t{}", i + 1);
+        create_task_dir(
+            &tasks_dir,
+            &format!("{id}-x"),
+            status,
+            &make_task(&id, "Task"),
+        );
+    }
+
+    let (_tree, summary) = build_task_index(&tasks_dir, 100).unwrap();
+    let first = serde_json::to_string(&summary.by_status).unwrap();
+    assert_eq!(
+        first,
+        r#"{"blocked":1,"done":1,"in_progress":1,"review":1,"skipped":1,"todo":2}"#
+    );
+    for _ in 0..10 {
+        let (_tree, again) = build_task_index(&tasks_dir, 100).unwrap();
+        assert_eq!(serde_json::to_string(&again.by_status).unwrap(), first);
+    }
+}

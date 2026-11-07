@@ -42,6 +42,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions can exceed the limit (a warning says by how many).
 - Mixing in a binary older than this version rewrites session files without
   `continues`; those sessions fall back to one chronological lineage.
+- **`handoff_doc_list` can fetch one document and trim its output**: new
+  `doc_id` / `slug` (exact match), `limit` and `fields` (metadata keys to keep;
+  an unknown name is an error that lists the allowed ones). Without them the
+  output is unchanged.
+- **`handoff_list_tasks` can fetch specific tasks and trim its output**: new
+  `ids` (the listed tasks plus their ancestors), `include_descendants` (with
+  `ids`, a listed task keeps its whole subtree, still narrowed by the other
+  filters), `limit` (top-level nodes) and `fields` (an `ids` match always
+  stays visible, even without `children`). Without them the output is
+  unchanged. The `/session-loop` procedure now fetches the tasks you name by
+  `ids` with `include_descendants` instead of listing every todo task, so a
+  named parent task selects its unfinished subtasks.
+- **`handoff_load_context` returns a compact `task_tree` by default**: instead
+  of every task (a project with 300 todos produced a 65 KB task tree), it lists
+  the tasks that belong to the session, each with a `scope_reason`: tasks that
+  are `in_progress`/`blocked`/`review` (`active`) or named by the new
+  `task_scope` argument (`scope`), the previous session's unfinished
+  `related_task_ids` (`previous_session`) and their siblings (`sibling`), tasks
+  whose dependencies are all done (`unblocked`), tasks named by the branch or
+  the latest commit subjects (`branch`), the current milestone's todos
+  (`milestone`) and the highest-priority todos without a milestone
+  (`priority`). Everything else is counted in the new `task_tree_meta`
+  (`omitted_total`, `omitted_by_status`, `truncated`, `hint`).
+  `task_summary` still counts every task. Fetch the rest with
+  `handoff_list_tasks`, or pass `task_tree: "full"` to get the complete tree
+  exactly as before. The new setting `settings.compact_task_limit` (default 40)
+  caps the tasks other than the active ones.
+- **`session_guidance.suggested_fields.related_task_ids` is no longer every
+  todo**: it holds the tasks in flight, the previous session's unfinished tasks
+  and your claimed tasks (at most 20, with `related_task_ids_truncated: true`
+  when more were found).
+- `task_summary.by_status` keys are now in ascending order on every call
+  (the order used to change from run to run).
 
 ## [0.47.2] — 2026-11-01
 

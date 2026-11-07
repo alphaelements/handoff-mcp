@@ -718,6 +718,35 @@ When saving context, the agent can record:
 
 These fields let the agent detect potential issues at session start without requiring a separate audit call.
 
+#### Which tasks `handoff_load_context` lists
+
+`task_tree` is **compact by default**: it holds the tasks that belong to the
+session, not every task of the project (a project with 300 todos would
+otherwise put tens of kilobytes of todos into every session start). Each listed
+task carries a `scope_reason`:
+
+| `scope_reason` | Tasks |
+|---|---|
+| `active` | `in_progress` / `blocked` / `review` (always all of them) |
+| `scope` | The subtrees named in the `task_scope` argument (always all of them) |
+| `previous_session` | Unfinished tasks in the previous session's `related_task_ids` (at most 20) |
+| `sibling` | Unfinished siblings of those (at most 10 per parent, by `order`) |
+| `unblocked` | `todo` tasks whose dependencies are all done (at most 10) |
+| `branch` | Tasks named by the branch name or the latest 5 commit subjects (`fix/t431-x`, `t419-t424`) |
+| `milestone` | `todo` tasks of the current milestone (the `active` milestone with the lowest `order`, else the one the `in_progress` tasks belong to) |
+| `priority` | `todo` tasks without a milestone, by priority, then newest id |
+
+Everything except `active` and `scope` shares one budget,
+`[settings] compact_task_limit` (default 40). Ancestors of listed tasks are kept
+so the tree stays connected (they have no `scope_reason`). `task_tree_meta`
+reports what was left out (`omitted_total`, `omitted_by_status`,
+`omitted_without_milestone`, `truncated`) and how to get it; `task_summary`
+always counts every task. To fetch other tasks use `handoff_list_tasks`; to get
+the complete tree exactly as before v0.47.3 pass `task_tree: "full"`
+(`handoff-mcp session load --task-tree full`). `session_guidance.suggested_fields.related_task_ids`
+lists only work in flight, the previous session's unfinished tasks and your
+claimed tasks (at most 20).
+
 ### Dashboard
 
 `handoff_dashboard` scans directories for projects with `.handoff/` and shows a summary:
@@ -745,6 +774,7 @@ description = "Project description"
 # session_prune_limit = 100   # Opt-in: keep at most N closed sessions (default: keep all; heads are never pruned).
                               # The old `history_limit` is deprecated and ignored since v0.47.3.
 done_task_limit = 10          # Max completed tasks to show
+compact_task_limit = 40       # Tasks (besides active ones) in handoff_load_context's compact task_tree
 auto_git_summary = true       # Capture git state automatically
 require_estimate_hours = true # Require estimate_hours on leaf tasks (default true)
 multi_session = true          # Allow multiple active sessions (default true for new projects)

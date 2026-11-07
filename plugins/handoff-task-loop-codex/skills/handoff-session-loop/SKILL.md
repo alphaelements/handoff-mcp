@@ -47,7 +47,12 @@ Handoff state changes.
    active session, immediately call `handoff_save_context` with
    `session_status: "active"`, inherited context, a concrete next action, and
    a checklist item.
-2. Call `handoff_list_tasks`. Select only tasks that are `todo`, have no
+2. Fetch the candidate tasks. When the user named task ids (for example
+   `t75,t78`), call `handoff_list_tasks` with `ids: ["t75","t78"]` and
+   `include_descendants: true` and do not fetch every `todo` task; a named
+   parent stands for its unfinished subtasks, which the response nests under
+   it. Only when no ids were named, call it with
+   `status_filter: "todo"`. Select only tasks that are `todo`, have no
    unfinished dependencies, and have a clear, independently writable file
    scope. Inspect each candidate with `handoff_get_task` before choosing it.
 3. If scope, acceptance criteria, required tooling, or file ownership is
@@ -100,7 +105,8 @@ Only the Manager may transition a task to `done`:
 
 ## End or resume the loop
 
-At the end of a batch, call `handoff_list_tasks` again. Save session context
+At the end of a batch, call `handoff_list_tasks` again (with the same `ids` and
+`include_descendants` when the user named task ids). Save session context
 with `handoff_save_context`: a one-sentence summary, decisions, blockers,
 context pointers, and 2–3 concrete next actions. Keep the session active only
 when the loop is continuing in the same conversation; otherwise close it.

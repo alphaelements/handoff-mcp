@@ -125,10 +125,19 @@ handoff_load_context
 ### 1. Fetch tasks and split into sessions
 
 ```
+# Tasks were specified (`/session-loop t75,t78`, or a closed range `t5-t9` expanded to
+# t5,t6,...,t9): fetch exactly those. Do NOT fetch all todo tasks.
+handoff_list_tasks(ids=["t75","t78"], include_descendants=true)
+
+# No task selector (or an open-ended `t5-`): the only case that needs every todo task
 handoff_list_tasks(status_filter="todo")
 ```
 
-- Fetch all todo tasks
+- With a task selector, fetch only the specified tasks by `ids` with
+  `include_descendants=true` (unknown ids are simply absent). A named parent stands for
+  its unfinished subtasks: the response nests each matched task's whole subtree, so the
+  subtask ids (e.g. `t75.1`) and their statuses are visible without a full todo fetch
+- Without a task selector, fetch all todo tasks
 - Analyze dependencies, priorities, and complexity
 - **1 session = 1-5 tasks** (adjust based on scale)
   - Group tasks in the same functional area (avoid file conflicts between developers)
@@ -667,7 +676,9 @@ handoff_save_context(
 ## Task selector (argument parsing)
 
 Users can scope the loop via arguments to `/session-loop`.
-The manager parses these and filters `handoff_list_tasks` results accordingly.
+The manager parses these and fetches the matching tasks with `handoff_list_tasks`
+(`ids=[...], include_descendants=true` when task ids are specified; `status_filter="todo"`
+only when they are not).
 
 | Format | Meaning | Example |
 |---|---|---|
@@ -677,7 +688,9 @@ The manager parses these and filters `handoff_list_tasks` results accordingly.
 | `goal: <cond>` | Natural language stop condition | `/session-loop goal: ...` |
 | (no args) | All todo tasks | `/session-loop` |
 
-- Tasks with non-`todo` status are skipped (reported to user).
+- Tasks with non-`todo` status are skipped (reported to user). A named parent that is
+  not `todo` (for example `in_progress`) is not skipped as a whole: its `todo` subtasks
+  are the work to run, and the parent itself is only reported.
 - Open-ended ranges (`t5-`) include all todo tasks with IDs >= t5.
 - Mixed formats (`t1,t3-t5`) are supported.
 
@@ -686,7 +699,14 @@ The manager parses these and filters `handoff_list_tasks` results accordingly.
 With task selector: Stop when all specified tasks are done.
 Without args (default): **Stop when zero todo tasks remain in handoff.**
 
-Each iteration checks `handoff_list_tasks(status_filter="todo")`.
+Each iteration checks the target tasks:
+- With a task selector naming ids:
+  `handoff_list_tasks(ids=[<the specified ids>], include_descendants=true)` and look for any
+  task or subtask that is still `todo` (never fetch all todo tasks for this check). A named
+  parent that is not `todo` (for example `in_progress`) does not keep the loop running by
+  itself: once none of its subtasks is `todo`, report the parent so the user can close it.
+- Without a task selector (or an open-ended `t5-`): `handoff_list_tasks(status_filter="todo")`.
+
 If target tasks remain, continue. If zero, run completion procedure.
 
 ## Completion (when goal is met)

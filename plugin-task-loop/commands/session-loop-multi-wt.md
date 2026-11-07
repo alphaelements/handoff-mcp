@@ -23,10 +23,15 @@ handoff_get_config
 ```
 
 Read `worktree.session_loop.auto_assign`. If it is absent or `false`, skip
-Steps 1b/1c/1d and continue at Step 2 with the todo tasks fetched in Step 1.
+Steps 1b/1c/1d and continue at Step 2 with the tasks fetched in Step 1 (the
+`ids`-selected tasks, with the subtasks of each named parent, when the user named task
+ids, otherwise the todo tasks).
 Only proceed with the rest of this step when it is explicitly `true`.
 
-**Grouping logic** (applied to the todo tasks fetched in Step 1):
+**Grouping logic** (applied to the tasks fetched in Step 1 — fetched by `ids` when the
+user named task ids as `handoff_list_tasks(ids=[...], include_descendants=true)`, never
+by listing every todo task in that case; a named parent stands for its unfinished
+subtasks):
 
 1. **Dependency chains**: tasks connected by `dependencies` belong to the same
    group — a WT boundary must never split a dependency edge.

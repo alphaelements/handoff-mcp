@@ -744,6 +744,11 @@ const ARRAY_FIELDS: &[&str] = &[
     "depends_on",
     // `doc export --doc-ids a` (no comma) must still be a one-element array.
     "doc_ids",
+    // `session load --task-scope t75` (no comma) must still be a one-element
+    // array: `load_context` reads `task_scope` as a list of task ids.
+    "task_scope",
+    // `task list --ids t75` (no comma) must still be a one-element array.
+    "ids",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
@@ -1045,6 +1050,27 @@ mod tests {
     }
 
     #[test]
+    fn list_narrowing_flags_map_to_the_tool_arguments() {
+        let flags = parse_flags(
+            &strs(&["--ids", "t75", "--limit", "3", "--fields", "id,status"]),
+            "handoff_list_tasks",
+        )
+        .unwrap();
+        assert_eq!(flags["ids"], json!(["t75"]));
+        assert_eq!(flags["limit"], json!(3));
+        assert_eq!(flags["fields"], json!(["id", "status"]));
+        let flags = parse_flags(&strs(&["--ids", "t75,t78"]), "handoff_list_tasks").unwrap();
+        assert_eq!(flags["ids"], json!(["t75", "t78"]));
+        let flags = parse_flags(
+            &strs(&["--slug", "my-doc", "--limit", "3"]),
+            "handoff_doc_list",
+        )
+        .unwrap();
+        assert_eq!(flags["slug"], json!("my-doc"));
+        assert_eq!(flags["limit"], json!(3));
+    }
+
+    #[test]
     fn doc_export_flags_map_to_the_tool_arguments() {
         assert_eq!(
             resolve_tool_name("doc", "export").unwrap(),
@@ -1068,6 +1094,21 @@ mod tests {
         assert_eq!(flags["include_toc"], json!(false));
         assert_eq!(flags["output_dir"], "out");
         assert_eq!(flags["template"], "spec");
+    }
+
+    #[test]
+    fn session_load_task_scope_and_task_tree_flags_map_to_the_tool_arguments() {
+        let flags = parse_flags(
+            &strs(&["--task-scope", "t75", "--task-tree", "full"]),
+            "handoff_load_context",
+        )
+        .unwrap();
+        assert_eq!(flags["task_scope"], json!(["t75"]));
+        assert_eq!(flags["task_tree"], "full");
+
+        let flags =
+            parse_flags(&strs(&["--task-scope", "t75,t78"]), "handoff_load_context").unwrap();
+        assert_eq!(flags["task_scope"], json!(["t75", "t78"]));
     }
 
     #[test]

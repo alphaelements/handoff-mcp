@@ -31,7 +31,11 @@ Load the project's handoff context at session start and get oriented on the curr
    - This keeps "what we were trying to do" in `.handoff/` even if the session is interrupted
 5. Review and summarize the returned context in this order:
    - **Previous session / previous_session**: summary, branch, commit, ended_at. Check the handed-over information (decisions, handoff_notes, context_pointers)
-   - **Tasks**: show in priority order `blocked` → `in_progress` → `todo`
+   - **Tasks**: `task_tree` is **compact by default**: it lists only the tasks that belong to this session, and each one has a `scope_reason` explaining why (`active` = in_progress/blocked/review, `scope`, `previous_session`, `sibling`, `unblocked`, `branch`, `milestone`, `priority`). A node without `scope_reason` is only an ancestor kept so the tree stays connected. Show them in priority order `blocked` → `in_progress`/`review` → `todo`
+     - `task_tree_meta` says what was left out (`omitted_total`, `omitted_by_status`, `omitted_without_milestone`, `truncated`) and `hint` says how to get it. `task_summary` always counts **every** task, so use it (not the length of `task_tree`) for totals
+     - You never need to page through the omitted todos at session start. When you do need other tasks, call `handoff_list_tasks` (`status_filter`, `ids`, `limit`, `fields`); call `handoff_load_context(task_tree: "full")` only when you really need the whole tree
+     - When the session works on specific tasks, pass them: `handoff_load_context(task_scope: ["t75", "t78"])` includes those tasks and their unfinished subtrees (`scope_reason: "scope"`) regardless of the limit. The number of other tasks is capped by `settings.compact_task_limit` (default 40)
+     - `session_guidance.suggested_fields.related_task_ids` lists only work in flight, the previous session's unfinished tasks and your claimed tasks (at most 20; `related_task_ids_truncated: true` when more were found)
    - **Effort summary**: report total_estimate_hours, total_actual_hours, completion_rate, overdue_count
    - **Overdue**: if overdue_count > 0, highlight the affected tasks
    - **Blockers**: highlight them if any
