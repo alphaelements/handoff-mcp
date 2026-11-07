@@ -10,7 +10,8 @@ Rules that apply to every diagram:
   `sequenceDiagram`); no text before it, no frontmatter.
 - Node ids are ASCII (`GW`, `S_LOGIN`); human text goes into the label. Never use `end` as an id.
 - Quote every label that contains spaces, punctuation or non-ASCII: `GW["ゲートウェイ (MQTT)"]`.
-  Japanese labels work as is; the PDF pipeline switches `htmlLabels` off itself, so do not put
+  Non-ASCII (e.g. Japanese) labels work as is - the flowchart template below keeps bilingual
+  labels on purpose to demonstrate it; the PDF pipeline switches `htmlLabels` off itself, so do not put
   `%%{init}%%` directives or HTML (`<br/>`) in the diagram.
 - Keep one diagram under about 15 nodes. Split by subsystem instead of cramming; a second diagram
   per subsystem is better than an unreadable first one.
@@ -64,20 +65,20 @@ C4 elements render inconsistently across mmdc versions.
 C4Context
   title システムコンテキスト / System context
 
-  Person(user, "利用者", "測定結果を確認する")
-  Person(admin, "管理者", "デバイスを登録する")
+  Person(user, "User", "Checks measurement results")
+  Person(admin, "Administrator", "Registers devices")
 
-  System_Boundary(b1, "対象システム") {
-    System(core, "モニタリング基盤", "測定値の収集・保存・表示")
+  System_Boundary(b1, "System under design") {
+    System(core, "Monitoring platform", "Collects, stores and displays measurements")
   }
 
-  System_Ext(push, "通知サービス", "プッシュ通知の配信")
-  System_Ext(idp, "認証基盤", "ログイン")
+  System_Ext(push, "Notification service", "Delivers push notifications")
+  System_Ext(idp, "Identity provider", "Sign-in")
 
-  Rel(user, core, "閲覧する", "HTTPS")
-  Rel(admin, core, "登録する", "HTTPS")
-  Rel(core, push, "通知を依頼する", "HTTPS/JSON")
-  Rel(core, idp, "認証を委譲する", "OIDC")
+  Rel(user, core, "Views", "HTTPS")
+  Rel(admin, core, "Registers", "HTTPS")
+  Rel(core, push, "Requests notifications", "HTTPS/JSON")
+  Rel(core, idp, "Delegates authentication", "OIDC")
 ```
 
 ## Phase 2 - stateDiagram-v2 (screen transitions)
@@ -90,23 +91,23 @@ and empty states the mocks show. Use a `note` for a guard condition that does no
 stateDiagram-v2
   [*] --> S_LOGIN
 
-  state "ログイン画面 (S_LOGIN)" as S_LOGIN
-  state "ホーム画面 (S_HOME)" as S_HOME
-  state "測定詳細画面 (S_DETAIL)" as S_DETAIL
-  state "設定画面 (S_SETTINGS)" as S_SETTINGS
-  state "エラー画面 (S_ERROR)" as S_ERROR
+  state "Login screen (S_LOGIN)" as S_LOGIN
+  state "Home screen (S_HOME)" as S_HOME
+  state "Measurement detail screen (S_DETAIL)" as S_DETAIL
+  state "Settings screen (S_SETTINGS)" as S_SETTINGS
+  state "Error screen (S_ERROR)" as S_ERROR
 
-  S_LOGIN --> S_HOME: ログイン成功
-  S_LOGIN --> S_ERROR: 認証失敗
-  S_ERROR --> S_LOGIN: 再試行ボタン
-  S_HOME --> S_DETAIL: 測定カードをタップ
-  S_DETAIL --> S_HOME: 戻る
-  S_HOME --> S_SETTINGS: 歯車アイコン
-  S_SETTINGS --> S_HOME: 保存して戻る
-  S_HOME --> [*]: ログアウト
+  S_LOGIN --> S_HOME: Sign-in succeeded
+  S_LOGIN --> S_ERROR: Authentication failed
+  S_ERROR --> S_LOGIN: Retry button
+  S_HOME --> S_DETAIL: Tap a measurement card
+  S_DETAIL --> S_HOME: Back
+  S_HOME --> S_SETTINGS: Gear icon
+  S_SETTINGS --> S_HOME: Save and return
+  S_HOME --> [*]: Sign out
 
   note right of S_ERROR
-    3回連続で失敗するとロックされる
+    Locked after 3 consecutive failures
   end note
 ```
 
@@ -118,21 +119,21 @@ scenarios.
 
 ```mermaid
 sequenceDiagram
-  actor U as 利用者
-  participant UI as モバイルアプリ
-  participant SVC as 集計サービス
-  participant DB as 時系列DB
+  actor U as User
+  participant UI as Mobile app
+  participant SVC as Aggregation service
+  participant DB as Time-series DB
 
-  U->>UI: 期間を選んで開く
-  UI->>SVC: 集計を要求 (期間)
-  SVC->>DB: 測定値を取得
-  DB-->>SVC: 測定値
-  alt データあり
-    SVC-->>UI: 集計結果
-    UI-->>U: グラフを表示
-  else データなし
-    SVC-->>UI: 空の結果
-    UI-->>U: 「データがありません」を表示
+  U->>UI: Pick a period and open it
+  UI->>SVC: Request aggregation (period)
+  SVC->>DB: Fetch readings
+  DB-->>SVC: Readings
+  alt Data available
+    SVC-->>UI: Aggregated result
+    UI-->>U: Show the chart
+  else No data
+    SVC-->>UI: Empty result
+    UI-->>U: Show "No data available"
   end
 ```
 

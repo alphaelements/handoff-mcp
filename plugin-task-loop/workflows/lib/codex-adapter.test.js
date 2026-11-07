@@ -88,7 +88,7 @@ test('happy path: the NDJSON log on disk matches what was parsed', async () => {
 
 // ============================================================
 // Completion is decided by turn.completed, NOT process exit alone
-// (spec doc: "run_in_background の completed 通知だけに頼らない")
+// (spec doc: "do not rely solely on the run_in_background completed notification")
 // ============================================================
 test('a clean exit (code 0) with no turn.completed is an error, not a silent pass', async () => {
   const dir = tmpDir();

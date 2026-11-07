@@ -191,7 +191,7 @@ Do not propose Phase 2 while required topics are uncovered, unless the user asks
 state which topics are missing and the risk (research built on an incomplete brief), and let them
 choose.
 
-### Delegate mode (一任モード)
+### Delegate mode
 
 Triggered when the user says they want you to handle it ("任せる", "あとは AI が調べて", "you decide",
 "just research it"), at the start or at the Phase 1 gate.

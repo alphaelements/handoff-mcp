@@ -184,6 +184,8 @@ coverage and state (lint `layer_outside_profile`, info).
 | `system_test` | システムテスト | right | 2 | `basic_spec` | `ST` |
 | `unit_test` | ユニットテスト | right | 3 | `detailed_spec` | `UT` |
 
+The display names are the Japanese built-in labels (English: Requirements, Basic spec,
+Detailed spec, Acceptance verification, System test, Unit test).
 The built-ins cannot be redefined or removed. To use fewer of them, choose a
 profile or set `layers`.
 
@@ -211,7 +213,7 @@ An **origin layer** has no verification pair. Declare it with
 use `level = 0` (above `requirement`), and may reuse a prefix another layer
 already owns (the document's `layer`, not the prefix, decides an item's layer).
 Its items get no horizontal coverage (reported as `na`) and no implicit
-acceptance items. The brainstorm report layer is one:
+acceptance items. The brainstorm report layer is one (its Japanese display name means "Brainstorming"):
 
 ```toml
 [[trace.layer]]

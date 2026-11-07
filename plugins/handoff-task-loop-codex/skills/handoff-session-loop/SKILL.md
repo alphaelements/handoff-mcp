@@ -37,7 +37,13 @@ Handoff state changes.
 
 ## Start and select work
 
-1. Call `handoff_load_context` for the current project. If it asks for an
+1. Call `handoff_load_context` for the current project. The lineage is decided
+   automatically: use `previous_session.inferred: true` as is. Only when the
+   response says `ambiguous: true` (no `previous_session`; candidates in
+   `other_heads`), match each candidate's `summary` against the user's request
+   and call `handoff_load_context` again with `continue_from: "<id>"`; ask the
+   user if you cannot decide. `/clear` does not close the handoff session, so
+   close it with `handoff_save_context` before `/clear`. If it asks for an
    active session, immediately call `handoff_save_context` with
    `session_status: "active"`, inherited context, a concrete next action, and
    a checklist item.

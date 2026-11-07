@@ -19,8 +19,8 @@
 // "Wiring" note in the developer report / README.
 //
 // Design basis (t216 instructions: read, do not re-investigate):
-//   - .handoff/docs/_doc.codex-manager-delegation-spec-revised.md (方式A技術仕様)
-//   - .handoff/docs/_doc.codex-manager-delegation-poc-results.md (実測)
+//   - .handoff/docs/_doc.codex-manager-delegation-spec-revised.md (approach A technical spec)
+//   - .handoff/docs/_doc.codex-manager-delegation-poc-results.md (measured results)
 //   - .handoff/docs/_doc.codex-manager-delegation-impl-plan-revised.md (Step 1)
 //
 // Interface shape mirrors the Workflow runtime's own convention: `agent()`
@@ -42,8 +42,8 @@ import { randomUUID } from 'node:crypto';
 
 /**
  * Default silence timeout (ms) between NDJSON events before the adapter treats
- * the process as hung and kills it. The spec doc's "ハング検知の閾値" section
- * gives an approximate range (単純作業: 2〜3分, 複雑な作業: 10分程度) rather
+ * the process as hung and kills it. The spec doc's "hang-detection threshold" section
+ * gives an approximate range (simple work: 2-3 minutes, complex work: about 10 minutes) rather
  * than a single number; the adapter defaults to the conservative end of the
  * simple-task range and lets a caller override it per role/task complexity via
  * `options.hangTimeoutMs`.
@@ -52,7 +52,7 @@ const DEFAULT_HANG_TIMEOUT_MS = 3 * 60 * 1000;
 
 /**
  * NDJSON `item.completed` sub-types worth surfacing in the returned text, per
- * the spec doc's "購読すべきNDJSONイベント種別" list. `agent_message` carries
+ * the spec doc's "NDJSON event types to subscribe to" list. `agent_message` carries
  * the model's own final-answer prose; the others are progress noise the
  * caller does not need once turn.completed has fired.
  *
@@ -96,7 +96,7 @@ function extractAgentMessage(events) {
 
 /**
  * Does this event signal a Codex-side error? Matches the spec doc's
- * "`error`系イベント" bullet — the exact type name is not pinned in the docs
+ * "`error`-family events" bullet — the exact type name is not pinned in the docs
  * (no error was observed in the PoC runs), so this matches defensively on
  * both a literal `type: "error"` and any type ending in `.error` /
  * `.failed` /`.aborted`, which is the shape Codex uses elsewhere
@@ -118,7 +118,7 @@ function describeErrorEvent(evt) {
 /**
  * Error subclass so callers can `err.code === 'CODEX_HANG'` /
  * `'CODEX_ERROR_EVENT'` / `'CODEX_EXIT_NONZERO'` instead of parsing message
- * text. See "エラーハンドリング方針" in the module doc comment at the bottom
+ * text. See "error handling policy" in the module doc comment at the bottom
  * of this file for what each code means and what the caller should do.
  */
 export class CodexAdapterError extends Error {

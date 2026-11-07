@@ -411,7 +411,7 @@ function resolveResponseLanguage(value, taskList) {
     const normalized = value.trim();
     // A free-form phrase is not a language label and becomes prompt content
     // when interpolated below. Accept either a single Unicode word (English,
-    // Français, 日本語) or the safe, commonly used BCP-47 subset
+    // Français, Deutsch) or the safe, commonly used BCP-47 subset
     // language[-Script][-REGION] (ja, en-US, zh-Hant-TW). This deliberately
     // excludes sentence punctuation, whitespace, and arbitrary variant text.
     const isLanguageName = /^[\p{L}\p{M}]+$/u.test(normalized);

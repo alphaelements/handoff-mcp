@@ -48,11 +48,11 @@ documents** (check `handoff_doc_query`/project memory for an existing
 `config.toml` `[trace]` section or layer documents, or ask the coordinator):
 save with `handoff_doc_save(layer=..., trace_profile?=...)` instead of a
 plain document, and write the body in that layer's notation (heading = ID
-with the project's configured prefix, attribute block, 受入基準 block where
+with the project's configured prefix, attribute block, `Acceptance criteria:` block where
 applicable) — see the `handoff-requirements` skill for the notation and
 starter templates, and use whichever profile the project has configured as
 its default (or the one the coordinator's brief names) to decide the ID
-prefix and whether an inline 受入基準 block is enough or a paired
+prefix and whether an inline `Acceptance criteria:` block is enough or a paired
 verification-layer document is also needed. This makes the drafted
 specification a real, lintable layer document from the moment it's saved,
 instead of prose that has to be manually transcribed into one later.

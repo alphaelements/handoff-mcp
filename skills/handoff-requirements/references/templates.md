@@ -51,8 +51,8 @@ Non-functional requirements use the same shape with an `NFR-` prefix:
 
 ## Use-Case Summary (requirement layer)
 
-ユースケースは要件を発見するためのツールであり、V-model の管理対象ではない。
-ユースケースから導出した要件は通常の FR-/NFR- として起票する。
+A use case is a tool for discovering requirements; it is not managed by the V-model.
+Requirements derived from a use case are filed as ordinary FR-/NFR- items.
 
 Keep the use case in a plain document (`handoff_doc_save` **without** `layer`)
 or in the task notes — never in a layer document. A `### UC-001` heading inside
@@ -61,26 +61,26 @@ a layer document is an ID-like heading the parser may ignore with a warning
 verified by the engine.
 
 ```markdown
-### UC-001 ユースケースタイトル
-- actor: アクター名
-- trigger: トリガイベント
-- precondition: 事前条件
+### UC-001 Use case title
+- actor: actor name
+- trigger: trigger event
+- precondition: precondition
 
-**メインフロー:**
-1. アクターが ...
-2. システムが ...
+**Main flow:**
+1. The actor ...
+2. The system ...
 
-**代替フロー:**
-- A1: 条件が ... の場合、...
+**Alternative flow:**
+- A1: If the condition is ..., then ...
 
-**例外フロー:**
-- E1: エラーが ... の場合、...
+**Exception flow:**
+- E1: If the error is ..., then ...
 
-**事後条件:** システムの状態が ...
+**Postcondition:** The system state is ...
 
-各ステップから機能要件を導出:
-- ステップ 1 → FR-001: ...
-- ステップ 2 → FR-002: ...
+Derive functional requirements from each step:
+- Step 1 → FR-001: ...
+- Step 2 → FR-002: ...
 ```
 
 Then write each derived `FR-` / `NFR-` with the **Requirement** template above.

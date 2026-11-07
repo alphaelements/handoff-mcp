@@ -2,7 +2,7 @@
 // baseline-fixture — 64-run reference data for session-loop KPI comparison
 // ============================================================
 //
-// Source: design doc "Claude Code session-loop 高速化 — ログ実測・対策設計"
+// Source: design doc "Claude Code session-loop speed-up: measured log analysis and countermeasure design"
 // Section 3.1, referral cutoff 2026-08-04T15:25:31.061Z.
 //
 // These are AGGREGATE statistics derived from 64 completed session-execute
