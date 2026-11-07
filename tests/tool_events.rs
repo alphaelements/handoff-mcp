@@ -345,6 +345,9 @@ fn save_context_records_session_created_event() {
 /// `session.closed` event.
 #[test]
 fn save_context_records_session_closed_event() {
+    // Pinned: an active session is only closed by its owner, so the identity
+    // must not change between the two saves.
+    let _agent = PinnedAgent::new("agent-closed-event");
     let dir = setup();
     let project_dir = init(&dir);
 
@@ -518,10 +521,9 @@ fn save_context_closing_active_session_emits_no_second_created() {
         "handoff_save_context",
         json!({ "project_dir": project_dir, "session_status": "active", "summary": "start" }),
     );
-    // Close from a *different* caller identity: with the same pinned id an
-    // owner overwrite on the close path would be invisible (DS-V0473-207 AC3).
-    // t439.5 (no closing another agent's session) will revisit this scenario.
-    handoff_mcp::mcp::router::set_agent_id("agent-close-other-caller".to_string());
+    // Another caller's close never reaches this session (it is refused and
+    // saved as that caller's own session; see `session_ownership_e2e`), so this
+    // closes it as its owner.
     let closed = call(
         "handoff_save_context",
         json!({ "project_dir": project_dir, "summary": "end" }),

@@ -5,23 +5,31 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use super::save_context::append_session_event;
+use super::save_context::{
+    ambiguous_message, append_session_event, append_session_event_with_detail, entry_for,
+};
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::agents::{
     generate_agent_id, read_agent, write_agent, AgentRecord, AgentStatus,
 };
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
+use crate::storage::session_target::{
+    activatable_open, adoptable, effective_owner, resolve_session_target, updated_at, Caller,
+    Relation, Resolution, TargetOp, EVENT_ADOPTED,
+};
 use crate::storage::sessions::{
-    activate_open_sessions, activate_session_by_id, read_active_sessions,
-    read_latest_closed_session, read_open_sessions, read_paused_sessions,
-    resume_paused_session_by_id, SessionData,
+    adopt_session, read_latest_closed_session, read_session_entries, transition_session_file,
+    OwnerStamp, SessionData, SessionEntry,
 };
 use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
 /// `.handoff/` child projects.
 const MAX_CHILD_SCAN_DEPTH: usize = 5;
+
+/// Cap on `adoptable_sessions` / `session_guidance.candidates`, newest first.
+const ADOPTABLE_MAX: usize = 20;
 
 /// Directory names skipped while scanning for child projects.
 const DEFAULT_SCAN_EXCLUDES: &[&str] = &["node_modules", ".git", "target", "dist", ".next"];
@@ -76,93 +84,172 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     };
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
-
-    let active_sessions = read_active_sessions(&sessions_dir)?;
-    let sessions = read_open_sessions(&sessions_dir)?;
-    let paused_sessions = read_paused_sessions(&sessions_dir)?;
+    let adopt = arguments
+        .get("adopt")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let multi_session = config.settings.multi_session;
 
     // The process's identity was fixed once at startup (see `main.rs`). Only a
     // caller that never went through the server's startup (in-process tests)
     // reaches the fallback, which resolves it now; it is stored below so every
-    // later call in the same process reuses it.
-    let agent_id = ctx.agent_id.clone().unwrap_or_else(generate_agent_id);
+    // later call in the same process reuses it. The CLI is a one-shot process
+    // with no stable identity: it neither registers an agent nor owns anything.
+    let agent_id: Option<String> = ctx.agent_id.clone().or_else(|| {
+        if crate::mcp::router::is_cli_process() {
+            None
+        } else {
+            Some(crate::mcp::router::claim_agent_id(generate_agent_id()))
+        }
+    });
+    let worktree = project_dir.to_string_lossy().to_string();
+    let caller = Caller {
+        agent_id: agent_id.as_deref(),
+        worktree: &worktree,
+    };
     let record_transition = |event: &str, session: Option<&SessionData>| {
         if let Some(id) = session.and_then(|s| s.id.as_deref()) {
-            append_session_event(handoff, event, Some(id), Some(&agent_id));
+            append_session_event(handoff, event, Some(id), agent_id.as_deref());
         }
     };
 
-    let selected_session = if let Some(sid) = target_session_id {
-        let already_active = active_sessions
-            .iter()
-            .any(|s| s.id.as_deref().is_some_and(|id| id == sid));
-        if already_active {
-            active_sessions
-                .into_iter()
-                .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
-        } else if !multi_session && !active_sessions.is_empty() {
-            let active_ids: Vec<String> = active_sessions
-                .iter()
-                .filter_map(|s| s.id.clone())
-                .collect();
-            anyhow::bail!(
-                "Cannot activate session '{sid}': another session is already active ({}).\n\
-                 Use save_context with close_session_id or pause_session_id to \
-                 close/pause the active session first, or enable multi_session in config.",
-                active_ids.join(", ")
-            );
-        } else if activate_session_by_id(&sessions_dir, sid)?.is_some() {
-            let activated = sessions
-                .into_iter()
-                .find(|s| s.id.as_deref().is_some_and(|id| id == sid));
-            record_transition("session.activated", activated.as_ref());
-            activated
-        } else if resume_paused_session_by_id(&sessions_dir, sid)?.is_some() {
-            let resumed = paused_sessions
-                .into_iter()
-                .find(|s| s.id.as_deref().is_some_and(|id| id == sid));
-            record_transition("session.resumed", resumed.as_ref());
-            resumed
-        } else {
-            None
+    let entries = read_session_entries(&sessions_dir)?;
+    let mut ownership_warnings: Vec<Warning> = Vec::new();
+
+    // Which session this call works with. Every choice goes through
+    // `resolve_session_target`; a session owned by someone else is only taken
+    // over by an explicit id (plus `adopt:true` while it is still active).
+    let selected_session: Option<SessionData> = if let Some(sid) = target_session_id {
+        match resolve_session_target(&entries, &caller, Some(sid), TargetOp::Select, false) {
+            Resolution::Target(t) => {
+                let entry = entry_for(&entries, &t.id)
+                    .ok_or_else(|| anyhow::anyhow!("Session '{}' disappeared", t.id))?;
+                // Someone else's session, taken over by a caller that has an
+                // identity to take it over with.
+                let take_over = t
+                    .foreign_owner
+                    .clone()
+                    .filter(|_| caller.agent_id.is_some());
+                if t.status == "active" {
+                    match take_over {
+                        None => Some(entry.data.clone()),
+                        Some(owner) => {
+                            if !adopt {
+                                anyhow::bail!(
+                                    "Session '{}' is active and owned by another agent ({owner}); \
+                                     it may still be in use in another window. Pass adopt:true to \
+                                     take it over (e.g. after a restart or --continue), or create \
+                                     your own session with save_context(session_status='active').",
+                                    t.id
+                                );
+                            }
+                            Some(adopt_into(ctx, &sessions_dir, entry, &caller, "active")?)
+                        }
+                    }
+                } else {
+                    let own_actives = entries
+                        .iter()
+                        .filter(|e| {
+                            e.status == "active"
+                                && caller.in_worktree(&e.data)
+                                && caller.relation(&e.data) != Relation::Foreign
+                        })
+                        .count();
+                    if !multi_session && own_actives > 0 {
+                        let active_ids: Vec<String> = entries
+                            .iter()
+                            .filter(|e| {
+                                e.status == "active"
+                                    && caller.in_worktree(&e.data)
+                                    && caller.relation(&e.data) != Relation::Foreign
+                            })
+                            .filter_map(|e| e.data.id.clone())
+                            .collect();
+                        anyhow::bail!(
+                            "Cannot activate session '{sid}': another session is already active ({}).\n\
+                             Use save_context with close_session_id or pause_session_id to \
+                             close/pause the active session first, or enable multi_session in config.",
+                            active_ids.join(", ")
+                        );
+                    }
+                    let event = if t.status == "open" {
+                        "session.activated"
+                    } else {
+                        "session.resumed"
+                    };
+                    // Foreign or ownerless: the activating caller becomes the owner.
+                    let activated = if caller.agent_id.is_some()
+                        && caller.relation(&entry.data) != Relation::Mine
+                    {
+                        adopt_into(ctx, &sessions_dir, entry, &caller, "active")?
+                    } else {
+                        transition_session_file(&entry.path, "active")?;
+                        entry.data.clone()
+                    };
+                    record_transition(event, Some(&activated));
+                    Some(activated)
+                }
+            }
+            Resolution::Ambiguous { ids } => anyhow::bail!(ambiguous_message(&ids)),
+            _ => None,
         }
-    } else if !active_sessions.is_empty() {
-        active_sessions.into_iter().last()
-    } else if sessions.len() > 1 {
-        let open_ids: Vec<String> = sessions.iter().filter_map(|s| s.id.clone()).collect();
-        anyhow::bail!(
-            "Multiple open sessions found ({}).\n\
-             Specify session_id to choose one, or use save_context to \
-             close/pause the others first.",
-            open_ids.join(", ")
-        );
     } else {
-        activate_open_sessions(&sessions_dir)?;
-        for activated in &sessions {
-            record_transition("session.activated", Some(activated));
+        match resolve_session_target(&entries, &caller, None, TargetOp::Select, false) {
+            Resolution::Target(t) => {
+                ownership_warnings.extend(t.warnings.iter().cloned().map(Warning::from));
+                entry_for(&entries, &t.id).map(|e| e.data.clone())
+            }
+            Resolution::NeedsExplicitId { .. } => None,
+            _ => {
+                let opens = activatable_open(&entries, &caller);
+                if opens.len() > 1 {
+                    let open_ids: Vec<String> =
+                        opens.iter().filter_map(|e| e.data.id.clone()).collect();
+                    anyhow::bail!(
+                        "Multiple open sessions found ({}).\n\
+                         Specify session_id to choose one, or use save_context to \
+                         close/pause the others first.",
+                        open_ids.join(", ")
+                    );
+                }
+                match opens.first() {
+                    Some(entry) => {
+                        let activated = if caller.agent_id.is_some() {
+                            adopt_into(ctx, &sessions_dir, entry, &caller, "active")?
+                        } else {
+                            transition_session_file(&entry.path, "active")?;
+                            entry.data.clone()
+                        };
+                        record_transition("session.activated", Some(&activated));
+                        Some(activated)
+                    }
+                    None => None,
+                }
+            }
         }
-        sessions.into_iter().last()
     };
 
     let (task_tree, task_summary, _expired_ids) =
         build_task_index_with_expiry(&tasks_dir, config.settings.done_task_limit)?;
 
-    let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
-    let agent = register_agent(handoff, project_dir, &agent_id, session_id_for_agent)?;
-    crate::mcp::router::set_agent_id(agent.agent_id.clone());
-    // Best-effort GC of long-disconnected agent records; never let a GC
-    // failure fail the whole load_context call.
-    let _ = crate::storage::agents::gc_agents(handoff);
-
     let mut result = serde_json::json!({
         "project": config.project.name,
         "task_tree": task_tree,
         "task_summary": task_summary,
-        "agent_id": agent.agent_id,
-        "claimed_tasks": agent.claimed_tasks,
     });
+    if let Some(id) = agent_id.as_deref() {
+        let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
+        let agent = register_agent(handoff, project_dir, id, session_id_for_agent)?;
+        crate::mcp::router::set_agent_id(agent.agent_id.clone());
+        // Best-effort GC of long-disconnected agent records; never let a GC
+        // failure fail the whole load_context call.
+        let _ = crate::storage::agents::gc_agents(handoff);
+        result["agent_id"] = serde_json::json!(agent.agent_id);
+        result["claimed_tasks"] = serde_json::json!(agent.claimed_tasks);
+    } else {
+        result["claimed_tasks"] = serde_json::json!([]);
+    }
 
     // Accumulate every independent warning condition and join them, so one
     // condition (e.g. session-not-found) can never silently clobber another
@@ -172,6 +259,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     if let Some(warning) = version_mismatch_warning(handoff) {
         warnings.push(warning.into());
     }
+    warnings.extend(ownership_warnings);
 
     if let Some(warning) = history_limit_deprecation_warning(config.settings.history_limit) {
         warnings.push(warning.into());
@@ -299,29 +387,77 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         result["referrals"] = serde_json::to_value(&open_referrals)?;
     }
 
-    let current_open = read_open_sessions(&sessions_dir)?;
+    // Re-read after the transitions above. Only the caller's own (and
+    // ownerless) sessions are listed as its sessions; everything another agent
+    // owns is offered separately as `adoptable_sessions`, without its body.
+    let current = read_session_entries(&sessions_dir)?;
+    let summaries_of = |status: &str, include_foreign: bool| -> Vec<Value> {
+        current
+            .iter()
+            .filter(|e| e.status == status)
+            .filter(|e| include_foreign || caller.relation(&e.data) != Relation::Foreign)
+            .map(|e| session_summary_json(&e.data))
+            .collect()
+    };
+
+    let current_open = summaries_of("open", true);
     if !current_open.is_empty() {
-        let summaries: Vec<Value> = current_open.iter().map(session_summary_json).collect();
-        result["open_sessions"] = serde_json::json!(summaries);
+        result["open_sessions"] = serde_json::json!(current_open);
     }
 
-    let current_paused = read_paused_sessions(&sessions_dir)?;
+    let current_paused = summaries_of("paused", false);
     if !current_paused.is_empty() {
-        let summaries: Vec<Value> = current_paused.iter().map(session_summary_json).collect();
-        result["paused_sessions"] = serde_json::json!(summaries);
+        result["paused_sessions"] = serde_json::json!(current_paused);
     }
 
-    let current_active = read_active_sessions(&sessions_dir)?;
-    if current_active.len() > 1 {
-        let summaries: Vec<Value> = current_active.iter().map(session_summary_json).collect();
+    let my_active: Vec<&SessionEntry> = current
+        .iter()
+        .filter(|e| {
+            e.status == "active"
+                && caller.in_worktree(&e.data)
+                && caller.relation(&e.data) != Relation::Foreign
+        })
+        .collect();
+    if my_active.len() > 1 {
+        let summaries: Vec<Value> = my_active
+            .iter()
+            .map(|e| session_summary_json(&e.data))
+            .collect();
         result["active_sessions"] = serde_json::json!(summaries);
     }
 
-    if current_active.is_empty() {
-        let mut guidance = serde_json::json!({
-            "action": "create_session",
-            "message": "No active session. Before starting work, call handoff_save_context with session_status='active' to establish a session. Include inherited context (decisions, context_pointers, references) from the previous session so your work survives interruptions."
-        });
+    let adoptable_all = adoptable(&current, &caller);
+    if !adoptable_all.is_empty() {
+        let list: Vec<Value> = adoptable_all
+            .iter()
+            .take(ADOPTABLE_MAX)
+            .map(|e| adoptable_json(e))
+            .collect();
+        result["adoptable_sessions"] = serde_json::json!(list);
+    }
+    let adoptable_here: Vec<Value> = adoptable_all
+        .iter()
+        .filter(|e| caller.in_worktree(&e.data))
+        .take(ADOPTABLE_MAX)
+        .map(|e| adoptable_json(e))
+        .collect();
+
+    if my_active.is_empty() {
+        let (action, message) = if adoptable_here.is_empty() {
+            (
+                "create_session",
+                "No active session. Before starting work, call handoff_save_context with session_status='active' to establish a session. Include inherited context (decisions, context_pointers, references) from the previous session so your work survives interruptions.",
+            )
+        } else {
+            (
+                "adopt_or_create",
+                "You have no active session, but other agents' sessions exist in this worktree (see candidates / adoptable_sessions). If one of them is yours (after a restart, --continue or an MCP reconnect), resume it with handoff_load_context(session_id=<id>) (add adopt:true for an active one). Otherwise call handoff_save_context with session_status='active' to create your own session, including inherited context (decisions, context_pointers, references) from the previous session.",
+            )
+        };
+        let mut guidance = serde_json::json!({ "action": action, "message": message });
+        if !adoptable_here.is_empty() {
+            guidance["candidates"] = serde_json::json!(adoptable_here);
+        }
         if let Some(prev) = result.get("previous_session") {
             let mut suggested = serde_json::json!({});
             if let Some(summary) = prev.get("summary").and_then(|v| v.as_str()) {
@@ -340,8 +476,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             guidance["suggested_fields"] = suggested;
         }
         result["session_guidance"] = guidance;
-    } else if current_active.len() > 1 && target_session_id.is_none() {
-        let summaries: Vec<Value> = current_active.iter().map(session_summary_json).collect();
+    } else if my_active.len() > 1 && target_session_id.is_none() {
+        let summaries: Vec<Value> = my_active
+            .iter()
+            .map(|e| session_summary_json(&e.data))
+            .collect();
         result["session_guidance"] = serde_json::json!({
             "action": "select_session",
             "message": "Multiple active sessions. Use session_id to specify which to work with, or create a new session.",
@@ -622,6 +761,54 @@ fn health_guidance_message(
     }
 }
 
+/// Hand `entry` to the caller and put it in `to_status`, logging
+/// `session.adopted` when it really changed owner (the old owner, new owner,
+/// and the worktree/scope the session had before are in the event detail).
+/// The owner comparison happens inside the storage lock, so two processes
+/// adopting the same session cannot both win.
+fn adopt_into(
+    ctx: &HandlerContext,
+    sessions_dir: &Path,
+    entry: &SessionEntry,
+    caller: &Caller<'_>,
+    to_status: &str,
+) -> Result<SessionData> {
+    let agent_id = caller
+        .agent_id
+        .ok_or_else(|| anyhow::anyhow!("Adopting a session needs an agent identity"))?;
+    let session_id = entry
+        .data
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Session has no id"))?;
+    let scope = crate::storage::detect_session_scope(&ctx.project_dir);
+    let outcome = adopt_session(
+        sessions_dir,
+        session_id,
+        effective_owner(&entry.data),
+        &OwnerStamp {
+            agent_id,
+            worktree: caller.worktree,
+            scope,
+        },
+        to_status,
+    )?;
+    if let Some(previous) = outcome.previous_owner.as_deref() {
+        append_session_event_with_detail(
+            &ctx.handoff_dir,
+            EVENT_ADOPTED,
+            Some(session_id),
+            Some(agent_id),
+            Some(format!(
+                "from={previous}; to={agent_id}; old_worktree={}; old_scope={}",
+                outcome.previous_worktree.as_deref().unwrap_or("none"),
+                outcome.previous_scope.as_deref().unwrap_or("none"),
+            )),
+        );
+    }
+    Ok(outcome.data)
+}
+
 /// Register (or refresh) this process's agent record under
 /// `.handoff/agents/<agent-id>.json` (spec §7.2).
 ///
@@ -785,6 +972,25 @@ fn collect_in_progress_ids(tasks: &[TaskIndex], ids: &mut Vec<String>) {
         }
         collect_in_progress_ids(&task.children, ids);
     }
+}
+
+/// An adoptable session as `load_context` lists it: enough to recognise it,
+/// never its body (decisions, notes, ...), which belongs to its owner.
+fn adoptable_json(e: &SessionEntry) -> Value {
+    let mut obj = serde_json::json!({
+        "id": e.data.id,
+        "status": e.status,
+        "summary": e.data.summary,
+        "branch": e.data.branch,
+        "updated_at": updated_at(&e.data),
+    });
+    if let Some(ref label) = e.data.label {
+        obj["label"] = serde_json::json!(label);
+    }
+    if let Some(ref worktree) = e.data.worktree {
+        obj["worktree"] = serde_json::json!(worktree);
+    }
+    obj
 }
 
 fn session_summary_json(s: &crate::storage::sessions::SessionData) -> Value {

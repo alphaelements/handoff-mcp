@@ -38,7 +38,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Session ID to activate and load. Searches open sessions first, then paused sessions. If omitted, activates all open sessions and returns the latest."
+                        "description": "Session ID to activate and load. Searches active, open and paused sessions. If omitted, your own active session is loaded (or your own open session is activated); other agents' sessions are never picked implicitly, they are listed in adoptable_sessions."
+                    },
+                    "adopt": {
+                        "type": "boolean",
+                        "description": "Take over a session that is still ACTIVE under another agent (e.g. after a restart, --continue or MCP reconnect gave you a new agent_id). Required together with session_id for another agent's active session; a paused or open session of another agent is resumed by session_id alone. The session's owner, worktree and scope become yours and a session.adopted event is logged."
                     }
                 }
             }),
@@ -71,9 +75,17 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Session ID to pause instead of close. The paused session can be resumed later via load_context with the same session_id. Use this when switching to different work temporarily."
                     },
+                    "force_other_owner": {
+                        "type": "boolean",
+                        "description": "Override the protection of another agent's ACTIVE session: allow close_session_id / session_id (closed) / pause_session_id to act on it, applying summary and decisions to that session first. Requires 'reason'. Without it such a call is refused with an error (a session.close_refused event is logged) and nothing is saved or changed. Writing to another agent's active session with session_status 'active' is not refused: it is allowed with a warning and a session.foreign_write event, and the owner is unchanged."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why force_other_owner is needed (e.g. \"owner window crashed\"). Recorded in the event log."
+                    },
                     "pause_active": {
                         "type": "boolean",
-                        "description": "If true, pause all active sessions instead of closing them. Cannot be combined with close_session_id."
+                        "description": "If true, pause your own active sessions in this worktree instead of closing them (other agents' sessions are not touched). Cannot be combined with close_session_id."
                     },
                     "pause_only": {
                         "type": "boolean",
@@ -1281,6 +1293,14 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "close_sources": {
                         "type": "boolean",
                         "description": "Close non-target source sessions after merge. Default: true."
+                    },
+                    "force_other_owner": {
+                        "type": "boolean",
+                        "description": "Allow merging (and closing) another agent's ACTIVE session. Requires 'reason'. Without it the whole merge is refused and nothing changes."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why force_other_owner is needed. Recorded in the event log."
                     }
                 },
                 "required": ["source_session_ids", "target_session_id"]

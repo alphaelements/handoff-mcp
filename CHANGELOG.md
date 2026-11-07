@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Sessions are owned by the agent that created them**: a closed save, a
+  `keep_active` update, `update_session`, `import_context`, `fork_session`,
+  `merge_sessions` and `load_context` now act on the caller's own sessions
+  first and no longer close, pause or take over another agent's active
+  session. Closing/pausing another agent's active session by ID is refused with
+  an error (a `session.close_refused` event is logged); pass
+  `force_other_owner: true` with a `reason` to override. Another agent's
+  paused/open session can still be discarded by ID.
+- **`multi_session = false` now counts only your own sessions** when deciding
+  whether another active session blocks a new one.
+- `load_context` lists other agents' active/paused sessions as
+  `adoptable_sessions`; take one over with `session_id` (and `adopt: true` for
+  an active one). The new `session.adopted`, `session.foreign_close` and
+  `session.foreign_write` events record these cases.
+- Closing a session by ID no longer stamps your branch/commit/dirty files onto
+  it when it belongs to another worktree or agent.
+- Research/bug-report sub-agents record progress with `handoff_update_session`
+  instead of a closed `handoff_save_context`, which would close the parent's
+  session.
+
 ## [0.47.2] — 2026-11-01
 
 ### Added

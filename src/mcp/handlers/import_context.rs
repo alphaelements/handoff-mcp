@@ -8,8 +8,10 @@ use super::save_context::{append_session_event, prune_sessions_per_config};
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
+use crate::storage::session_target::{own_active_group, Caller, OWNER_V};
 use crate::storage::sessions::{
-    close_active_sessions, generate_session_id, write_open_session, SessionData,
+    generate_session_id, read_session_entries, transition_session_file, write_open_session,
+    SessionData,
 };
 use crate::storage::tasks::*;
 
@@ -30,6 +32,41 @@ fn write_imported_session(
         ctx.agent_id.as_deref(),
     );
     Ok(())
+}
+
+/// Close the caller's own active sessions (and ownerless ones) before an
+/// imported session replaces them. Another agent's active session is never
+/// closed by an import.
+fn close_own_active_sessions(ctx: &HandlerContext, sessions_dir: &Path) -> Result<()> {
+    let worktree = ctx.project_dir.to_string_lossy().to_string();
+    let caller = Caller {
+        agent_id: ctx.agent_id.as_deref(),
+        worktree: &worktree,
+    };
+    let entries = read_session_entries(sessions_dir)?;
+    for entry in own_active_group(&entries, &caller) {
+        transition_session_file(&entry.path, "closed")?;
+        append_session_event(
+            &ctx.handoff_dir,
+            "session.closed",
+            entry.data.id.as_deref(),
+            ctx.agent_id.as_deref(),
+        );
+    }
+    Ok(())
+}
+
+/// Ownership of a session written by this call: the caller's identity (none
+/// for the CLI), worktree and scope.
+fn imported_owner(
+    ctx: &HandlerContext,
+) -> (Option<String>, Option<u32>, Option<String>, Option<String>) {
+    (
+        ctx.agent_id.clone(),
+        ctx.agent_id.as_ref().map(|_| OWNER_V),
+        Some(ctx.project_dir.to_string_lossy().to_string()),
+        Some(crate::storage::detect_session_scope(&ctx.project_dir).to_string()),
+    )
 }
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -116,7 +153,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             })?;
 
         if !skip_session_close {
-            close_active_sessions(&sessions_dir)?;
+            close_own_active_sessions(ctx, &sessions_dir)?;
         }
         let git_state = capture_git_state(project_dir)?;
         let now = Utc::now().to_rfc3339();
@@ -146,6 +183,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             );
         }
 
+        let owner = imported_owner(ctx);
         let data = SessionData {
             version: 2,
             id: None,
@@ -165,9 +203,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             label: None,
             parent_session_id: None,
             related_task_ids: Vec::new(),
-            agent_id: None,
-            worktree: None,
-            scope: None,
+            agent_id: owner.0,
+            owner_v: owner.1,
+            worktree: owner.2,
+            scope: owner.3,
         };
 
         write_imported_session(ctx, &sessions_dir, data)?;
@@ -178,11 +217,12 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
         if !raw_notes.is_empty() {
             if !skip_session_close {
-                close_active_sessions(&sessions_dir)?;
+                close_own_active_sessions(ctx, &sessions_dir)?;
             }
             let git_state = capture_git_state(project_dir)?;
             let now = Utc::now().to_rfc3339();
 
+            let owner = imported_owner(ctx);
             let data = SessionData {
                 version: 2,
                 id: None,
@@ -210,9 +250,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 label: None,
                 parent_session_id: None,
                 related_task_ids: Vec::new(),
-                agent_id: None,
-                worktree: None,
-                scope: None,
+                agent_id: owner.0,
+                owner_v: owner.1,
+                worktree: owner.2,
+                scope: owner.3,
             };
 
             write_imported_session(ctx, &sessions_dir, data)?;

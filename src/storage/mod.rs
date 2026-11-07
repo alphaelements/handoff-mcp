@@ -12,6 +12,7 @@ pub mod memory;
 pub mod metrics_snapshots;
 pub mod referrals;
 pub mod runs;
+pub mod session_target;
 pub mod sessions;
 pub mod tasks;
 pub mod test_results;

@@ -12,7 +12,20 @@ description: "Session handoff — load context at start, save at end, track task
    derived from the directory name.
 3. If `paused_sessions` are returned, show them to the user (ID, summary,
    branch). To resume: `handoff_load_context(session_id: "s-...")`.
-   To discard: `handoff_save_context(close_session_id: "s-...")`.
+   To discard: `handoff_save_context(close_session_id: "s-...")` — a paused
+   (or open) session may be closed even when another agent owns it (a
+   `session.foreign_close` event is logged).
+   **Sessions owned by another agent** (another window) are never picked
+   implicitly. They appear in `adoptable_sessions` (ID, summary, branch,
+   `updated_at`; no body). If one is yours — after a restart, `--continue` or
+   an MCP reconnect gave you a new `agent_id` — resume it with
+   `handoff_load_context(session_id: "s-...")`; an **active** one also needs
+   `adopt: true`, because the other window may still be working on it.
+   An *active* session of another agent cannot be closed or paused by ID:
+   the call is refused with an error and nothing is saved or changed. Only
+   with `force_other_owner: true` plus a `reason` is it closed anyway.
+   `/clear` does not close the handoff session: close it with
+   `handoff_save_context` before `/clear`, or it stays active.
 4. **Establish an active session immediately** — if `session_guidance` is
    present in the response (meaning no active session exists), call
    `handoff_save_context` with `session_status: "active"` **before starting

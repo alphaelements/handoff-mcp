@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use super::save_context::{ambiguous_message, entry_for, record_ownership_event};
 use super::HandlerContext;
-use crate::storage::sessions::{read_active_sessions, SessionData};
+use crate::storage::session_target::{resolve_session_target, Caller, Resolution, TargetOp};
+use crate::storage::sessions::{read_session_entries, SessionData};
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
@@ -10,26 +12,47 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
 
-    let active = read_active_sessions(&sessions_dir)?;
-    if active.is_empty() {
-        anyhow::bail!(
-            "No active session. Call save_context with session_status='active' to create one first."
-        );
-    }
-
-    let session = if let Some(tid) = target_session_id {
-        active
-            .iter()
-            .find(|s| {
-                s.id.as_deref()
-                    .is_some_and(|id| id == tid || id.starts_with(tid) || tid.starts_with(id))
-            })
-            .ok_or_else(|| anyhow::anyhow!("session_id '{tid}' not found among active sessions"))?
-    } else if active.len() == 1 {
-        &active[0]
-    } else {
-        active.last().unwrap()
+    let worktree = ctx.project_dir.to_string_lossy().to_string();
+    let caller = Caller {
+        agent_id: ctx.agent_id.as_deref(),
+        worktree: &worktree,
     };
+    let entries = read_session_entries(&sessions_dir)?;
+    let mut notes: Vec<String> = Vec::new();
+    let target = match resolve_session_target(
+        &entries,
+        &caller,
+        target_session_id,
+        TargetOp::Append,
+        false,
+    ) {
+        Resolution::Target(t) => t,
+        Resolution::NotFound => {
+            let tid = target_session_id.unwrap_or_default();
+            anyhow::bail!("session_id '{tid}' not found among active sessions");
+        }
+        Resolution::NoTarget => {
+            anyhow::bail!(
+                "No active session of yours in this worktree. Call save_context with \
+                 session_status='active' to create one, or pass session_id to update a \
+                 specific session."
+            );
+        }
+        Resolution::NeedsExplicitId { ids } => anyhow::bail!(
+            "An active session owned by another agent exists in this worktree ({}), and this \
+             caller has no agent identity (CLI). Pass session_id to say which session you mean.",
+            ids.join(", ")
+        ),
+        Resolution::Ambiguous { ids } => anyhow::bail!(ambiguous_message(&ids)),
+        Resolution::Refused { id, owner } => {
+            anyhow::bail!("Session {id} is owned by another agent ({owner}); it was not updated.")
+        }
+    };
+    record_ownership_event(ctx, &target, None);
+    notes.extend(target.warnings.iter().cloned());
+    let session = entry_for(&entries, &target.id)
+        .map(|e| &e.data)
+        .ok_or_else(|| anyhow::anyhow!("Session '{}' disappeared", target.id))?;
     let sid = session.id.as_deref().unwrap_or("");
 
     let checklist_index = arguments
@@ -147,6 +170,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         checked_count,
         data.checklist.len()
     ));
+    for note in &notes {
+        msg.push('\n');
+        msg.push_str(note);
+    }
 
     Ok(msg)
 }

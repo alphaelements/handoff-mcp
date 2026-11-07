@@ -27,6 +27,10 @@ use crate::mcp::handlers;
 /// script's `$?` check than trying to subdivide this handler's own error
 /// paths into "really a 1" vs "really a 2".
 pub fn run(args: &[String]) -> i32 {
+    // A CLI invocation has no stable identity of its own: tools must not
+    // invent an agent for it (`handoff_load_context` would otherwise register
+    // a new one per call).
+    crate::mcp::router::mark_cli_process();
     let is_trace = args.first().map(String::as_str) == Some("trace");
     let action = args.get(1).map(String::as_str);
     let is_trace_lint = is_trace && action == Some("lint");

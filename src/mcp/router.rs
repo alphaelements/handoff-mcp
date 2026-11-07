@@ -27,10 +27,38 @@ pub fn set_agent_id(id: String) {
     *AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
 }
 
+/// Make `candidate` this process's agent identity unless one is already set,
+/// and return the identity in force. Used by callers that had no identity
+/// when their request started (in-process use without the server's startup):
+/// when several such callers race, they all end up with the same identity
+/// instead of each overwriting the last.
+pub fn claim_agent_id(candidate: String) -> String {
+    AGENT_ID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert(candidate)
+        .clone()
+}
+
 /// This process's agent identity (fixed at server startup, or registered by
 /// a prior `handoff_load_context` call in-process), if any.
 pub fn get_agent_id() -> Option<String> {
     AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Set once by the CLI entry point: this process is a one-shot CLI call, not
+/// a long-lived MCP server, so it has no agent identity to register.
+static CLI_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as a CLI invocation (see [`is_cli_process`]).
+pub fn mark_cli_process() {
+    CLI_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process was started as a CLI call (`handoff-mcp <command> ...`)
+/// rather than as the MCP server.
+pub fn is_cli_process() -> bool {
+    CLI_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Test-only: force this process's shared agent identity back to `None`.

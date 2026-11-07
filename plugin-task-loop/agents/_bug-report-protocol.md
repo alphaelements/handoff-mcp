@@ -57,7 +57,9 @@ new tasks via `handoff_update_task` (omit id for auto-assignment):
 
 After creation:
 
-- Record "Created report task <new_id>" in `handoff_save_context` notes.
+- Record "Created report task <new_id>" in the active session's notes with
+  `handoff_update_session` (a closed `handoff_save_context` from a sub-agent
+  would close the parent's own active session).
 - Inform the user: "Filed N issues as tXX" in the session summary.
 
 ## Rules

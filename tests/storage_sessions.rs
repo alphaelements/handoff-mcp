@@ -27,6 +27,7 @@ fn make_session(summary: &str, ended_at: &str) -> SessionData {
         parent_session_id: None,
         related_task_ids: Vec::new(),
         agent_id: None,
+        owner_v: None,
         worktree: None,
         scope: None,
     }

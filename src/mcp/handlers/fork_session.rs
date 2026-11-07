@@ -1,9 +1,10 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::save_context::append_session_event;
+use super::save_context::append_session_event_with_detail;
 use super::HandlerContext;
-use crate::storage::sessions::{fork_session, read_session_by_id};
+use crate::storage::session_target::effective_owner;
+use crate::storage::sessions::{fork_session, read_session_by_id, ForkSpec};
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
@@ -55,19 +56,34 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let forked = fork_session(
         &sessions_dir,
         &source,
-        summary,
-        label,
-        timeline,
-        related_task_ids,
-        &inherit,
+        ForkSpec {
+            summary,
+            label,
+            timeline,
+            related_task_ids,
+            inherit: &inherit,
+        },
+        &crate::storage::sessions::ForkOwner {
+            agent_id: ctx.agent_id.as_deref(),
+            worktree: &ctx.project_dir.to_string_lossy(),
+            scope: crate::storage::detect_session_scope(&ctx.project_dir),
+        },
     )?;
 
     let forked_id = forked.id.as_deref().unwrap_or("unknown");
-    append_session_event(
+    // The fork takes the caller's owner, worktree and scope; what the source
+    // had is kept in the event so the hand-off stays traceable.
+    append_session_event_with_detail(
         handoff,
         "session.created",
         forked.id.as_deref(),
         ctx.agent_id.as_deref(),
+        Some(format!(
+            "forked_from={source_session_id}; source_owner={}; source_worktree={}; source_scope={}",
+            effective_owner(&source).unwrap_or("none"),
+            source.worktree.as_deref().unwrap_or("none"),
+            source.scope.as_deref().unwrap_or("none"),
+        )),
     );
 
     let result = json!({

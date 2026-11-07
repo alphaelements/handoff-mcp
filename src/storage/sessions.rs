@@ -47,6 +47,14 @@ pub struct SessionData {
     /// outside an agent-identified call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Ownership format version (v0.47.3). Present only on sessions whose
+    /// `agent_id` was written by a build that keeps `agent_id` stable for the
+    /// life of an MCP process. A session without it carries an `agent_id`
+    /// from the older per-call generator, which says nothing about who owns
+    /// the session, so it is treated as having no owner (see
+    /// `session_target::effective_owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_v: Option<u32>,
     /// The resolved `project_dir` this session was saved from (the worktree
     /// checkout path, or the primary repo path for a non-worktree session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,7 +161,7 @@ fn synthesize_id_from_filename(filename: &str) -> String {
     }
 }
 
-fn ids_match(candidate: &str, query: &str) -> bool {
+pub(crate) fn ids_match(candidate: &str, query: &str) -> bool {
     candidate == query || candidate.starts_with(query) || query.starts_with(candidate)
 }
 
@@ -470,18 +478,234 @@ fn apply_session_updates(
     // update actually carries a value, so a `session_status` other than
     // "active" — which leaves these `None` in `handoff_updates` — doesn't
     // erase scope/agent_id/worktree/parent_session_id on close.
-    if updates.scope.is_some() {
-        data.scope = updates.scope.clone();
+    //
+    // Ownership travels as a unit and is only (re)written when the session
+    // has no trustworthy owner or the writer already is the owner: an update
+    // that reaches another agent's session (an explicit id, `force_other_owner`)
+    // must not move it to the writer (FR-V0473-008 AC3).
+    let may_claim = match crate::storage::session_target::effective_owner(data) {
+        None => true,
+        Some(owner) => updates.agent_id.as_deref() == Some(owner),
+    };
+    if may_claim {
+        if updates.scope.is_some() {
+            data.scope = updates.scope.clone();
+        }
+        if updates.agent_id.is_some() {
+            data.agent_id = updates.agent_id.clone();
+            data.owner_v = Some(crate::storage::session_target::OWNER_V);
+        }
+        if updates.worktree.is_some() {
+            data.worktree = updates.worktree.clone();
+        }
+        if updates.parent_session_id.is_some() {
+            data.parent_session_id = updates.parent_session_id.clone();
+        }
     }
-    if updates.agent_id.is_some() {
-        data.agent_id = updates.agent_id.clone();
+}
+
+/// An unfinished (`active` / `open` / `paused`) session together with the
+/// file it lives in. This is what the ownership rules in
+/// [`crate::storage::session_target`] operate on: the status is not part of
+/// [`SessionData`], it is the file-name suffix.
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    pub data: SessionData,
+    pub status: String,
+    pub path: PathBuf,
+}
+
+const UNFINISHED_STATUSES: [&str; 3] = ["active", "open", "paused"];
+
+/// Every active, open and paused session, oldest file name first.
+pub fn read_session_entries(sessions_dir: &Path) -> Result<Vec<SessionEntry>> {
+    let mut entries = Vec::new();
+    if !sessions_dir.exists() {
+        return Ok(entries);
     }
-    if updates.worktree.is_some() {
-        data.worktree = updates.worktree.clone();
+    let mut files: Vec<_> = std::fs::read_dir(sessions_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+    for file in files {
+        let name = file.file_name().to_string_lossy().to_string();
+        let Some(status) = UNFINISHED_STATUSES
+            .iter()
+            .find(|s| name.ends_with(&format!(".{s}.json")))
+        else {
+            continue;
+        };
+        let path = file.path();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read session: {}", path.display()))?;
+        let mut data: SessionData = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+        if data.id.is_none() {
+            data.id = Some(synthesize_id_from_filename(&name));
+        }
+        entries.push(SessionEntry {
+            data,
+            status: (*status).to_string(),
+            path,
+        });
     }
-    if updates.parent_session_id.is_some() {
-        data.parent_session_id = updates.parent_session_id.clone();
+    Ok(entries)
+}
+
+/// Rename a session file to another status (`foo.active.json` ->
+/// `foo.paused.json`) and return the new path.
+pub fn transition_session_file(path: &Path, to: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid session path: {}", path.display()))?;
+    let base = name
+        .strip_suffix(".json")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .map(|(base, _)| base)
+        .ok_or_else(|| anyhow::anyhow!("Not a session file name: {name}"))?;
+    let new_path = path.with_file_name(format!("{base}.{to}.json"));
+    std::fs::rename(path, &new_path).with_context(|| {
+        format!(
+            "Failed to transition session file {} -> {}",
+            path.display(),
+            new_path.display()
+        )
+    })?;
+    Ok(new_path)
+}
+
+/// Apply `updates` to the session stored at `path` and optionally move it to
+/// another status, returning the final path. Works on any status, so a
+/// `close_session_id` of a paused session records its summary too.
+pub fn update_session_at(
+    path: &Path,
+    updates: &SessionData,
+    provided_keys: Option<&Value>,
+    transition_to: Option<&str>,
+) -> Result<PathBuf> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read session: {}", path.display()))?;
+    let mut data: SessionData = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+    apply_session_updates(&mut data, updates, provided_keys);
+    let updated = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+    crate::storage::atomic_write(path, updated.as_bytes())
+        .with_context(|| format!("Failed to write session: {}", path.display()))?;
+    match transition_to {
+        Some(status) => {
+            let ts_part = compact_timestamp(&data);
+            let base = generate_session_filename(&data.summary, &ts_part);
+            let new_path = path.with_file_name(format!("{base}.{status}.json"));
+            std::fs::rename(path, &new_path).with_context(|| {
+                format!(
+                    "Failed to transition session to {status}: {}",
+                    path.display()
+                )
+            })?;
+            Ok(new_path)
+        }
+        None => Ok(path.to_path_buf()),
     }
+}
+
+/// Who a session is being handed to by [`adopt_session`].
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerStamp<'a> {
+    pub agent_id: &'a str,
+    pub worktree: &'a str,
+    pub scope: &'a str,
+}
+
+/// What a session looked like before [`adopt_session`] rewrote it.
+#[derive(Debug, Clone)]
+pub struct AdoptOutcome {
+    pub path: PathBuf,
+    pub data: SessionData,
+    pub previous_owner: Option<String>,
+    pub previous_worktree: Option<String>,
+    pub previous_scope: Option<String>,
+}
+
+/// Hand an unfinished session to `stamp` and put it in `to_status`.
+///
+/// `expected_owner` is the owner the caller saw when it decided to adopt. The
+/// comparison and the rewrite happen under one exclusive file lock, so of two
+/// processes adopting the same session at once exactly one wins and the other
+/// gets an error naming the new owner instead of silently overwriting it
+/// (spec §4.4' SHOULD-FIX 12). The body's `agent_id`, `worktree` and `scope`
+/// are replaced by the new owner's; the old values are returned for the
+/// event detail.
+pub fn adopt_session(
+    sessions_dir: &Path,
+    session_id: &str,
+    expected_owner: Option<&str>,
+    stamp: &OwnerStamp<'_>,
+    to_status: &str,
+) -> Result<AdoptOutcome> {
+    use fs2::FileExt;
+
+    let lock_dir = sessions_dir.parent().unwrap_or(sessions_dir).join("agents");
+    std::fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("Failed to create lock dir: {}", lock_dir.display()))?;
+    let lock_path = lock_dir.join("_sessions.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .context("Failed to lock sessions for adopt")?;
+    let result = adopt_locked(sessions_dir, session_id, expected_owner, stamp, to_status);
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
+fn adopt_locked(
+    sessions_dir: &Path,
+    session_id: &str,
+    expected_owner: Option<&str>,
+    stamp: &OwnerStamp<'_>,
+    to_status: &str,
+) -> Result<AdoptOutcome> {
+    let entries = read_session_entries(sessions_dir)?;
+    let entry = entries
+        .iter()
+        .find(|e| e.data.id.as_deref() == Some(session_id))
+        .ok_or_else(|| anyhow::anyhow!("Session '{session_id}' is no longer available"))?;
+    let current_owner = crate::storage::session_target::effective_owner(&entry.data);
+    if current_owner != expected_owner {
+        anyhow::bail!(
+            "Session '{session_id}' changed owner while it was being adopted (now owned by {}). \
+             Reload and try again.",
+            current_owner.unwrap_or("nobody")
+        );
+    }
+    let previous_owner = current_owner.map(String::from);
+    let previous_worktree = entry.data.worktree.clone();
+    let previous_scope = entry.data.scope.clone();
+
+    let mut data = entry.data.clone();
+    data.agent_id = Some(stamp.agent_id.to_string());
+    data.owner_v = Some(crate::storage::session_target::OWNER_V);
+    data.worktree = Some(stamp.worktree.to_string());
+    data.scope = Some(stamp.scope.to_string());
+    let content = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+    crate::storage::atomic_write(&entry.path, content.as_bytes())
+        .with_context(|| format!("Failed to write session: {}", entry.path.display()))?;
+    let path = if entry.status == to_status {
+        entry.path.clone()
+    } else {
+        transition_session_file(&entry.path, to_status)?
+    };
+    Ok(AdoptOutcome {
+        path,
+        data,
+        previous_owner,
+        previous_worktree,
+        previous_scope,
+    })
 }
 
 fn find_and_update_active_session(
@@ -633,15 +857,38 @@ pub fn read_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Optio
     Ok(matches.into_iter().next().map(|(data, _)| data))
 }
 
+/// The caller a forked session is created for.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkOwner<'a> {
+    pub agent_id: Option<&'a str>,
+    pub worktree: &'a str,
+    pub scope: &'a str,
+}
+
+/// What the forked session says about itself.
+#[derive(Debug, Clone)]
+pub struct ForkSpec<'a> {
+    pub summary: &'a str,
+    pub label: Option<&'a str>,
+    pub timeline: Option<&'a str>,
+    pub related_task_ids: Vec<String>,
+    /// Source fields the fork copies (`decisions`, `context_pointers`, ...).
+    pub inherit: &'a [&'a str],
+}
+
 pub fn fork_session(
     sessions_dir: &Path,
     source: &SessionData,
-    summary: &str,
-    label: Option<&str>,
-    timeline: Option<&str>,
-    related_task_ids: Vec<String>,
-    inherit: &[&str],
+    spec: ForkSpec<'_>,
+    owner: &ForkOwner<'_>,
 ) -> Result<SessionData> {
+    let ForkSpec {
+        summary,
+        label,
+        timeline,
+        related_task_ids,
+        inherit,
+    } = spec;
     let source_id = source
         .id
         .as_deref()
@@ -668,9 +915,14 @@ pub fn fork_session(
         label: label.map(String::from),
         parent_session_id: Some(source_id.to_string()),
         related_task_ids,
-        agent_id: source.agent_id.clone(),
-        worktree: source.worktree.clone(),
-        scope: source.scope.clone(),
+        // The fork belongs to whoever forked it, not to the source's owner
+        // (FR-V0473-008 AC3).
+        agent_id: owner.agent_id.map(String::from),
+        owner_v: owner
+            .agent_id
+            .map(|_| crate::storage::session_target::OWNER_V),
+        worktree: Some(owner.worktree.to_string()),
+        scope: Some(owner.scope.to_string()),
     };
 
     for field in inherit {
@@ -695,6 +947,7 @@ pub fn merge_sessions(
     source_ids: &[&str],
     target_id: &str,
     close_sources: bool,
+    caller_agent_id: Option<&str>,
 ) -> Result<MergeResult> {
     let mut sources: Vec<SessionData> = Vec::new();
     for sid in source_ids {
@@ -779,6 +1032,15 @@ pub fn merge_sessions(
                 let _ = path;
                 closed_sessions.push(source_actual_id.to_string());
             }
+        }
+    }
+
+    // The merge target is an existing session, not a new one: its owner is
+    // only ever filled in, never replaced (FR-V0473-008 AC3).
+    if crate::storage::session_target::effective_owner(&target).is_none() {
+        if let Some(agent) = caller_agent_id {
+            target.agent_id = Some(agent.to_string());
+            target.owner_v = Some(crate::storage::session_target::OWNER_V);
         }
     }
 
@@ -891,7 +1153,7 @@ struct ClosedEntry {
 
 /// The UTC instant embedded in a session id (`s-YYYYMMDD-HHMMSS-uuuuuu`, or
 /// the `-000000` form synthesized from an old file name).
-fn timestamp_from_id(id: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+pub(crate) fn timestamp_from_id(id: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     let rest = id.strip_prefix("s-")?;
     let naive = chrono::NaiveDateTime::parse_from_str(rest.get(..22)?, "%Y%m%d-%H%M%S-%6f").ok()?;
     Some(naive.and_utc().fixed_offset())

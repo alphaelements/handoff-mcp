@@ -18,7 +18,10 @@ user-invocable: true
 3. **paused セッション**がある場合:
    - `paused_sessions` をユーザーに表示（ID, summary, branch）
    - 再開したい場合: `handoff_load_context(session_id: "s-...")` で paused → active に遷移
-   - 不要な場合: `handoff_save_context(close_session_id: "s-...")` で paused → closed に直接遷移
+   - 不要な場合: `handoff_save_context(close_session_id: "s-...")` で paused → closed に直接遷移（他のエージェントが所有する paused / open でも閉じられる。`session.foreign_close` イベントが残る）
+   - **他のエージェントの active / paused セッション**は暗黙に選ばれず、`adoptable_sessions`（ID・summary・branch・`updated_at`、本文なし）に載る。再起動・`--continue`・MCP 再接続で自分のセッションが別の `agent_id` になった場合は `handoff_load_context(session_id: "s-...")` で引き継ぐ（active は他のウィンドウが作業中の可能性があるため `adopt: true` が必要。引き継ぐと所有者が自分に移り `session.adopted` が残る）
+   - 他のエージェントの **active** セッションは ID 指定でも閉じられない・pause できない（エラーで拒否され、何も保存・変更されない）。それでも閉じるときだけ `force_other_owner: true` と `reason` を付ける。なお `/clear` では handoff セッションは閉じない: 閉じたいときは `/clear` の前に `handoff_save_context` を呼ぶ
+   - `session_guidance.action` が `adopt_or_create` のときは、`candidates` が自分のものか確認して引き継ぐか、新規に `session_status: "active"` で作る
 4. **`session_guidance` がある場合（アクティブセッション未確立）**:
    - 作業開始前に `handoff_save_context` を `session_status: "active"` で呼んでセッションを確立する
    - `session_guidance.suggested_fields` の内容（summary, decisions, context_pointers, references, related_task_ids）を引き継いで含める
