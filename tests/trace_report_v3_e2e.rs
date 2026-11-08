@@ -607,6 +607,26 @@ fn sample_matches_what_the_binary_produces_for_the_dag_project() {
     );
 }
 
+/// Placeholder for `inputs.config_fnv` in the committed sample. The real value
+/// fingerprints the whole default `config.toml`, which is not part of the report
+/// contract; `inputs_config_fnv_is_a_16_digit_hex_fingerprint` guards its shape.
+const CONFIG_FNV_SAMPLE: &str = "0000000000000000";
+
+#[test]
+fn inputs_config_fnv_is_a_16_digit_hex_fingerprint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let report = build_dag_report(tmp.path());
+    let fnv = report["inputs"]["config_fnv"]
+        .as_str()
+        .expect("config_fnv is a string when config.toml exists");
+    assert_eq!(fnv.len(), 16, "{fnv}");
+    assert!(
+        fnv.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{fnv}"
+    );
+}
+
 /// Replaces every value that is random per run with a fixed placeholder.
 fn stabilize(report: &mut Value) {
     fn walk(v: &mut Value) {
@@ -616,10 +636,14 @@ fn stabilize(report: &mut Value) {
                 for k in keys {
                     let randomish = matches!(
                         k.as_str(),
-                        "doc" | "docs_max_mtime_ns" | "tasks_max_mtime_ns"
+                        "doc" | "docs_max_mtime_ns" | "tasks_max_mtime_ns" | "config_fnv"
                     );
                     if randomish {
-                        if map[&k].is_string() {
+                        if k == "config_fnv" {
+                            // Hash of the freshly `handoff_init`-written config.toml,
+                            // so it changes whenever any default setting is added.
+                            map.insert(k, json!(CONFIG_FNV_SAMPLE));
+                        } else if map[&k].is_string() {
                             map.insert(k, json!("doc-sample"));
                         } else if map[&k].is_number() {
                             map.insert(k, json!(0));

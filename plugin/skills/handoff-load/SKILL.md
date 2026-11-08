@@ -12,7 +12,7 @@ Load the project's handoff context at session start and get oriented on the curr
 
 1. Call `handoff_load_context` (no arguments — it uses the cwd)
    - **The previous session (lineage) is inferred automatically.** When `previous_session.inferred: true` is returned (the basis is in `evidence`), use it as is. Do not pass `continue_from`. The next `handoff_save_context` that creates a new session records it into `continues` automatically
-   - **Only** when `ambiguous: true` is returned (there is no `previous_session` or `next_actions`, and candidates are listed in `other_heads`): compare each candidate's `summary` with the user's request and the tasks you are about to work on, then call `handoff_load_context` again with the `id` of the matching candidate as `continue_from`. If you cannot decide, ask the user. A candidate with `in_flight_by` is already continued by another agent's active session (if it is your own, take it over with `session_id` + `adopt: true`)
+   - **Only** when `ambiguous: true` is returned (there is no `previous_session` or `next_actions`, and candidates are listed in `other_heads`): compare each candidate's `summary` with the user's request and the tasks you are about to work on, then call `handoff_load_context` again with the `id` of the matching candidate as `continue_from`. If you cannot decide, ask the user. A candidate with `in_flight_by` is already continued by another agent's active session (if that session is your own, take it over with `session_id` set to the ACTIVE session id listed in `in_flight_by`, not the candidate's head id, plus `adopt: true`)
 2. If `not_initialized` is returned:
    - Infer the project name from the directory name
    - Initialize with `handoff_init`

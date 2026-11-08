@@ -1180,11 +1180,14 @@ fn recent_closed_reader_is_capped_to_the_newest_files() {
     for i in 1..=12 {
         write_closed(&sessions_dir, i, &format!("s-{i:02}"), "main");
     }
-    let recent = read_recent_closed_sessions(&sessions_dir, 5).unwrap();
+    let recent = read_recent_closed_sessions(&sessions_dir, 5)
+        .unwrap()
+        .sessions;
     let mut got: Vec<String> = recent.iter().map(|s| s.id.clone().unwrap()).collect();
     got.sort();
     assert_eq!(got, vec!["s-08", "s-09", "s-10", "s-11", "s-12"]);
     assert!(read_recent_closed_sessions(&dir.path().join("missing"), 5)
         .unwrap()
+        .sessions
         .is_empty());
 }

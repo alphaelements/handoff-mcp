@@ -18,7 +18,8 @@ description: "Session handoff — load context at start, save at end, track task
    again with `continue_from: "<id>"` of the matching one. If you cannot
    decide, ask the user. A candidate with `in_flight_by` is already continued
    by another agent's active session — if that is yours (after a restart),
-   resume it with `session_id` + `adopt: true` instead. Never pass
+   resume it with `session_id` set to the ACTIVE session id listed in
+   `in_flight_by` (not the candidate's head id) plus `adopt: true` instead. Never pass
    `continue_from` when `inferred: true` came back.
 2. If the project is not initialized, call `handoff_init` with the project name
    derived from the directory name.

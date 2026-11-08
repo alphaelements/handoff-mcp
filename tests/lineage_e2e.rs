@@ -798,9 +798,10 @@ fn in_flight_head_that_matches_the_checkout_stays_ambiguous() {
 }
 
 /// A load in a linked worktree while the primary checkout has an active
-/// session: the worktree session will continue that session, so the report is
-/// the primary's own previous session. It is not ambiguous, and no in-flight
-/// block applies to the orchestrator's own claim.
+/// session of the same agent: the worktree session will continue that session,
+/// so the report is the primary's own previous session. It is not ambiguous,
+/// and no in-flight block applies to the orchestrator's own claim. Another
+/// agent's primary session is never adopted as a parent.
 #[test]
 fn load_in_a_worktree_while_the_primary_is_active_reports_its_previous_session() {
     let p = project();
@@ -841,18 +842,15 @@ fn load_in_a_worktree_while_the_primary_is_active_reports_its_previous_session()
         .to_string_lossy()
         .to_string();
 
-    // The same process (same agent) and a different one both start cleanly.
-    let mut other_agent = Server::spawn();
-    for server in [&mut orchestrator, &mut other_agent] {
-        let v = server.load(&wt_pd, json!({}));
-        assert!(v.get("ambiguous").is_none(), "{v}");
-        assert!(v.get("other_heads").is_none(), "{v}");
-        assert_eq!(previous_id(&v), Some("s-head".into()), "{v}");
-        assert!(v.get("lineage_token").is_none(), "{v}");
-    }
+    // The primary's owner (the same process) starts cleanly in the worktree.
+    let v = orchestrator.load(&wt_pd, json!({}));
+    assert!(v.get("ambiguous").is_none(), "{v}");
+    assert!(v.get("other_heads").is_none(), "{v}");
+    assert_eq!(previous_id(&v), Some("s-head".into()), "{v}");
+    assert!(v.get("lineage_token").is_none(), "{v}");
 
     // The worktree session still records its parent.
-    let child = other_agent.save(
+    let child = orchestrator.save(
         &wt_pd,
         json!({ "session_status": "active", "summary": "worktree work" }),
     );
@@ -864,6 +862,30 @@ fn load_in_a_worktree_while_the_primary_is_active_reports_its_previous_session()
         find_session(&p, child_id)["continues"],
         json!([parent_id]),
         "{child}"
+    );
+    assert_eq!(
+        find_session(&p, child_id)["parent_session_id"],
+        parent_id.as_str(),
+        "{child}"
+    );
+
+    // Another agent's primary session is not its parent: it is told the head
+    // is in flight under that session instead of silently becoming its child.
+    let mut other_agent = Server::spawn();
+    let v = other_agent.load(&wt_pd, json!({}));
+    assert_eq!(v["ambiguous"], true, "{v}");
+    assert_eq!(v["other_heads"][0]["id"], "s-head", "{v}");
+    let other = other_agent.save(
+        &wt_pd,
+        json!({ "session_status": "active", "summary": "other agent's worktree work" }),
+    );
+    let other_id = other
+        .lines()
+        .find_map(|l| l.strip_prefix("Session ID: "))
+        .unwrap();
+    assert!(
+        find_session(&p, other_id)["parent_session_id"].is_null(),
+        "{other}"
     );
 }
 

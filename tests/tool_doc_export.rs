@@ -653,7 +653,17 @@ fn warns_once_when_exports_is_not_gitignored() {
     if !typst_available() {
         return;
     }
-    let (_d, pd) = setup();
+    let (d, pd) = setup();
+    // `handoff_init` now ignores /exports/ from the start; undo that to get the
+    // pre-existing-project state this test is about.
+    let gitignore = d.path().join(".handoff/.gitignore");
+    let kept: String = std::fs::read_to_string(&gitignore)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("exports"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&gitignore, kept).unwrap();
     save_doc(&pd, "ign-a", "A", "# A\n\ntext\n");
     save_doc(&pd, "ign-b", "B", "# B\n\ntext\n");
 

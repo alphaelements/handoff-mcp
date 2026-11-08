@@ -87,6 +87,14 @@ pub struct CompactView {
 /// Statuses of work that is under way: always part of the compact tree.
 const ACTIVE_STATUSES: [&str; 3] = ["in_progress", "blocked", "review"];
 
+/// Statuses of a task that still has work to do (everything but `done` and
+/// `skipped`).
+const OPEN_STATUSES: [&str; 4] = ["todo", "in_progress", "review", "blocked"];
+
+fn is_open_status(status: &str) -> bool {
+    OPEN_STATUSES.contains(&status)
+}
+
 /// `[milestones.<name>] status` of the milestone being worked on.
 const ACTIVE_MILESTONE_STATUS: &str = "active";
 
@@ -425,7 +433,9 @@ pub fn compact_view(
             *shown
                 .entry(index.task(position).status.as_str())
                 .or_insert(0) += 1;
-        } else if index.milestone_of(position).is_none() {
+        } else if is_open_status(&index.task(position).status)
+            && index.milestone_of(position).is_none()
+        {
             omitted_without_milestone += 1;
         }
     }
@@ -1135,8 +1145,28 @@ mod tests {
             view.meta["omitted_by_status"],
             json!({"done": 1, "todo": 2})
         );
-        assert_eq!(view.meta["omitted_without_milestone"], 2);
+        // t5 only: the omitted `done` t4 has no milestone either, but a
+        // finished task is not a reason to go and assign one.
+        assert_eq!(view.meta["omitted_without_milestone"], 1);
         assert_eq!(view.meta["truncated"], true);
+    }
+
+    #[test]
+    fn omitted_without_milestone_counts_only_open_tasks() {
+        let tree = vec![
+            task("t1", "in_progress"),
+            task("t2", "done"),
+            task("t3", "skipped"),
+            task("t4", "blocked"),
+            task("t5", "review"),
+            task("t6", "todo"),
+        ];
+        let mut tight = Req::new(1);
+        tight.previous = Vec::new();
+        let view = tight.run(&tree);
+        // t1, t4, t5 are active and always kept; budget 1 keeps one todo.
+        let omitted_open = view.meta["omitted_without_milestone"].as_u64().unwrap();
+        assert_eq!(omitted_open, 0, "done/skipped must not be counted");
     }
 
     #[test]

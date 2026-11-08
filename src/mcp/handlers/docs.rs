@@ -2506,10 +2506,36 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .filter(|s| !s.is_empty());
 
     let (mut docs, unreadable) = read_all_docs_with_unreadable(handoff)?;
+    // `doc_id` is the document id, but callers routinely pass a slug (the
+    // other doc tools take either). When no document has that id and one has
+    // that slug, read it as the slug and say so, rather than answer "nothing".
+    let mut doc_id_notes: Vec<String> = Vec::new();
+    let doc_id_is_slug = exact_doc_id
+        .filter(|id| !docs.iter().any(|d| d.id == *id) && docs.iter().any(|d| d.slug == *id));
+    if let Some(id) = doc_id_is_slug {
+        doc_id_notes.push(format!(
+            "doc_id '{id}' is a slug, not a document id; it was matched as a slug. \
+             Pass it as 'slug' to be exact."
+        ));
+    } else if let Some(id) = exact_doc_id {
+        if !docs.iter().any(|d| d.id == id) {
+            doc_id_notes.push(format!(
+                "no document has doc_id '{id}' (nor a slug of that name). doc_id is the \
+                 document id returned by doc_save/doc_list; pass 'slug' to look a document \
+                 up by its slug."
+            ));
+        }
+    }
     filter.retain(&mut docs);
     // Exact, case-sensitive, untrimmed; an empty string matches nothing.
     docs.retain(|d| {
-        exact_doc_id.is_none_or(|id| d.id == id) && exact_slug.is_none_or(|s| d.slug == s)
+        exact_doc_id.is_none_or(|id| {
+            if doc_id_is_slug.is_some() {
+                d.slug == id
+            } else {
+                d.id == id
+            }
+        }) && exact_slug.is_none_or(|s| d.slug == s)
     });
 
     let mut ordered_indices: Vec<usize> = if let Some(q) = query {
@@ -2539,7 +2565,8 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // warning strings `doc_save`/`trace_report` already surface via
     // `unreadable_doc_warnings`, so a caller sees the count/detail without
     // having to interpret the raw per-doc objects itself.
-    let doc_list_warnings = unreadable_doc_warnings(&unreadable);
+    let mut doc_list_warnings = unreadable_doc_warnings(&unreadable);
+    doc_list_warnings.extend(doc_id_notes);
 
     let unreadable_json: Vec<Value> = unreadable
         .into_iter()

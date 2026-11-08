@@ -274,7 +274,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "ids": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Return only these task ids (exact match; whitespace is trimmed, blanks and duplicates dropped; unknown ids are silently absent) plus the ancestors of each match so the tree stays connected. A matched parent keeps only the children that are themselves in ids, unless include_descendants is true. [] matches nothing. Combined with the other filters (AND). task_summary still counts every task. When fields is given, children is always kept for an ids selection, so a requested subtask never disappears behind its ancestor. Use this instead of listing all todo tasks when the task ids are already known."
+                        "description": "Return only these task ids (exact match; whitespace is trimmed, blanks and duplicates dropped; unknown ids are silently absent) plus the ancestors of each match so the tree stays connected. A matched parent keeps only the children that are themselves in ids, unless include_descendants is true. [] matches nothing. Combined with the other filters (AND). task_summary still counts every task. When fields is given, children is always kept for an ids selection (and for any other active filter), so a requested subtask never disappears behind its ancestor. Use this instead of listing all todo tasks when the task ids are already known."
                     },
                     "include_descendants": {
                         "type": "boolean",
@@ -283,12 +283,12 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Return at most this many top-level task_tree nodes (after the filters and ids), keeping each kept node's descendants. With include_children it applies per project. task_summary is unaffected. Omit for no cap."
+                        "description": "Return at most this many task_tree nodes (after the filters and ids), counted depth-first: a parent and each of its descendants count one each, so nested output is bounded too. With include_children it applies per project. When nodes were cut, the response carries task_tree_meta {truncated, limit, returned, matched}; it is absent otherwise. task_summary is unaffected. Omit for no cap."
                     },
                     "fields": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Keys to keep on each task node (duplicates collapse). Allowed: id, title, status, schedule, dependencies, order, assignee, lock, children. id is always kept. Keys a task does not have are omitted, never null. Without 'children' nodes carry no nested children, so include it to keep the tree. project_name/project_dir/task_ref from include_children are always kept. An unknown name is an error that lists the allowed names. Omit or [] for all keys."
+                        "description": "Keys to keep on each task node (duplicates collapse). Allowed: id, title, status, schedule, dependencies, order, assignee, lock, children. id is always kept. Keys a task does not have are omitted, never null. Without 'children' nodes carry no nested children (unless ids or another filter is active, which always keep them), so include it to keep the tree. project_name/project_dir/task_ref from include_children are always kept. An unknown name is an error that lists the allowed names. Omit or [] for all keys."
                     }
                 }
             }),
@@ -1626,7 +1626,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "task_id": { "type": "string", "description": "Filter: only documents linked to this task." },
                     "include_body": { "type": "boolean", "description": "Include each document's full body.", "default": false },
                     "query": { "type": "string", "description": "BM25 text search over title + tags + body." },
-                    "doc_id": { "type": "string", "description": "Exact match on the document id (case-sensitive, not trimmed; an empty string matches nothing). Combined with the other filters (AND). To fetch one known document, prefer this or slug over listing everything." },
+                    "doc_id": { "type": "string", "description": "Exact match on the document id (case-sensitive, not trimmed; an empty string matches nothing). If no document has that id but one has that slug, it is matched as the slug and warnings says so; if neither exists, warnings carries a hint. Combined with the other filters (AND). To fetch one known document, prefer this or slug over listing everything." },
                     "slug": { "type": "string", "description": "Exact match on the document slug (case-sensitive, not trimmed; an empty string matches nothing). Combined with the other filters (AND)." },
                     "limit": { "type": "integer", "minimum": 1, "description": "Return at most this many documents, taken from the front of the result (after filters and, when query is given, relevance ranking). Omit for no cap." },
                     "fields": { "type": "array", "items": { "type": "string" }, "description": "Metadata keys to keep on each document (duplicates collapse). Allowed: id, slug, title, doc_type, tags, scope_paths, parent_id, children, related, auto_inject, task_ids, layer, trace_profile, milestone, has_bom, line_ending, sections, section_count, created_at, updated_at, content_hash. An unknown name is an error that lists the allowed names. include_body still adds body after the projection. Omit or [] for all keys." }

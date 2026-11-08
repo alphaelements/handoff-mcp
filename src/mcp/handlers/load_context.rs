@@ -20,8 +20,8 @@ use crate::storage::session_target::{
     Relation, Resolution, TargetOp, EVENT_ADOPTED,
 };
 use crate::storage::sessions::{
-    adopt_session, read_session_entries, transition_session_file, OwnerStamp, SessionData,
-    SessionEntry,
+    adopt_session, read_session_entries, transition_session_checked, OwnerStamp, SeenSession,
+    SessionData, SessionEntry,
 };
 use crate::storage::task_scope;
 use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
@@ -196,7 +196,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     {
                         adopt_into(ctx, &sessions_dir, entry, &caller, "active")?
                     } else {
-                        transition_session_file(&entry.path, "active")?;
+                        transition_session_checked(
+                            &sessions_dir,
+                            &SeenSession::of(entry),
+                            "active",
+                        )?;
                         entry.data.clone()
                     };
                     record_transition(event, Some(&activated));
@@ -230,7 +234,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                         let activated = if caller.agent_id.is_some() {
                             adopt_into(ctx, &sessions_dir, entry, &caller, "active")?
                         } else {
-                            transition_session_file(&entry.path, "active")?;
+                            transition_session_checked(
+                                &sessions_dir,
+                                &SeenSession::of(entry),
+                                "active",
+                            )?;
                             entry.data.clone()
                         };
                         record_transition("session.activated", Some(&activated));
@@ -269,6 +277,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     warnings.extend(ownership_warnings);
 
     if let Some(warning) = history_limit_deprecation_warning(config.settings.history_limit) {
+        warnings.push(warning.into());
+    }
+
+    if let Some(warning) = crate::storage::tasks::overlong_task_dir_warning(&tasks_dir) {
         warnings.push(warning.into());
     }
 
@@ -679,7 +691,8 @@ fn ambiguous_message_text(
         if in_flight_here {
             msg.push_str(
                 " If that session is yours (after a restart, --continue or an MCP reconnect), \
-                 resume it with handoff_load_context(session_id=<id>, adopt:true) instead.",
+                 resume it with handoff_load_context(session_id=<the active session id listed \
+                 in in_flight_by, not the candidate's id>, adopt:true) instead.",
             );
         }
     }
@@ -1071,7 +1084,8 @@ fn version_mismatch_warning(handoff: &Path) -> Option<String> {
 /// `[settings] history_limit` stopped pruning sessions in v0.47.3 (it is
 /// replaced by the opt-in `session_prune_limit`). A config that still carries
 /// it — typically the `20` older `handoff_init` runs wrote — gets one warning
-/// per `load_context` call, with the exact command that removes the key.
+/// per `load_context` call; the hint says when removing the key is safe (an
+/// older binary prunes on a missing `history_limit`).
 fn history_limit_deprecation_warning(history_limit: Option<u32>) -> Option<StructuredWarning> {
     let value = history_limit?;
     Some(StructuredWarning {
@@ -1083,7 +1097,10 @@ fn history_limit_deprecation_warning(history_limit: Option<u32>) -> Option<Struc
              opt in to pruning."
         ),
         fix_hint: Some(
-            "handoff_update_config updates={\"settings.history_limit\": null} removes the key."
+            "A binary older than v0.47.3 treats a missing history_limit as 20 and prunes, so \
+             keep a large history_limit while any instance or clone sharing this .handoff/ \
+             still runs an older binary. Once all are upgraded, \
+             handoff_update_config updates={\"settings.history_limit\": null} removes the key."
                 .to_string(),
         ),
         affected_doc_ids: vec![],

@@ -3172,6 +3172,42 @@ fn doc_list_doc_id_and_slug_together_both_must_match() {
 }
 
 #[test]
+fn doc_list_doc_id_given_a_slug_resolves_it_and_says_so() {
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-a", "plan", "# A\n");
+    save_doc(&dir, "ws3-b", "plan", "# B\n");
+    let listed = list_docs(&dir, json!({ "doc_id": "ws3-b" }));
+    assert_eq!(doc_slugs(&listed), vec!["ws3-b"]);
+    let warnings = listed["warnings"].to_string();
+    assert!(
+        warnings.contains("is a slug") && warnings.contains("slug"),
+        "expected a hint to use `slug`: {warnings}"
+    );
+}
+
+#[test]
+fn doc_list_unknown_doc_id_returns_a_hint_instead_of_silence() {
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-a", "plan", "# A\n");
+    let listed = list_docs(&dir, json!({ "doc_id": "no-such-doc" }));
+    assert!(listed["documents"].as_array().unwrap().is_empty());
+    let warnings = listed["warnings"].to_string();
+    assert!(
+        warnings.contains("no-such-doc") && warnings.contains("slug"),
+        "expected a hint naming the id and the slug argument: {warnings}"
+    );
+}
+
+#[test]
+fn doc_list_doc_id_that_is_a_real_id_adds_no_hint() {
+    let (_tmp, dir) = setup_project();
+    let id = save_doc(&dir, "ws3-a", "plan", "# A\n");
+    let listed = list_docs(&dir, json!({ "doc_id": id }));
+    assert_eq!(doc_slugs(&listed), vec!["ws3-a"]);
+    assert!(listed["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn doc_list_slug_filter_combines_with_doc_type() {
     let (_tmp, dir) = setup_twelve_docs();
     let hit = list_docs(&dir, json!({ "slug": "ws3-doc-02", "doc_type": "plan" }));

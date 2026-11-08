@@ -4,14 +4,15 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use super::save_context::{append_session_event, prune_sessions_per_config};
+use super::save_context::{
+    append_session_event, prune_sessions_per_config, transition_group_member,
+};
 use super::{lineage, HandlerContext};
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::session_target::{own_active_group, Caller, OWNER_V};
 use crate::storage::sessions::{
-    generate_session_id, read_session_entries, transition_session_file, write_open_session,
-    SessionData,
+    generate_session_id, read_session_entries, write_open_session, SessionData,
 };
 use crate::storage::tasks::*;
 
@@ -59,9 +60,14 @@ fn write_imported_session(
 
 /// Close the caller's own active sessions (and ownerless ones) before an
 /// imported session replaces them. Another agent's active session is never
-/// closed by an import. Returns the id of the most recently updated session it
-/// closed, which the import continues.
-fn close_own_active_sessions(ctx: &HandlerContext, sessions_dir: &Path) -> Result<Option<String>> {
+/// closed by an import, and neither is one that changed hands since it was
+/// read (reported in `notes`). Returns the id of the most recently updated
+/// session it closed, which the import continues.
+fn close_own_active_sessions(
+    ctx: &HandlerContext,
+    sessions_dir: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<String>> {
     let worktree = ctx.project_dir.to_string_lossy().to_string();
     let caller = Caller {
         agent_id: ctx.agent_id.as_deref(),
@@ -70,7 +76,9 @@ fn close_own_active_sessions(ctx: &HandlerContext, sessions_dir: &Path) -> Resul
     let entries = read_session_entries(sessions_dir)?;
     let mut latest: Option<(Option<&str>, &str)> = None;
     for entry in own_active_group(&entries, &caller) {
-        transition_session_file(&entry.path, "closed")?;
+        if !transition_group_member(ctx, sessions_dir, entry, &caller, "closed", notes)? {
+            continue;
+        }
         append_session_event(
             &ctx.handoff_dir,
             "session.closed",
@@ -175,6 +183,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let mut session_saved = false;
     let mut prune_lines: Vec<String> = Vec::new();
+    let mut close_notes: Vec<String> = Vec::new();
     if let Some(session) = arguments.get("session") {
         let summary = session
             .get("summary")
@@ -186,7 +195,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         let closed_active = if skip_session_close {
             None
         } else {
-            close_own_active_sessions(ctx, &sessions_dir)?
+            close_own_active_sessions(ctx, &sessions_dir, &mut close_notes)?
         };
         let git_state = capture_git_state(project_dir)?;
         let now = Utc::now().to_rfc3339();
@@ -253,7 +262,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             let closed_active = if skip_session_close {
                 None
             } else {
-                close_own_active_sessions(ctx, &sessions_dir)?
+                close_own_active_sessions(ctx, &sessions_dir, &mut close_notes)?
             };
             let git_state = capture_git_state(project_dir)?;
             let now = Utc::now().to_rfc3339();
@@ -314,7 +323,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     if session_saved {
         msg.push_str("\n  Session saved: yes");
     }
-    for line in &prune_lines {
+    for line in prune_lines.iter().chain(&close_notes) {
         msg.push_str("\n  ");
         msg.push_str(line);
     }
@@ -420,7 +429,7 @@ fn create_task_recursive(
     let base_dir = parent_dir.unwrap_or(tasks_dir);
     let task_dir = base_dir.join(&dir_name);
 
-    create_task_dir_all(&task_dir)?;
+    create_task_dir_all(&task_dir, task_id)?;
 
     let now = Utc::now().to_rfc3339();
     let status = task_status(task_val);

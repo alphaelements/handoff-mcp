@@ -8,13 +8,13 @@ use super::{lineage, HandlerContext};
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::session_target::{
-    own_active_group, resolve_session_target, Caller, Resolution, Target, TargetOp,
-    EVENT_CLOSE_REFUSED,
+    own_active_group, ownerless_bulk_warning, resolve_session_target, Caller, Resolution, Target,
+    TargetOp, EVENT_CLOSE_REFUSED, EVENT_FOREIGN_CLOSE,
 };
 use crate::storage::sessions::{
     closed_head_ids, find_active_primary_session_id, generate_session_id, prune_closed_sessions,
-    read_session_entries, transition_session_file, update_session_at, write_session_with_status,
-    SessionData, SessionEntry,
+    read_session_entries, transition_session_checked, update_session_at, write_session_with_status,
+    SeenSession, SessionData, SessionEntry, SessionWriteError, WriteMode,
 };
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -73,7 +73,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         match resolve_session_target(&entries, &caller, Some(id), TargetOp::Pause, force) {
             Resolution::Target(t) => {
                 if let Some(entry) = entry_for(&entries, &t.id) {
-                    transition_session_file(&entry.path, "paused")?;
+                    transition_session_checked(&sessions_dir, &SeenSession::of(entry), "paused")
+                        .map_err(|e| write_refusal(ctx, e, "pause"))?;
                     total_paused = 1;
                     record_ownership_event(ctx, &t, reason);
                     notes.extend(t.warnings);
@@ -99,8 +100,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     } else if pause_all {
         for entry in own_active_group(&entries, &caller) {
-            transition_session_file(&entry.path, "paused")?;
-            total_paused += 1;
+            if transition_group_member(ctx, &sessions_dir, entry, &caller, "paused", &mut notes)? {
+                total_paused += 1;
+            }
         }
     }
 
@@ -146,7 +148,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let detected_scope = crate::storage::detect_session_scope(project_dir).to_string();
     let (scope, agent_id, worktree, parent_session_id) = if keep_active {
         let parent = if detected_scope == "worktree" {
-            find_active_primary_session_id(&sessions_dir)?
+            find_active_primary_session_id(&sessions_dir, ctx.agent_id.as_deref())?
         } else {
             None
         };
@@ -255,10 +257,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             Resolution::Target(t) => {
                 let entry = entry_for(&entries, &t.id)
                     .ok_or_else(|| anyhow::anyhow!("Session '{}' disappeared", t.id))?;
-                record_ownership_event(ctx, &t, reason);
-                notes.extend(t.warnings.iter().cloned());
-                // The caller's summary and decisions are applied whoever owns
-                // the session, but the branch/commit/dirty files describe the
+                // The caller's decisions are applied whoever owns the session
+                // (its summary too, except on a keep_active write into another
+                // agent's session, see `WriteMode::MergeForeign` below), but
+                // the branch/commit/dirty files describe the
                 // CALLER's checkout: stamping them onto another agent's or
                 // another worktree's session would mislead lineage inference.
                 let foreign_checkout = t.foreign_owner.is_some()
@@ -273,9 +275,22 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     updates.commit = entry.data.commit.clone();
                     updates.dirty_files = entry.data.dirty_files.clone();
                 }
+                // The session was chosen from the read at the top of this call;
+                // the write re-checks its owner under the sessions lock, so a
+                // session adopted in the meantime is not closed or rewritten.
+                let seen = SeenSession::of(entry);
                 if op == TargetOp::Close {
-                    let closed_path =
-                        update_session_at(&entry.path, &updates, Some(arguments), Some("closed"))?;
+                    let closed_path = update_session_at(
+                        &sessions_dir,
+                        &seen,
+                        &updates,
+                        Some(arguments),
+                        Some("closed"),
+                        WriteMode::Replace,
+                    )
+                    .map_err(|e| write_refusal(ctx, e, "close"))?;
+                    record_ownership_event(ctx, &t, reason);
+                    notes.extend(t.warnings.iter().cloned());
                     // A forced close carries its justification on the close
                     // event itself (SPEC-V0473-108 AC2).
                     let closed_detail = t.forced.then(|| {
@@ -295,8 +310,32 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     );
                     (1, Some(closed_path), Some(t.id))
                 } else {
-                    let updated_path =
-                        update_session_at(&entry.path, &updates, Some(arguments), None)?;
+                    // Rewriting another agent's active session must not erase
+                    // what its owner recorded: the caller's entries are added
+                    // and the owner's summary stays.
+                    let mode = if t.foreign_owner.is_some() {
+                        WriteMode::MergeForeign
+                    } else {
+                        WriteMode::Replace
+                    };
+                    let updated_path = update_session_at(
+                        &sessions_dir,
+                        &seen,
+                        &updates,
+                        Some(arguments),
+                        None,
+                        mode,
+                    )
+                    .map_err(|e| write_refusal(ctx, e, "update"))?;
+                    record_ownership_event(ctx, &t, reason);
+                    notes.extend(t.warnings.iter().cloned());
+                    if mode == WriteMode::MergeForeign {
+                        notes.push(format!(
+                            "Note: session {} belongs to another agent; your decisions, \
+                             checklist, notes and pointers were appended and its summary was kept.",
+                            t.id
+                        ));
+                    }
                     (0, Some(updated_path), Some(t.id))
                 }
             }
@@ -524,6 +563,78 @@ pub(super) fn record_ownership_event(ctx: &HandlerContext, target: &Target, reas
         ctx.agent_id.as_deref(),
         Some(detail),
     );
+}
+
+/// The error for a checked session write that did not happen because the
+/// session changed since this call read it (`op` is `close`, `pause` or
+/// `update`). A change of owner is logged like any other refused close; nothing
+/// was written either way. Errors that are not about the session changing pass
+/// through.
+pub(super) fn write_refusal(ctx: &HandlerContext, err: anyhow::Error, op: &str) -> anyhow::Error {
+    let past = match op {
+        "close" => "closed",
+        "pause" => "paused",
+        _ => "updated",
+    };
+    match err.downcast_ref::<SessionWriteError>() {
+        Some(SessionWriteError::OwnerChanged { id, owner }) => {
+            let owner = owner.as_deref().unwrap_or("none");
+            append_session_event_with_detail(
+                &ctx.handoff_dir,
+                EVENT_CLOSE_REFUSED,
+                Some(id),
+                ctx.agent_id.as_deref(),
+                Some(format!("op={op}; owner={owner}; changed_during_call=true")),
+            );
+            anyhow::anyhow!(
+                "Session {id} changed owner while this call was running (now owned by {owner}); \
+                 it was not {past} and nothing was saved."
+            )
+        }
+        Some(SessionWriteError::Gone { id }) => anyhow::anyhow!(
+            "Session {id} was closed or removed by another process while this call was \
+             running; it was not {past} and nothing was saved."
+        ),
+        None => err,
+    }
+}
+
+/// Move one session of a bulk group (`pause_active`, an import's close) to
+/// `to`. Returns whether it moved. A session that changed hands since the group
+/// was read is left alone and reported in `notes`; an ownerless one is moved
+/// with the same warning and `session.foreign_close` event a single-session
+/// close would produce.
+pub(super) fn transition_group_member(
+    ctx: &HandlerContext,
+    sessions_dir: &Path,
+    entry: &SessionEntry,
+    caller: &Caller<'_>,
+    to: &str,
+    notes: &mut Vec<String>,
+) -> Result<bool> {
+    let id = entry.data.id.as_deref().unwrap_or_default();
+    match transition_session_checked(sessions_dir, &SeenSession::of(entry), to) {
+        Ok(_) => {
+            if let Some(warning) = ownerless_bulk_warning(entry, caller) {
+                append_session_event_with_detail(
+                    &ctx.handoff_dir,
+                    EVENT_FOREIGN_CLOSE,
+                    Some(id),
+                    ctx.agent_id.as_deref(),
+                    Some("owner=none".to_string()),
+                );
+                notes.push(warning);
+            }
+            Ok(true)
+        }
+        Err(e) if e.downcast_ref::<SessionWriteError>().is_some() => {
+            notes.push(format!(
+                "Warning: session {id} was changed by another process ({e}); it was left as it is."
+            ));
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Error text for a close that matches several of the caller's own sessions.

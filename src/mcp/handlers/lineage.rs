@@ -27,7 +27,7 @@ use crate::storage::lineage::{
 use crate::storage::session_target::Caller;
 use crate::storage::sessions::{
     find_active_primary_session_id, ids_match, read_recent_closed_sessions, read_session_by_id,
-    read_sessions_by_status, SessionData, SessionEntry, RECENT_CLOSED_MAX,
+    read_sessions_by_status_lenient, SessionData, SessionEntry, SkippedSession, RECENT_CLOSED_MAX,
 };
 
 /// Commit subjects scanned for task ids.
@@ -155,10 +155,14 @@ pub struct PreviousRequest<'a> {
 /// Decide what the caller continues. Order: `continue_from`, then the caller's
 /// own active session's `continues`, then the head selection.
 pub fn resolve_previous(req: &PreviousRequest<'_>, warnings: &mut Vec<String>) -> Result<Previous> {
-    let closed = read_recent_closed_sessions(req.sessions_dir, RECENT_CLOSED_MAX)?;
+    // Closed sessions only feed lineage: a file that cannot be read (e.g. a git
+    // conflict marker) is reported and skipped rather than failing the call.
+    let read = read_recent_closed_sessions(req.sessions_dir, RECENT_CLOSED_MAX)?;
+    note_skipped(&read.skipped, warnings);
+    let closed = read.sessions;
 
     if let Some(wanted) = req.continue_from {
-        match find_closed(&closed, req.sessions_dir, wanted)? {
+        match find_closed(&closed, req.sessions_dir, wanted, warnings)? {
             Some(session) => return Ok(Previous::Explicit(session)),
             None => warnings.push(format!(
                 "Warning: continue_from '{wanted}' is not a closed session; choosing the \
@@ -168,7 +172,7 @@ pub fn resolve_previous(req: &PreviousRequest<'_>, warnings: &mut Vec<String>) -
     }
 
     if let Some(first) = req.own_active.and_then(|a| a.continues_ids().first()) {
-        if let Some(session) = find_closed(&closed, req.sessions_dir, first)? {
+        if let Some(session) = find_closed(&closed, req.sessions_dir, first, warnings)? {
             return Ok(Previous::FromActive(session));
         }
     }
@@ -176,7 +180,7 @@ pub fn resolve_previous(req: &PreviousRequest<'_>, warnings: &mut Vec<String>) -
     // A worktree session is created under the primary's active session and
     // continues it, so what it reports is that session's own previous session:
     // no scoring, no git, and no in-flight block for the orchestrator's claim.
-    if let Some(session) = primary_parent_previous(req, &closed)? {
+    if let Some(session) = primary_parent_previous(req, &closed, warnings)? {
         return Ok(Previous::FromActive(session));
     }
 
@@ -220,11 +224,14 @@ pub fn resolve_previous(req: &PreviousRequest<'_>, warnings: &mut Vec<String>) -
 fn primary_parent_previous(
     req: &PreviousRequest<'_>,
     closed: &[SessionData],
+    warnings: &mut Vec<String>,
 ) -> Result<Option<SessionData>> {
     if crate::storage::detect_session_scope(&req.ctx.project_dir) != "worktree" {
         return Ok(None);
     }
-    let Some(parent_id) = find_active_primary_session_id(req.sessions_dir)? else {
+    let Some(parent_id) =
+        find_active_primary_session_id(req.sessions_dir, req.ctx.agent_id.as_deref())?
+    else {
         return Ok(None);
     };
     let first = req
@@ -233,7 +240,7 @@ fn primary_parent_previous(
         .find(|e| e.status == "active" && e.data.id.as_deref() == Some(parent_id.as_str()))
         .and_then(|e| e.data.continues_ids().first());
     match first {
-        Some(first) => find_closed(closed, req.sessions_dir, first),
+        Some(first) => find_closed(closed, req.sessions_dir, first, warnings),
         None => Ok(None),
     }
 }
@@ -296,6 +303,7 @@ fn find_closed(
     recent: &[SessionData],
     sessions_dir: &Path,
     wanted: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<SessionData>> {
     let pick = |list: &[SessionData]| -> Option<SessionData> {
         let exact = list.iter().find(|s| s.id.as_deref() == Some(wanted));
@@ -313,7 +321,19 @@ fn find_closed(
     if let Some(found) = pick(recent) {
         return Ok(Some(found));
     }
-    Ok(pick(&read_sessions_by_status(sessions_dir, "closed")?))
+    let all = read_sessions_by_status_lenient(sessions_dir, "closed")?;
+    note_skipped(&all.skipped, warnings);
+    Ok(pick(&all.sessions))
+}
+
+/// One warning per unreadable closed file, however many reads hit it.
+fn note_skipped(skipped: &[SkippedSession], warnings: &mut Vec<String>) {
+    for file in skipped {
+        let warning = file.warning();
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
 }
 
 /// Task ids named by `branch` and by the latest [`SUBJECT_DEPTH`] commit

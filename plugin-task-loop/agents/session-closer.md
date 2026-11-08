@@ -45,7 +45,7 @@ shown; a flat flag for a nested field can be silently dropped by some actions.
 |---|---|---|
 | `handoff_get_task` | `handoff-mcp task get --task-id <id> --project-dir .` | read-only; use it to read a task back |
 | `handoff_check_criterion` | `handoff-mcp task check --task-id <id> --criterion-index <n> --checked true --project-dir .` | `<n>` is the 0-based index |
-| `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","status":"done"}' --project-dir .` | status; `schedule_stale` / `plan_update_needed` lines are printed after the JSON echo |
+| `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","status":"done"}' --project-dir .` | status; the `schedule_stale` / `plan_update_needed` lines are printed after the `Updated task …` line (the output is not a JSON echo) |
 | `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","requirement_ids":["<stable_id>"]}' --project-dir .` | `requirement_ids` REPLACES the whole link set: pass the already-linked ids plus the new ones |
 | `handoff_trace_update` | `handoff-mcp trace update --task-id <id> --ops '[{"op":"link","item":"<stable_id>","role":"implements"},{"op":"set","item":"<stable_id>","dev_stage":"implemented"}]' --project-dir .` | exits with exit code 1 when any op `failed` (see below) |
 | `handoff_doc_verify` | `handoff-mcp doc verify --doc-id <doc_id> --action set_dev_stage --sub-item-id <stable_id> --dev-stage <stage> --project-dir .` | plan SubItem stage (Step 5) |

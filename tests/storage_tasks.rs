@@ -203,9 +203,25 @@ fn long_slug_dir_name_fits_filesystem_limit_and_resolves_by_id() {
 fn create_task_dir_all_error_reports_name_byte_length() {
     let dir = setup();
     let too_long = dir.path().join("t1-".to_string() + &"a".repeat(300));
-    let err = create_task_dir_all(&too_long).unwrap_err().to_string();
+    let err = create_task_dir_all(&too_long, "t1")
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("dir name is 303 bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(err.contains("slug is 300 bytes"), "unexpected error: {err}");
+}
+
+#[test]
+fn create_task_dir_all_error_counts_the_slug_after_an_id_containing_a_dash() {
+    let dir = setup();
+    let too_long = dir.path().join("t-vfix.4-".to_string() + &"a".repeat(300));
+    let err = create_task_dir_all(&too_long, "t-vfix.4")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("dir name is 309 bytes"),
         "unexpected error: {err}"
     );
     assert!(err.contains("slug is 300 bytes"), "unexpected error: {err}");

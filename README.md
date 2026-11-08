@@ -478,6 +478,10 @@ appends any missing line the first time it writes the matching kind of file
 /runs/_latest.json
 # Derived index of the trace baselines (the baseline records themselves are tracked).
 /trace/baselines/_index.json
+# Generated PDFs and their Typst sources.
+/exports/
+# Transient mermaid render cache used by PDF export.
+.mermaid-cache/
 ```
 
 ### What to track
@@ -513,6 +517,25 @@ This works for pattern A and pattern B alike.
   earlier that works on the same `.handoff/` rewrites files in the old shape:
   it can drop the session `continues` link and write back the memory usage
   counters (`hit_count`, `last_referenced_at`) that newer versions removed.
+
+### Very long task directory names
+
+Task directories are named `{task_id}-{slug}`. Since v0.47.3 the slug is capped
+at 120 bytes, but older versions could create names longer than the 255 bytes
+most filesystems allow (typically from long titles written in multi-byte
+characters, created on a filesystem that counts characters rather than bytes).
+Git can then fail to check such a directory out on Linux, and copying `.handoff/`
+to another filesystem can fail the same way. `handoff_load_context` reports
+the number of affected directories and one example in its `warnings`.
+
+Rename each one to a shorter name that keeps the `{task_id}-` prefix; a task is
+found by that prefix, and the task file inside is unchanged:
+
+```bash
+git -C .handoff mv 'tasks/t12-<very long name>' tasks/t12-short-name
+```
+
+For a subtask, rename the directory inside its parent's directory the same way.
 
 ## Tools
 
@@ -1047,7 +1070,7 @@ MCP tool from a hook directly, with no wrapper script. In
 ```
 
 (`server` must match the name you registered handoff-mcp under — `handoff` in the
-[Setup](#setup) examples.)
+[Setup](#setup-non-plugin) examples.)
 
 **Wrapper script fallback.** If your Claude Code version doesn't support the
 `mcp_tool` hook type, use the bundled `command` wrapper

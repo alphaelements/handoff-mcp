@@ -1872,6 +1872,16 @@ test('closer-reported warnings and incomplete task coverage are propagated to wa
   );
 });
 
+test('a task missing from tasks_processed (no closer error) is listed in closer_failed_tasks', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    { closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'done' }] } },
+  );
+  assert.equal(r.passed, true, 'closer gap must not fail the session');
+  assert.ok(!r.closer_report.error, 'this is the no-closer-error case');
+  assert.deepEqual(r.closer_failed_tasks, ['t2']);
+});
+
 // WS1 / t430: a closer that could not write must not look like a clean close-out.
 test('the closer schema exposes optional ops_failed and unexecuted_ops per task', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });

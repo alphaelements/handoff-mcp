@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.3] — 2026-11-08
+
+### Behavior changes
+
+This patch release changes several defaults. Each item below says what changed,
+how to get the old behavior back (or that there is no switch), and what to
+watch for when an older binary is used against the same `.handoff/`. The
+detailed entries under Changed, Added and Fixed further down describe the same
+changes in full.
+
+**Running an older binary against the same `.handoff/`** (a second clone, a Mac
+host and a container sharing one directory, or the VS Code extension next to an
+updated server): every instance should be updated together. Until then, a binary
+from v0.47.2 or earlier:
+- keeps pruning sessions automatically: it reads `settings.history_limit`, which
+  this release ignores, and it treats a missing `history_limit` as 20, so sessions
+  kept by v0.47.3 can still be deleted. Keep a large `history_limit` in
+  `config.toml` (accepting the `DEPRECATED_HISTORY_LIMIT` warning) until every
+  instance and clone is upgraded, and do not remove the key before then;
+- rewrites session files without `continues` / `lineage_v` (it does not keep
+  unknown fields), so the affected sessions fall back to one chronological
+  lineage and `previous_session` selection degrades to the old behavior;
+- writes `hit_count` / `last_referenced_at` back into memory files whenever it
+  injects a memory;
+- knows nothing about session owners, `adopt` or `force_other_owner`. The VS Code
+  extension's `forkSession` also creates sessions with no owner; an ownerless
+  session can be operated on by anyone, as before;
+- exits 0 from `trace update` even when an op failed.
+
+The `.handoff/version` marker is written only by `handoff_init`, and
+`handoff_load_context` warns when it differs from the running binary. That is a
+notice, not a guard: it does not stop or reconcile a mixed-version setup.
+
+- **`load_context` returns a compact `task_tree` by default.** Only the tasks that
+  belong to the session are listed (see `scope_reason`); the rest is counted in
+  `task_tree_meta`. Restore: pass `task_tree: "full"` to get the complete tree
+  exactly as before; `settings.compact_task_limit` (default 40) raises or lowers
+  the compact cap; `task_scope` adds tasks to the compact tree. Older binaries
+  always return the full tree.
+- **`session_guidance.suggested_fields.related_task_ids` is narrowed.** It holds
+  the tasks in flight, the previous session's unfinished tasks and your claimed
+  tasks (at most 20, `related_task_ids_truncated: true` when more exist) instead
+  of every todo. Restore: there is no switch; list the tasks with
+  `handoff_list_tasks` and pass the IDs you want in `related_task_ids` when saving.
+- **`agent_id` is stable for the life of the MCP process.** It is taken from
+  `CLAUDE_CODE_SESSION_ID`, then `CLAUDE_SESSION_ID`, and otherwise generated once
+  per process (`agent.registered` is no longer logged repeatedly for the same
+  ID). `/clear`, sub-agents and child processes that inherit the environment
+  share one `agent_id`, so they are not protected from each other; separate
+  windows are separate agents. Restore: there is no switch. To give a process a
+  fresh identity, start it without those two variables set. An older binary
+  generates a new `agent_id` per process start and ignores the variables.
+- **Other agents' sessions are protected, and fork/merge ownership changes.**
+  Implicit targets (a closed save, `keep_active`, `update_session`,
+  `import_context`, `auto_schedule`, `load_context`) only act on your own active
+  session, whatever `multi_session` says. Closing or pausing another agent's
+  active session by ID is refused with an error and a `session.close_refused`
+  event. `fork_session` makes the caller the owner of the fork; `merge_sessions`
+  only sets the target's owner when it has none, and `keep_active` never
+  overwrites an existing owner (onto another agent's session it appends and
+  keeps the owner's summary). Restore: pass `force_other_owner: true` with a
+  `reason` to close or pause another agent's active session; take over a paused
+  session with `load_context session_id=<id>` and an active one with
+  `adopt: true` (candidates are listed as `adoptable_sessions`). Sessions with no
+  owner (written by older versions or the VS Code extension) stay operable by
+  anyone.
+- **`previous_session` is chosen by lineage, not by date.** New sessions record
+  `continues`; `load_context` returns the latest session of your lineage
+  (`inferred: true` with `evidence`), or `ambiguous: true` with `other_heads` when
+  it cannot tell. Restore: pass `continue_from: "<session id>"` to `load_context`
+  to choose the previous session yourself; `continues` / `lineage_token` on
+  `save_context` override what is recorded. Sessions written by older versions
+  count as one chronological lineage.
+- **Sessions are no longer deleted automatically.** `settings.history_limit` is
+  deprecated and ignored (`load_context` warns `DEPRECATED_HISTORY_LIMIT` while
+  it is present; once every instance sharing the `.handoff/` runs v0.47.3 or
+  later, remove it with `handoff_update_config`
+  `{"settings.history_limit": null}`), and `handoff_init` no longer writes it
+  (a binary older than v0.47.3 treats the missing key as 20 and prunes).
+  Restore: set `settings.session_prune_limit` to opt in to pruning (lineage heads
+  are always kept, so more sessions than the limit can remain). Side effect: the
+  session list grows without bound, and `load_context` reads at most the newest
+  100 sessions.
+- **Memory usage statistics are removed.** `hit_count` and `last_referenced_at`
+  are no longer tracked, so reading memories never rewrites a memory file.
+  Restore: there is no switch; run a v0.47.2 binary if you need the counters.
+  Existing counters can be removed from memory files with
+  `handoff-mcp memory strip-usage-stats --apply` (a dry run without `--apply`).
+- **`stale` memories are chosen by `updated_at`**, not by last injection, and are
+  review candidates only. Restore: there is no switch; `settings.memory_stale_days`
+  still sets the age threshold. A v0.47.2 binary keeps ranking by last injection.
+- **`memory_cleanup` no longer merges exact duplicates by default.**
+  `apply_exact_merges` now defaults to `false`, so the cleanup hook is read-only.
+  Restore: pass `apply_exact_merges: true` to `handoff_memory_cleanup`.
+- **`memory_injected_gc_days = 0` means "never delete injection records".** It used
+  to delete every record on each cleanup. The default stays 14. Restore: there is
+  no value that deletes everything; set a small positive number such as `1` for
+  the shortest retention window.
+- **A `plan` document's layer is only inferred when the document is created.**
+  With `[trace] auto_layer = true`, a layer is inferred from `doc_type` only for a
+  new document saved without `layer`; appending to or editing an existing
+  document (including a `plan`) no longer adds one. Restore: pass `layer`
+  explicitly (for example `layer: "<layer id>"`) when you want a layer on an
+  existing document.
+- **`trace update` exits 1 when an op failed.** A partial success also exits 1;
+  resend only the ops not listed in `applied`. Restore: there is no switch; a
+  script that must keep going can ignore the exit status and read `failed` and
+  `applied` from the printed JSON.
+
 ### Changed
 - **Machine-local files under `.handoff/` are git-ignored**: `handoff_init`
   now writes a recommended `.handoff/.gitignore`, and on existing projects
@@ -17,7 +126,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/timer/`, `/memory/injected/` and `/docs/injected/`, next to the derived
   files that were already ignored (`/docs/_task_ids_rebuild.json`,
   `/docs/_requirements_summary.json`, `/docs/_trace_report.json`,
-  `/runs/_latest.json`, `/trace/baselines/_index.json`). Files that are already
+  `/runs/_latest.json`, `/trace/baselines/_index.json`). `handoff_init` also
+  writes `/exports/` (generated PDFs and their Typst sources) and
+  `.mermaid-cache/`. The file is read and compared as bytes, so a `.gitignore`
+  in another encoding, with a BOM or with CRLF line endings is appended to
+  without being altered, and a symlinked `.gitignore` stays a symlink. Failing
+  to update it never fails the operation that triggered it; a warning is
+  printed on stderr once per path instead. Files that are already
   tracked stay tracked; stop tracking them once with
   `git -C .handoff rm -r --cached --ignore-unmatch -q -- '*.lock' agents timer memory/injected docs/injected`
   and commit. The README has a new "Managing `.handoff/` in Git" section
@@ -38,7 +153,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session. Closing/pausing another agent's active session by ID is refused with
   an error (a `session.close_refused` event is logged); pass
   `force_other_owner: true` with a `reason` to override. Another agent's
-  paused/open session can still be discarded by ID.
+  paused/open session can still be discarded by ID. A `keep_active` save that
+  reaches another agent's active session (by `session_id`) appends your
+  decisions, checklist items, notes, pointers and blockers and keeps the
+  owner's summary and checkout state instead of replacing them. A close, a
+  pause, a `keep_active` save, `update_session` and a `load_context` activation
+  re-check the session's owner under a lock at write time: a session another
+  agent adopted during the call is left
+  untouched, the call fails with nothing written, and `session.close_refused`
+  is logged. `pause_active` and an import that close a session with no
+  recorded owner now warn and log `session.foreign_close`, like a close by ID.
+- A worktree session is auto-parented only to the caller's own (or an
+  ownerless) active primary session, never to another agent's; the same rule
+  decides which primary session's lineage `load_context` reports in a worktree.
 - **`multi_session = false` now counts only your own sessions** when deciding
   whether another active session blocks a new one.
 - `load_context` lists other agents' active/paused sessions as
@@ -65,16 +192,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions can exceed the limit (a warning says by how many).
 - Mixing in a binary older than this version rewrites session files without
   `continues`; those sessions fall back to one chronological lineage.
+- **Task directory slugs are cut to 120 bytes**: the slug part of
+  `{task_id}-{slug}` is truncated on a UTF-8 character boundary, so a long
+  Japanese title (or a 4-byte character) no longer makes the directory name
+  exceed the filesystem's 255-byte limit. When creating the directory still
+  fails, the error now reports the directory-name and slug byte lengths. Task
+  directories that already exist keep their names; one left over from an earlier
+  version whose name is longer than 255 bytes is reported as a warning instead of
+  being skipped silently.
+- **Session file names normalize symbols**: in the slug part of a session file
+  name, non-ASCII symbols, punctuation, spaces and emoji become `-` (letters and
+  digits of any script stay), and NFD combining marks (a voiced-sound mark or
+  accent written as a separate code point) stay attached to the character they
+  follow. Existing session files are not renamed.
+- **`fork_session` and `import_context` now log `session.created`**, like
+  `save_context` does, so `handoff_events` shows every new session. For a fork
+  the event detail records the source session and its owner, worktree and scope.
+- **The CLI no longer registers an agent on `session load`**: `handoff-mcp
+  session load` used to write an agent record under `.handoff/agents/` on every
+  call; its output now carries no `agent_id`. A CLI call has no identity of its
+  own, so pass `--session-id` when you must name a session. New sessions store
+  the full commit hash.
 - **`handoff_doc_list` can fetch one document and trim its output**: new
   `doc_id` / `slug` (exact match), `limit` and `fields` (metadata keys to keep;
-  an unknown name is an error that lists the allowed ones). Without them the
-  output is unchanged.
+  an unknown name is an error that lists the allowed ones). A `doc_id` that no
+  document has but that is some document's slug is matched as the slug, with a
+  warning; a `doc_id` that matches nothing returns a hint in `warnings`. Without
+  them the output is unchanged.
 - **`handoff_list_tasks` can fetch specific tasks and trim its output**: new
   `ids` (the listed tasks plus their ancestors), `include_descendants` (with
   `ids`, a listed task keeps its whole subtree, still narrowed by the other
-  filters), `limit` (top-level nodes) and `fields` (an `ids` match always
-  stays visible, even without `children`). Without them the output is
-  unchanged. The `/session-loop` procedure now fetches the tasks you name by
+  filters), `limit` and `fields`. `limit` counts nodes depth-first, a parent and
+  each of its descendants one each, so nested output is bounded too (with
+  `include_children` it applies per project); when it cut nodes the response
+  carries `task_tree_meta` (`truncated`, `limit`, `returned`, `matched`). With
+  `fields`, `children` is always kept while `ids` or any other filter is
+  active, so a matching subtask stays visible below its ancestor. Without them
+  the output is unchanged. The `/session-loop` procedure now fetches the tasks you name by
   `ids` with `include_descendants` instead of listing every todo task, so a
   named parent task selects its unfinished subtasks.
 - **`handoff_load_context` returns a compact `task_tree` by default**: instead
@@ -87,7 +241,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the latest commit subjects (`branch`), the current milestone's todos
   (`milestone`) and the highest-priority todos without a milestone
   (`priority`). Everything else is counted in the new `task_tree_meta`
-  (`omitted_total`, `omitted_by_status`, `truncated`, `hint`).
+  (`omitted_total`, `omitted_by_status`, `omitted_without_milestone` (open
+  tasks only), `truncated`, `hint`).
   `task_summary` still counts every task. Fetch the rest with
   `handoff_list_tasks`, or pass `task_tree: "full"` to get the complete tree
   exactly as before. The new setting `settings.compact_task_limit` (default 40)
@@ -129,6 +284,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test).
 
 ### Added
+- **`handoff_bulk_update_tasks` accepts `id` as an alias of `task_id`** in an
+  `updates[]` element. Giving both with different values is an error
+  (`conflicting task ids`) instead of silently preferring one, and the
+  `missing task_id` error now shows the expected element shape.
 - **`handoff-mcp memory strip-usage-stats`** (MCP tool
   `handoff_memory_strip_usage_stats`): opt-in migration that removes the
   obsolete `hit_count` / `last_referenced_at` keys from existing memory files.
@@ -140,6 +299,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes the counters back.
 
 ### Fixed
+- **Session writes re-check the owner under a lock**: closing, pausing,
+  updating or activating a session re-reads it under the sessions lock and
+  re-checks its owner. A session that another agent adopted during the call is
+  no longer closed by the old owner; the call fails with no side effects and
+  logs `session.close_refused`. `update_session` applies its change to the
+  freshly read session, so concurrent appends are no longer lost.
+- **A save onto another agent's active session no longer erases it**: a
+  `keep_active` or `session_id` save onto another agent's active session now
+  appends your decisions, checklist, notes, pointers and blockers and keeps the
+  owner's summary and checkout state (it used to replace them).
+- A worktree session is auto-parented only to the caller's own (or an
+  ownerless) primary session, never another agent's.
+- Closed session files that cannot be read (for example git conflict markers)
+  are skipped with a warning instead of failing `save_context` or the
+  `load_context` lineage lookup.
+- `pause_active` and `import_context` warn and log `session.foreign_close`
+  when they act on a session with no recorded owner.
+- `handoff_list_tasks`: filters combined with `fields` no longer drop matching
+  subtasks, and `limit` now counts nodes depth-first including nested children
+  (`task_tree_meta` is added when the output was truncated).
+  `handoff_doc_list` accepts a slug in `doc_id` (with a warning) and returns a
+  hint for an unknown `doc_id`.
+- `.handoff/.gitignore` maintenance never fails a write: a non-UTF-8 file, a
+  BOM or a symlink is handled, and a failure only produces a warning. The
+  recommended `.gitignore` also lists `/exports/` and `.mermaid-cache/`.
 - **Workflow sub-agents can reach handoff**: `session-closer`,
   `session-spec-writer` and `session-spec-reconciler` list the handoff MCP
   tools (`mcp__handoff__*` and `mcp__plugin_handoff-mcp_handoff__*`) in their
@@ -148,8 +332,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains per-task `ops_failed` / `unexecuted_ops`; a non-empty one adds a
   `closer_failed:` warning and the task id to the new `closer_failed_tasks`.
 - `task update --requirement-ids` / `--requirement-roles` were silently
-  dropped; they now reach the task. `doc update-section --seq N` no longer
+  dropped; they now reach the task. Because `requirement_ids` replaces the
+  task's whole link set, an empty value (`--requirement-ids ""`, a stray comma)
+  is rejected with an error instead of removing every link; pass `'[]'` to clear
+  them on purpose. `doc update-section --seq N` no longer
   fails with "'seq' is required".
+- A closed session file that cannot be read or parsed (for example one left
+  with Git conflict markers) no longer makes `save_context` or `load_context`
+  fail: it is skipped for lineage and named in a warning.
+- `update_session` applies its change to the session as it is on disk under
+  the sessions lock, so two concurrent appends no longer lose one of them.
 
 ## [0.47.2] — 2026-11-01
 

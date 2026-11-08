@@ -69,19 +69,71 @@ fn parse_include_descendants(arguments: &Value) -> Result<bool> {
     }
 }
 
-/// Keeps only the first `limit` top-level nodes (each with its descendants).
-fn apply_limit(mut tree: Vec<TaskIndex>, limit: Option<usize>) -> Vec<TaskIndex> {
-    if let Some(limit) = limit {
-        tree.truncate(limit);
+/// Node counts seen by [`apply_limit`], summed over every project listed.
+#[derive(Default)]
+struct LimitStats {
+    matched: usize,
+    returned: usize,
+}
+
+impl LimitStats {
+    /// `task_tree_meta` for the response, only when `limit` actually cut nodes:
+    /// a response that fits (or has no limit) keeps its pre-existing shape.
+    fn meta(&self, limit: Option<usize>) -> Option<Value> {
+        let limit = limit?;
+        (self.returned < self.matched).then(|| {
+            json!({
+                "truncated": true,
+                "limit": limit,
+                "returned": self.returned,
+                "matched": self.matched,
+            })
+        })
     }
-    tree
+}
+
+fn count_nodes(tree: &[TaskIndex]) -> usize {
+    tree.iter().map(|n| 1 + count_nodes(&n.children)).sum()
+}
+
+/// Keeps nodes in depth-first (pre-order) order while `budget` lasts: a node
+/// costs 1 and its children are cut to what is left, so nested output is
+/// bounded too.
+fn take_nodes(tree: Vec<TaskIndex>, budget: &mut usize) -> Vec<TaskIndex> {
+    let mut kept = Vec::new();
+    for mut node in tree {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        node.children = take_nodes(std::mem::take(&mut node.children), budget);
+        kept.push(node);
+    }
+    kept
+}
+
+/// Keeps the first `limit` nodes of `tree` counted depth-first (children
+/// included), recording matched/returned counts in `stats`.
+fn apply_limit(
+    tree: Vec<TaskIndex>,
+    limit: Option<usize>,
+    stats: &mut LimitStats,
+) -> Vec<TaskIndex> {
+    let Some(limit) = limit else {
+        return tree;
+    };
+    stats.matched += count_nodes(&tree);
+    let mut budget = limit;
+    let kept = take_nodes(tree, &mut budget);
+    stats.returned += limit - budget;
+    kept
 }
 
 /// Projects task-node JSON down to `fields` (plus [`ALWAYS_KEPT_KEYS`]).
 /// `children` is kept, and projected recursively, only when requested or when
-/// `force_children` is set (an `ids` selection: the matched task may sit below
-/// an ancestor kept only for connectivity, and dropping `children` would leave
-/// that ancestor alone in the result).
+/// `force_children` is set (an `ids` selection or any other active filter: a
+/// matched task may sit below an ancestor kept only for connectivity, and
+/// dropping `children` would leave that ancestor alone in the result).
 fn project_nodes(nodes: Vec<Value>, fields: &[String], force_children: bool) -> Vec<Value> {
     let keep_children = force_children || fields.iter().any(|f| f == "children");
     nodes
@@ -193,7 +245,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     } else {
         tree
     };
-    let filtered_tree = apply_limit(filtered_tree, limit);
+    let mut limit_stats = LimitStats::default();
+    let filtered_tree = apply_limit(filtered_tree, limit, &mut limit_stats);
+    // A narrowed listing keeps `children` through a `fields` projection, or the
+    // subtasks that matched would vanish behind their ancestors.
+    let keep_matched_children = filters.any_active();
 
     let include_children = arguments
         .get("include_children")
@@ -201,10 +257,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .unwrap_or(false);
 
     if !include_children {
-        let result = serde_json::json!({
-            "task_tree": nodes_to_json(&filtered_tree, fields.as_deref(), ids.is_some())?,
+        let mut result = serde_json::json!({
+            "task_tree": nodes_to_json(&filtered_tree, fields.as_deref(), keep_matched_children)?,
             "task_summary": summary,
         });
+        insert_limit_meta(&mut result, &limit_stats, limit);
         return serde_json::to_string_pretty(&result).context("Failed to serialize task list");
     }
 
@@ -250,7 +307,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         } else {
             child_tree
         };
-        let child_filtered = apply_limit(child_filtered, limit);
+        let child_filtered = apply_limit(child_filtered, limit, &mut limit_stats);
 
         let child_dir_str = child_dir.to_string_lossy().to_string();
         aggregated.extend(annotate_tasks_json(
@@ -262,15 +319,22 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
 
     if let Some(fields) = fields.as_deref() {
-        aggregated = project_nodes(aggregated, fields, ids.is_some());
+        aggregated = project_nodes(aggregated, fields, keep_matched_children);
     }
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "task_tree": aggregated,
         "task_summary": total_summary,
     });
+    insert_limit_meta(&mut result, &limit_stats, limit);
 
     serde_json::to_string_pretty(&result).context("Failed to serialize task list")
+}
+
+fn insert_limit_meta(result: &mut Value, stats: &LimitStats, limit: Option<usize>) {
+    if let Some(meta) = stats.meta(limit) {
+        result["task_tree_meta"] = meta;
+    }
 }
 
 fn merge_summary(base: &mut TaskSummary, other: &TaskSummary) {

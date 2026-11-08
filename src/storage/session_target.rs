@@ -211,6 +211,25 @@ fn resolve_explicit(
     }
 }
 
+/// The warning for modifying a session that has no recorded owner.
+fn ownerless_warning(id: &str) -> String {
+    format!(
+        "Warning: session {id} has no recorded owner (created before ownership tracking \
+         or by the CLI); it was modified without an ownership check."
+    )
+}
+
+/// What a bulk operation over [`own_active_group`] (`pause_active`, the
+/// import's close) owes the user for taking `e`: the same warning
+/// [`resolve_session_target`] gives for an ownerless session, and the caller
+/// logs [`EVENT_FOREIGN_CLOSE`] with it. `None` when the session is the
+/// caller's own, or when neither side has an identity (CLI), where nothing is
+/// reported either.
+pub fn ownerless_bulk_warning(e: &SessionEntry, caller: &Caller<'_>) -> Option<String> {
+    (caller.agent_id.is_some() && caller.relation(&e.data) == Relation::Unowned)
+        .then(|| ownerless_warning(&entry_id(e)))
+}
+
 /// Build the [`Target`] (or refusal) for one concrete session.
 fn classify(e: &SessionEntry, caller: &Caller<'_>, op: TargetOp, force: bool) -> Resolution {
     let id = entry_id(e);
@@ -232,10 +251,7 @@ fn classify(e: &SessionEntry, caller: &Caller<'_>, op: TargetOp, force: bool) ->
         (Relation::Unowned, Some(_)) if op == TargetOp::Select => {}
         (Relation::Unowned, Some(_)) => {
             target.event = Some(op.foreign_event());
-            target.warnings.push(format!(
-                "Warning: session {id} has no recorded owner (created before ownership tracking \
-                 or by the CLI); it was modified without an ownership check."
-            ));
+            target.warnings.push(ownerless_warning(&id));
         }
         (Relation::Foreign, None) => {
             target.foreign_owner = owner;

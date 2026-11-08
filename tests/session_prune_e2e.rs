@@ -173,6 +173,27 @@ fn load_warnings(server: &mut Server, pd: &str) -> Vec<Value> {
     v["warnings"].as_array().cloned().unwrap_or_default()
 }
 
+/// The deprecation hint must not tell the user to delete the key while an older
+/// binary may share the `.handoff/` (it would prune on a missing value).
+#[test]
+fn deprecation_hint_warns_about_older_binaries_before_removing_the_key() {
+    let (_tmp, pd) = legacy_project();
+    let mut server = Server::spawn();
+    let warnings = load_warnings(&mut server, &pd);
+    let w = warnings
+        .iter()
+        .find(|w| w["code"] == "DEPRECATED_HISTORY_LIMIT")
+        .expect("legacy history_limit must be warned about");
+    let hint = w["fix_hint"].as_str().unwrap();
+    assert!(hint.contains("older than v0.47.3"), "{hint}");
+    assert!(hint.contains("as 20 and prunes"), "{hint}");
+    assert!(hint.contains("keep a large history_limit"), "{hint}");
+    assert!(
+        hint.contains("Once all are upgraded"),
+        "removal must be conditional: {hint}"
+    );
+}
+
 fn has_deprecation_warning(warnings: &[Value]) -> bool {
     warnings
         .iter()

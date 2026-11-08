@@ -300,13 +300,73 @@ fn agent_id_is_only_overwritten_when_the_owner_is_none() {
     assert_eq!(session_id_of(&text), a_sid);
     let a_session = session_by_id(dir.path(), "active", &a_sid).unwrap();
     assert_eq!(a_session["agent_id"], "agent-a", "owner is not rewritten");
-    assert_eq!(a_session["summary"], "B edits");
+    assert_eq!(
+        a_session["summary"], "A v1",
+        "the owner's summary is not replaced by a foreign write"
+    );
     assert_eq!(sessions(dir.path(), "active").len(), 1, "no extra session");
     assert!(events(dir.path(), "session.close_refused").is_empty());
     let writes = events(dir.path(), "session.foreign_write");
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0]["agent_id"], "agent-b");
     assert_eq!(writes[0]["session_id"], a_sid.as_str());
+}
+
+#[test]
+fn foreign_keep_active_write_appends_and_never_erases_the_owners_content() {
+    let dir = project();
+    let mut a = Server::spawn("agent-a", dir.path());
+    let mut b = Server::spawn("agent-b", dir.path());
+    let a_sid = a.start("A v1");
+    a.ok(
+        "handoff_save_context",
+        json!({
+            "summary": "A v2",
+            "session_status": "active",
+            "decisions": [
+                { "decision": "A1", "reason": "r", "confidence": "high" },
+                { "decision": "A2", "reason": "r", "confidence": "high" }
+            ],
+            "checklist": [{ "item": "A task", "checked": true, "owner": "ai" }],
+            "handoff_notes": [{ "note": "A note", "category": "context" }],
+            "context_pointers": [{ "path": "src/a.rs", "reason": "A" }]
+        }),
+    );
+
+    let text = b.ok(
+        "handoff_save_context",
+        json!({
+            "summary": "B overwrites",
+            "session_status": "active",
+            "session_id": a_sid,
+            "decisions": [{ "decision": "B1", "reason": "r", "confidence": "high" }],
+            "checklist": [{ "item": "B task", "checked": false, "owner": "ai" }],
+            "handoff_notes": [{ "note": "B note", "category": "context" }],
+            "context_pointers": [{ "path": "src/b.rs", "reason": "B" }]
+        }),
+    );
+
+    assert!(text.contains("Warning"), "existing warning kept: {text}");
+    let s = session_by_id(dir.path(), "active", &a_sid).unwrap();
+    assert_eq!(s["summary"], "A v2", "the owner's summary is kept");
+    assert_eq!(s["agent_id"], "agent-a");
+    let decisions: Vec<&str> = s["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["decision"].as_str())
+        .collect();
+    assert_eq!(decisions, vec!["A1", "A2", "B1"]);
+    let items: Vec<&str> = s["checklist"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["item"].as_str())
+        .collect();
+    assert_eq!(items, vec!["A task", "B task"]);
+    assert_eq!(s["handoff_notes"].as_array().unwrap().len(), 2);
+    assert_eq!(s["context_pointers"].as_array().unwrap().len(), 2);
+    assert_eq!(events(dir.path(), "session.foreign_write").len(), 1);
 }
 
 #[test]
@@ -541,6 +601,44 @@ fn pause_active_pauses_only_the_callers_own_sessions() {
 
     assert!(session_by_id(dir.path(), "active", &a_sid).is_some());
     assert!(session_by_id(dir.path(), "paused", &b_sid).is_some());
+}
+
+#[test]
+fn pause_active_over_an_ownerless_session_warns_and_logs_a_foreign_close() {
+    let dir = project();
+    let legacy = write_legacy_active(dir.path(), Some("a-20260101-000000-000000"), None);
+    let mut b = Server::spawn("agent-b", dir.path());
+
+    let text = b.ok(
+        "handoff_save_context",
+        json!({ "pause_only": true, "pause_active": true }),
+    );
+
+    assert!(text.contains("no recorded owner"), "warns: {text}");
+    assert!(session_by_id(dir.path(), "paused", &legacy).is_some());
+    let ev = events(dir.path(), "session.foreign_close");
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["session_id"], legacy.as_str());
+    assert_eq!(ev[0]["agent_id"], "agent-b");
+}
+
+#[test]
+fn import_over_an_ownerless_session_warns_and_logs_a_foreign_close() {
+    let dir = project();
+    let legacy = write_legacy_active(dir.path(), None, None);
+    let mut b = Server::spawn("agent-b", dir.path());
+
+    let text = b.ok(
+        "handoff_import_context",
+        json!({
+            "source": { "description": "notes", "format": "other" },
+            "session": { "summary": "imported by B" }
+        }),
+    );
+
+    assert!(text.contains("no recorded owner"), "warns: {text}");
+    assert!(session_by_id(dir.path(), "closed", &legacy).is_some());
+    assert_eq!(events(dir.path(), "session.foreign_close").len(), 1);
 }
 
 // ---- update_session -------------------------------------------------------
@@ -1099,4 +1197,81 @@ fn same_agent_in_two_worktrees_keeps_one_session_per_worktree() {
         "a different worktree gets its own session"
     );
     assert_eq!(sessions(dir.path(), "active").len(), 2);
+}
+
+// ---- auto-parenting never uses another agent's primary session -----------
+
+#[test]
+fn worktree_session_is_not_parented_to_another_agents_primary_session() {
+    let dir = project();
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = wt_parent.path().join("feature-wt");
+    let out = Command::new("git")
+        .args(["worktree", "add", "-b", "feat", wt.to_str().unwrap()])
+        .current_dir(dir.path())
+        .output()
+        .expect("git worktree add");
+    assert!(out.status.success(), "{out:?}");
+    let mut a = Server::spawn("agent-a", dir.path());
+    let mut b = Server::spawn("agent-b", &wt);
+    let mut a_in_wt = Server::spawn("agent-a", &wt);
+    let primary_sid = a.start("A primary work");
+
+    let b_sid = b.start("B in the worktree");
+    let a_wt_sid = a_in_wt.start("A in the worktree");
+
+    let b_session = session_by_id(dir.path(), "active", &b_sid).expect("B's session");
+    assert_eq!(b_session["scope"], "worktree");
+    assert!(
+        b_session["parent_session_id"].is_null(),
+        "another agent's primary is not B's parent: {b_session}"
+    );
+    let a_session = session_by_id(dir.path(), "active", &a_wt_sid).expect("A's worktree session");
+    assert_eq!(
+        a_session["parent_session_id"],
+        primary_sid.as_str(),
+        "the owner's own primary session is its parent"
+    );
+}
+
+// ---- an unreadable closed file does not block a save ---------------------
+
+#[test]
+fn an_unparseable_closed_file_does_not_block_save_context() {
+    let dir = project();
+    let mut a = Server::spawn("agent-a", dir.path());
+    a.close("first", json!({}));
+    std::fs::write(
+        dir.path()
+            .join(".handoff/sessions/29990101-000000-conflicted.closed.json"),
+        "<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> other\n",
+    )
+    .unwrap();
+
+    let text = a.ok(
+        "handoff_save_context",
+        json!({ "summary": "second", "session_status": "active" }),
+    );
+
+    assert!(text.contains("Session saved: second"), "{text}");
+    assert!(text.contains("conflicted.closed.json"), "warns: {text}");
+    assert_eq!(sessions(dir.path(), "active").len(), 1);
+}
+
+#[test]
+fn an_unparseable_closed_file_does_not_block_load_context() {
+    let dir = project();
+    let mut a = Server::spawn("agent-a", dir.path());
+    a.close("first", json!({}));
+    std::fs::write(
+        dir.path()
+            .join(".handoff/sessions/29990101-000000-conflicted.closed.json"),
+        "not json",
+    )
+    .unwrap();
+
+    let loaded = a.load(json!({}));
+
+    let warnings = loaded["warnings"].to_string();
+    assert!(warnings.contains("conflicted.closed.json"), "{warnings}");
 }

@@ -482,7 +482,7 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
         // argument. Only the first `=` splits, so a value may contain more.
         if let Some((raw_key, raw_value)) = arg[2..].split_once('=') {
             let key = raw_key.replace('-', "_");
-            let value = parse_value(raw_value, &key);
+            let value = parse_flag_value(raw_value, &key, tool_name)?;
             insert_value(&mut map, &key, value, tool_name);
             i += 1;
             continue;
@@ -497,7 +497,7 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
             let Some(raw_value) = args.get(i + 1) else {
                 anyhow::bail!("--{} requires a value", arg[2..].replace('_', "-"));
             };
-            let value = parse_value(raw_value, &key);
+            let value = parse_flag_value(raw_value, &key, tool_name)?;
             insert_value(&mut map, &key, value, tool_name);
             i += 2;
             continue;
@@ -510,10 +510,10 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
         let forced = i + 2 < args.len() && args[i + 1] == "--";
         let value = if forced {
             i += 2;
-            parse_value(&args[i], &key)
+            parse_flag_value(&args[i], &key, tool_name)?
         } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
             i += 1;
-            parse_value(&args[i], &key)
+            parse_flag_value(&args[i], &key, tool_name)?
         } else {
             Value::Bool(true)
         };
@@ -779,6 +779,26 @@ const ARRAY_FIELDS: &[&str] = &[
     // one-element array: it REPLACES the task's whole requirement link set.
     "requirement_ids",
 ];
+
+/// `parse_value` plus the one validation that needs the tool name: an empty
+/// `--requirement-ids` value is an error. `task.requirement_ids` REPLACES the
+/// whole link set, so a blank value (an unset shell variable, a stray comma)
+/// must not silently unlink every requirement. An explicit JSON `[]` still
+/// clears the links on purpose.
+fn parse_flag_value(raw: &str, key: &str, tool_name: &str) -> anyhow::Result<Value> {
+    let value = parse_value(raw, key);
+    if tool_name == "handoff_update_task"
+        && key == "requirement_ids"
+        && matches!(&value, Value::Array(items) if items.is_empty())
+        && !raw.trim_start().starts_with('[')
+    {
+        anyhow::bail!(
+            "--requirement-ids needs at least one id: an empty value would remove every \
+             requirement link of the task. Pass '[]' to clear them on purpose."
+        );
+    }
+    Ok(value)
+}
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
 /// whether numeric coercion is appropriate.
@@ -1251,6 +1271,53 @@ mod tests {
     fn reason_without_a_value_is_an_error() {
         let err = parse_flags(&strs(&["--reason"]), "handoff_trace_suspect").unwrap_err();
         assert!(err.to_string().contains("--reason"), "{err}");
+    }
+
+    #[test]
+    fn empty_requirement_ids_value_is_rejected_instead_of_wiping_links() {
+        // `requirement_ids` REPLACES the whole link set, so an empty value
+        // (shell variable that expanded to nothing, stray comma) must not
+        // silently unlink every requirement.
+        for raw in ["", "  ", ",", " , "] {
+            let err = parse_flags(
+                &strs(&["--id", "t1", "--requirement-ids", raw]),
+                "handoff_update_task",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("--requirement-ids"),
+                "{raw:?}: {err}"
+            );
+            let err = parse_flags(
+                &strs(&["--id", "t1", &format!("--requirement-ids={raw}")]),
+                "handoff_update_task",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("--requirement-ids"),
+                "{raw:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_json_array_still_clears_requirement_ids() {
+        let flags = parse_flags(
+            &strs(&["--id", "t1", "--requirement-ids", "[]"]),
+            "handoff_update_task",
+        )
+        .unwrap();
+        assert_eq!(flags["task"]["requirement_ids"], json!([]));
+    }
+
+    #[test]
+    fn non_empty_requirement_ids_are_unchanged() {
+        let flags = parse_flags(
+            &strs(&["--id", "t1", "--requirement-ids", "FR-1, FR-2"]),
+            "handoff_update_task",
+        )
+        .unwrap();
+        assert_eq!(flags["task"]["requirement_ids"], json!(["FR-1", "FR-2"]));
     }
 
     #[test]

@@ -330,23 +330,89 @@ pub fn title_to_slug(title: &str) -> String {
     }
 }
 
-/// Create a task directory, reporting the directory-name byte length on
-/// failure (the usual cause is a name over the filesystem's 255-byte limit).
-pub fn create_task_dir_all(task_dir: &Path) -> Result<()> {
+/// Create the directory `task_dir` (`{task_id}-{slug}`) of task `task_id`,
+/// reporting the directory-name byte length on failure (the usual cause is a
+/// name over the filesystem's 255-byte limit).
+pub fn create_task_dir_all(task_dir: &Path, task_id: &str) -> Result<()> {
     std::fs::create_dir_all(task_dir).with_context(|| {
         let name = task_dir.file_name().map(|n| n.to_string_lossy());
         let name_bytes = task_dir.file_name().map_or(0, |n| n.len());
-        // `{task_id}-{slug}`: task IDs never contain `-`, so the slug is
-        // everything after the first one (DS-V0473-011 error rule).
+        // Task IDs may contain `-` themselves (`t-vfix.4`), so the slug is what
+        // follows the *known* ID prefix, not what follows the first `-`
+        // (DS-V0473-011 error rule). A name not shaped `{task_id}-…` has no slug.
         let slug_bytes = name
             .as_deref()
-            .and_then(|n| n.split_once('-'))
-            .map_or(0, |(_, slug)| slug.len());
+            .and_then(|n| n.strip_prefix(task_id))
+            .and_then(|rest| rest.strip_prefix('-'))
+            .map_or(0, str::len);
         format!(
             "Failed to create task dir: {} (dir name is {name_bytes} bytes, slug is {slug_bytes} bytes)",
             task_dir.display()
         )
     })
+}
+
+/// Longest directory name (bytes) the common filesystems accept.
+pub const TASK_DIR_NAME_MAX_BYTES: usize = 255;
+
+/// Characters of an offending directory name quoted in the warning.
+const OVERLONG_EXAMPLE_CHARS: usize = 60;
+
+/// Counts the directories below `tasks_dir` whose name is longer than
+/// `max_bytes`, and returns the count with the first one found (in sorted
+/// order, so the report is stable). `None` when there is none.
+///
+/// Such names predate the slug limit ([`TASK_SLUG_MAX_BYTES`]) or come from a
+/// filesystem that counts characters, not bytes. An unreadable directory is
+/// skipped: this only feeds a warning, and the real read of the same tree
+/// reports it properly.
+fn find_overlong_task_dirs(tasks_dir: &Path, max_bytes: usize) -> Option<(usize, String)> {
+    fn walk(dir: &Path, max_bytes: usize, count: &mut usize, first: &mut Option<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut subdirs: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .collect();
+        subdirs.sort();
+        for (name, path) in subdirs {
+            if name.len() > max_bytes {
+                *count += 1;
+                first.get_or_insert(name);
+            }
+            walk(&path, max_bytes, count, first);
+        }
+    }
+    let (mut count, mut first) = (0, None);
+    walk(tasks_dir, max_bytes, &mut count, &mut first);
+    first.map(|name| (count, name))
+}
+
+/// A `load_context` warning when some task directory name is longer than
+/// `max_bytes`; see [`overlong_task_dir_warning`].
+fn overlong_task_dir_warning_for(tasks_dir: &Path, max_bytes: usize) -> Option<String> {
+    let (count, name) = find_overlong_task_dirs(tasks_dir, max_bytes)?;
+    let mut example: String = name.chars().take(OVERLONG_EXAMPLE_CHARS).collect();
+    if example.len() < name.len() {
+        example.push('…');
+    }
+    Some(format!(
+        "{count} task directory {} longer than {max_bytes} bytes (legacy names, e.g. \"{example}\" \
+         at {} bytes): checking them out with Git or copying them to another filesystem can fail. \
+         Rename each directory to a shorter name that keeps its `{{task_id}}-` prefix; the task \
+         is found by that prefix and its file content is unchanged. See README \
+         \"Managing .handoff/ in Git\".",
+        if count == 1 { "name is" } else { "names are" },
+        name.len()
+    ))
+}
+
+/// The warning for task directory names over [`TASK_DIR_NAME_MAX_BYTES`], or
+/// `None` when every name fits.
+pub fn overlong_task_dir_warning(tasks_dir: &Path) -> Option<String> {
+    overlong_task_dir_warning_for(tasks_dir, TASK_DIR_NAME_MAX_BYTES)
 }
 
 pub fn find_task_file(task_dir: &Path) -> Result<Option<(PathBuf, String)>> {
@@ -2886,5 +2952,57 @@ mod task_index_cache_tests {
 
         let gitignore = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
         assert_eq!(gitignore.lines().collect::<Vec<_>>(), vec!["*.lock"]);
+    }
+}
+
+#[cfg(test)]
+mod overlong_task_dir_tests {
+    use super::*;
+
+    #[test]
+    fn no_warning_when_every_name_fits() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("t1-short/t1.1-child")).unwrap();
+
+        assert_eq!(overlong_task_dir_warning_for(tmp.path(), 40), None);
+        assert_eq!(overlong_task_dir_warning(tmp.path()), None);
+    }
+
+    #[test]
+    fn reports_count_and_first_example_of_overlong_names_at_any_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_a = format!("t1-{}", "a".repeat(40));
+        let long_b = format!("t1.1-{}", "b".repeat(40));
+        std::fs::create_dir_all(tmp.path().join(&long_a).join(&long_b)).unwrap();
+        std::fs::create_dir_all(tmp.path().join("t2-ok")).unwrap();
+
+        let warning = overlong_task_dir_warning_for(tmp.path(), 30).unwrap();
+
+        assert!(warning.starts_with("2 task directory names are longer than 30 bytes"));
+        assert!(warning.contains(&long_a[..20]), "{warning}");
+        assert!(
+            warning.contains(&format!("at {} bytes", long_a.len())),
+            "{warning}"
+        );
+        assert!(warning.contains("Managing .handoff/ in Git"));
+    }
+
+    #[test]
+    fn single_name_is_worded_in_the_singular_and_the_example_is_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("t1-{}", "あ".repeat(70)); // 213 bytes, multi-byte
+        std::fs::create_dir_all(tmp.path().join(&long)).unwrap();
+
+        let warning = overlong_task_dir_warning_for(tmp.path(), 100).unwrap();
+
+        assert!(warning.starts_with("1 task directory name is longer than 100 bytes"));
+        assert!(warning.contains('…'), "a long example is cut: {warning}");
+        assert!(warning.contains("at 213 bytes"), "{warning}");
+    }
+
+    #[test]
+    fn a_missing_tasks_dir_is_no_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(overlong_task_dir_warning(&tmp.path().join("tasks")), None);
     }
 }

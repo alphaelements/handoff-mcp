@@ -2245,10 +2245,14 @@ fn list_tasks_ids_rejects_non_string_elements() {
 }
 
 #[test]
-fn list_tasks_limit_caps_top_level_nodes_in_original_order() {
+fn list_tasks_limit_caps_nodes_in_original_order() {
     let (_dir, pd) = setup_list_fixture();
-    let full = list(&pd, json!({}));
-    let limited = list(&pd, json!({ "limit": 3 }));
+    // Leaf top-level tasks only (t2 has descendants), so one node = one entry.
+    let leaves = json!({ "ids": ["t1", "t3", "t4", "t5", "t6"] });
+    let full = list(&pd, leaves.clone());
+    let mut args = leaves;
+    args["limit"] = json!(3);
+    let limited = list(&pd, args);
     assert_eq!(limited["task_tree"].as_array().unwrap().len(), 3);
     assert_eq!(
         limited["task_tree"],
@@ -2256,6 +2260,8 @@ fn list_tasks_limit_caps_top_level_nodes_in_original_order() {
     );
     // The summary still describes every task.
     assert_eq!(limited["task_summary"], full["task_summary"]);
+    assert_eq!(limited["task_tree_meta"]["returned"], json!(3));
+    assert_eq!(limited["task_tree_meta"]["matched"], json!(5));
 }
 
 #[test]
@@ -2468,10 +2474,75 @@ fn list_tasks_include_descendants_with_fields_and_limit() {
             "fields": ["id", "status"]
         }),
     );
-    // limit caps top-level nodes; the subtree of t2 is not capped, and the
-    // descendants survive the projection even though `children` was not asked.
+    // limit counts nodes depth-first, so t1 and t2 use the whole budget and
+    // t2's subtree is cut; the kept nodes survive the projection even though
+    // `children` was not asked.
     assert_eq!(top_ids(&parsed), vec!["t1", "t2"]);
-    assert_eq!(tree_ids(&parsed), vec!["t1", "t2", "t2.1", "t2.1.1"]);
+    assert_eq!(tree_ids(&parsed), vec!["t1", "t2"]);
+    assert_eq!(parsed["task_tree_meta"]["truncated"], json!(true));
+}
+
+/// One in_progress parent `t1` with `count` todo children (`t1.1`..).
+fn setup_parent_with_children(count: usize) -> (TempDir, String) {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Parent", "status": "in_progress" } }),
+    );
+    assert!(!is_error(&resp), "create failed: {}", get_text(&resp));
+    for i in 0..count {
+        create_task_titled(&pd, &format!("Child {i}"), Some("t1"));
+    }
+    (dir, pd)
+}
+
+#[test]
+fn list_tasks_status_filter_with_fields_keeps_matching_subtasks() {
+    let (_dir, pd) = setup_parent_with_children(30);
+    let parsed = list(
+        &pd,
+        json!({ "status_filter": "todo", "fields": ["id", "status", "title"] }),
+    );
+    let ids = tree_ids(&parsed);
+    // 30 todo children plus the in_progress parent kept for connectivity.
+    assert_eq!(ids.len(), 31, "{ids:?}");
+    assert!(ids.contains(&"t1.30".to_string()));
+    // Fields other than the requested ones (and `children`) are projected out.
+    let child = &parsed["task_tree"][0]["children"][0];
+    assert!(child.get("order").is_none());
+}
+
+#[test]
+fn list_tasks_other_filters_with_fields_keep_matching_subtasks() {
+    let (_dir, pd) = setup_parent_with_children(3);
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t1.2", "assignee": "bob" } }),
+    );
+    assert!(!is_error(&resp), "{}", get_text(&resp));
+    let parsed = list(&pd, json!({ "assignee_filter": "bob", "fields": ["id"] }));
+    assert_eq!(tree_ids(&parsed), vec!["t1", "t1.2"]);
+}
+
+#[test]
+fn list_tasks_limit_counts_nested_nodes_depth_first() {
+    let (_dir, pd) = setup_parent_with_children(30);
+    let parsed = list(&pd, json!({ "limit": 2 }));
+    assert_eq!(tree_ids(&parsed), vec!["t1", "t1.1"]);
+    assert_eq!(
+        parsed["task_tree_meta"],
+        json!({ "truncated": true, "limit": 2, "returned": 2, "matched": 31 })
+    );
+}
+
+#[test]
+fn list_tasks_limit_not_reached_adds_no_meta_and_default_output_is_unchanged() {
+    let (_dir, pd) = setup_parent_with_children(3);
+    let full = list(&pd, json!({}));
+    assert!(full.get("task_tree_meta").is_none());
+    let roomy = list(&pd, json!({ "limit": 4 }));
+    assert_eq!(roomy, full);
 }
 
 #[test]

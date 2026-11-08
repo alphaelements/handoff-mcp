@@ -177,6 +177,10 @@ fn init_writes_the_recommended_gitignore_and_leaves_the_project_repo_alone() {
     let content = String::from_utf8(gitignore_bytes(project.path())).unwrap();
     let lines: Vec<&str> = content.lines().collect();
     assert_eq!(lines, RECOMMENDED_GITIGNORE_ENTRIES);
+    // The PDF export output and its render cache are written by handoff-mcp
+    // too and must be ignored from the first commit on.
+    assert!(lines.contains(&"/exports/"), "{lines:?}");
+    assert!(lines.contains(&".mermaid-cache/"), "{lines:?}");
     assert!(
         !project.path().join(".gitignore").exists(),
         "handoff_init must not create the project's own .gitignore"

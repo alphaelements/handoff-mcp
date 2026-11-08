@@ -3262,8 +3262,9 @@ if (sessionPassed && HAS_RECONCILE_STAGE) {
 let closerResult = null;
 const closerWarnings = [...specPrepWarnings, ...reconcileWarnings];
 // Tasks whose close-out the closer reported as failed or incomplete
-// (ops_failed / unexecuted_ops), or every task when the closer itself failed
-// (`error`). Empty when the closer did not run.
+// (ops_failed / unexecuted_ops), tasks missing from its tasks_processed, or
+// every task when the closer itself failed (`error`). Empty when the closer
+// did not run.
 const closerFailedTasks = [];
 if (sessionPassed && HAS_TEST_STAGE) {
   phase('Close');
@@ -3300,6 +3301,7 @@ if (sessionPassed && HAS_TEST_STAGE) {
     for (const t of tasks) {
       if (!processed.has(t.id)) {
         closerWarnings.push(`Closer did not report on task ${t.id}: not processed — close it manually.`);
+        if (!closerFailedTasks.includes(t.id)) closerFailedTasks.push(t.id);
       }
     }
   }

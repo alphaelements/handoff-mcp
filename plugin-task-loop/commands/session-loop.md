@@ -449,7 +449,7 @@ The workflow returns:
 | `spec_prep_report` | object\|null | Stage 0 (Spec-Prep, `standard`/`full`) result: `{ specs_generated[], scaffolds_created[], low_confidence_items[], checker_result{ verdict, issues[] }, error? }`. Low-confidence items, a failing checker, or a crash are added to `warnings` (never fails the session). `null` under `express` |
 | `spec_reconcile_report` | object\|null | Stage 3.5 (Spec-Reconcile, `standard`/`full`) result: `{ mode: audit\|apply, reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[], error? }`. Each `contract_ambiguity` is also appended to `pending_followups` (source `spec-reconciler`) and each `verification_impact` to `warnings`. `null` under `express` or when `passed: false` |
 | `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, ops_failed[{ op, error }], unexecuted_ops[{ op, reason }], notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
-| `closer_failed_tasks` | string[] | Task ids whose close-out the closer reported as failed or incomplete (`ops_failed` / `unexecuted_ops` non-empty), or every session task when the closer itself failed (`closer_report.error`). Each failed/incomplete task also has a `closer_failed:` entry in `warnings`. Close these by hand; never trust their `status_set`. Empty when the closer ran clean or did not run |
+| `closer_failed_tasks` | string[] | Task ids whose close-out the closer reported as failed or incomplete (`ops_failed` / `unexecuted_ops` non-empty), session tasks missing from `closer_report.tasks_processed` (the closer reported no error but skipped them), or every session task when the closer itself failed (`closer_report.error`). A reported-failed/incomplete task has a `closer_failed:` entry in `warnings`; a skipped task has a `Closer did not report on task …` entry. Close these by hand; never trust their `status_set`. Empty when the closer ran clean or did not run |
 | `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
 | `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged |
 | `session_log` | object[] | per-round trace |
@@ -469,8 +469,8 @@ The workflow returns:
 > sets each task to `done` (fully verified) or `review`, and runs `trace_update` /
 > `requirement_ids` linking. Read `closer_report` and **verify rather than repeat** it. Do the
 > manual procedure below only for what it did not cover: when `warnings` is non-empty or
-> `closer_report.error` is set, for any task missing from `closer_report.tasks_processed`,
-> for any task listed in `closer_failed_tasks`,
+> `closer_report.error` is set, for any task listed in `closer_failed_tasks` (this includes a
+> task missing from `closer_report.tasks_processed`),
 > and under `express` / `passed: false` where no closer runs. Surface every closer warning to
 > the user.
 

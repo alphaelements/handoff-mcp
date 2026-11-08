@@ -634,7 +634,7 @@ fn quote_stderr(stderr: &str) -> String {
 #[cfg(all(test, unix, not(feature = "bundled-typst")))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::storage::docs::pdf::test_support::write_executable_script;
 
     /// A shell script standing in for `typst`. `fonts` prints
     /// `font_lines`; `compile` runs `compile_body` with `$@` being the
@@ -642,10 +642,9 @@ mod tests {
     fn fake_typst(dir: &Path, font_lines: &str, compile_body: &str) -> PathBuf {
         let path = dir.join("fake-typst");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  fonts) printf '%s\\n' '{font_lines}' ;;\n  compile) shift\n{compile_body}\n ;;\nesac\n"
+            "case \"$1\" in\n  fonts) printf '%s\\n' '{font_lines}' ;;\n  compile) shift\n{compile_body}\n ;;\nesac\n"
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_script(&path, &script);
         path
     }
 
@@ -944,8 +943,7 @@ mod tests {
         } else {
             "echo 'Parse error on line 2' >&2; exit 1"
         };
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_script(&path, &format!("{body}\n"));
         path
     }
 
