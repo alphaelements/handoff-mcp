@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.47.3] — 2026-11-08
+## [0.47.3] — 2026-11-12
 
 ### Behavior changes
 
@@ -299,6 +299,9 @@ notice, not a guard: it does not stop or reconcile a mixed-version setup.
   writes the counters back.
 
 ### Fixed
+- **Dependency security fix**: `pulldown-cmark` 0.13.5 → 0.13.6
+  (RUSTSEC-2026-0433, quadratic parsing of nested image wikilinks); the
+  weekly `cargo audit` check was failing on it.
 - **Session writes re-check the owner under a lock**: closing, pausing,
   updating or activating a session re-reads it under the sessions lock and
   re-checks its owner. A session that another agent adopted during the call is
