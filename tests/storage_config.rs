@@ -31,13 +31,39 @@ fn config_has_correct_defaults() {
     write_config(&path, &config).unwrap();
 
     let read_back = read_config(&path).unwrap();
-    assert_eq!(read_back.settings.history_limit, 20);
+    // t439.7: neither key is written by default; session pruning is opt-in.
+    assert_eq!(read_back.settings.history_limit, None);
+    assert_eq!(read_back.settings.session_prune_limit, None);
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("history_limit"), "config.toml:\n{raw}");
+    assert!(!raw.contains("session_prune_limit"), "config.toml:\n{raw}");
     assert_eq!(read_back.settings.done_task_limit, 10);
     assert!(read_back.settings.auto_git_summary);
     assert!(read_back.settings.context_files.is_empty());
     assert_eq!(read_back.dashboard.scan_dirs, vec!["~/pro/"]);
     assert!(read_back.dashboard.exclude_patterns.is_empty());
     assert!(read_back.project.description.is_none());
+}
+
+#[test]
+fn compact_task_limit_defaults_to_forty_when_the_key_is_absent() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+
+    // A config.toml written before the key existed.
+    fs::write(
+        &path,
+        "[project]\nname = \"old\"\n\n[settings]\ndone_task_limit = 5\n",
+    )
+    .unwrap();
+    assert_eq!(read_config(&path).unwrap().settings.compact_task_limit, 40);
+
+    fs::write(
+        &path,
+        "[project]\nname = \"new\"\n\n[settings]\ncompact_task_limit = 12\n",
+    )
+    .unwrap();
+    assert_eq!(read_config(&path).unwrap().settings.compact_task_limit, 12);
 }
 
 #[test]
@@ -64,7 +90,8 @@ exclude_patterns = ["*/target", "*/node_modules"]
 
     let config = read_config(&path).unwrap();
     assert_eq!(config.project.name, "custom-proj");
-    assert_eq!(config.settings.history_limit, 50);
+    assert_eq!(config.settings.history_limit, Some(50));
+    assert_eq!(config.settings.session_prune_limit, None);
     assert_eq!(config.settings.done_task_limit, 5);
     assert!(!config.settings.auto_git_summary);
     assert_eq!(config.settings.context_files.len(), 2);
@@ -102,7 +129,7 @@ name = "minimal"
 
     let config = read_config(&path).unwrap();
     assert_eq!(config.project.name, "minimal");
-    assert_eq!(config.settings.history_limit, 20);
+    assert_eq!(config.settings.history_limit, None);
     assert_eq!(config.dashboard.scan_dirs, vec!["~/pro/"]);
 }
 
@@ -291,4 +318,26 @@ fn worktree_session_loop_round_trips_through_write_config() {
     );
     assert_eq!(read_back.worktree.session_loop.max_concurrent_wts, 2);
     assert!(read_back.worktree.session_loop.auto_cleanup);
+}
+
+/// t439.7: `session_prune_limit` is the opt-in replacement for the deprecated
+/// `history_limit`; both are optional and round-trip independently.
+#[test]
+fn session_prune_limit_round_trips_and_is_independent_of_history_limit() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[project]\nname = \"p\"\n\n[settings]\nhistory_limit = 20\nsession_prune_limit = 7\n",
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert_eq!(config.settings.history_limit, Some(20));
+    assert_eq!(config.settings.session_prune_limit, Some(7));
+
+    write_config(&path, &config).unwrap();
+    let back = read_config(&path).unwrap();
+    assert_eq!(back.settings.history_limit, Some(20));
+    assert_eq!(back.settings.session_prune_limit, Some(7));
 }

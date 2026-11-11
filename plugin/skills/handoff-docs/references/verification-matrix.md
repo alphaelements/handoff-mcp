@@ -153,7 +153,7 @@ Then: `handoff_doc_req_status` to confirm counts.
 |---|---|---|---|
 | `DIAG-R001` (warning) | `doc_req_*`, `load_context` | documents with no `layer` and no verification matrix — their requirements cannot be listed; `affected_doc_ids` lists them | `doc_save(doc_id, layer=...)` for V-model tracking, or `doc_verify(action: "generate")` for the section matrix. Holding imported req_* items? see `handoff-trace` → `references/migration.md` |
 | `DIAG-R002` (info) | `doc_req_list` | SubItems without a `stable_id` are skipped | `doc_verify(doc_id, action: "backfill_stable_ids")` |
-| `DIAG-D001` (warning) | `doc_save` | a `spec`/`design` document saved without a `layer` is outside V-model tracking | set a layer, enable `[trace] auto_layer`, or ignore if intentional |
+| `DIAG-D001` (warning) | `doc_save` | a `spec`/`design` document saved without a `layer` is outside V-model tracking | set a layer, enable `[trace] auto_layer`, or ignore if intentional (`[settings] layer_missing_notice = false` silences it) |
 
 `doc_req_scan` / `doc_req_impact` results are scoped by `scope_paths`: a
 missing suggestion usually means the document has none set. An empty

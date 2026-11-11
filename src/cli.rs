@@ -27,15 +27,26 @@ use crate::mcp::handlers;
 /// script's `$?` check than trying to subdivide this handler's own error
 /// paths into "really a 1" vs "really a 2".
 pub fn run(args: &[String]) -> i32 {
+    // A CLI invocation has no stable identity of its own: tools must not
+    // invent an agent for it (`handoff_load_context` would otherwise register
+    // a new one per call).
+    crate::mcp::router::mark_cli_process();
     let is_trace = args.first().map(String::as_str) == Some("trace");
     let action = args.get(1).map(String::as_str);
     let is_trace_lint = is_trace && action == Some("lint");
     // `trace tree` (wiki/300 SPEC-TREE-009): any failure — an invalid
     // parameter, an unknown root / layer, a missing `.handoff/` — is exit 2.
     let is_trace_tree = is_trace && action == Some("tree");
+    // `trace update` reports a rejected or half-applied batch as a normal
+    // response with a `failed` object; the exit code has to say so too.
+    let is_trace_update = is_trace && action == Some("update");
     let result = dispatch(args);
     match result {
         Ok(output) if is_trace_lint => print_trace_lint_output(&output),
+        Ok(output) if is_trace_update && trace_update_failed(&output) => {
+            println!("{output}");
+            1
+        }
         Ok(output) => {
             println!("{output}");
             0
@@ -53,6 +64,19 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
+}
+
+/// Whether a `trace update` response carries a `failed` op. The handler
+/// answers `Ok` with `{"applied": [...], "failed": {...}}` for both a
+/// validation rejection (nothing written) and a write-time failure (earlier
+/// categories already on disk), so the CLI has to inspect the body. A body
+/// that is not JSON cannot name a failed op, so it counts as "no failure
+/// reported" (the handler always answers JSON on `Ok`).
+fn trace_update_failed(output: &str) -> bool {
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|v| v.get("failed").map(|f| !f.is_null()))
+        .unwrap_or(false)
 }
 
 /// The `trace tree` output format (`--format json|text`).
@@ -269,6 +293,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("memory", "query") => "handoff_memory_query",
         ("memory", "delete") => "handoff_memory_delete",
         ("memory", "cleanup") => "handoff_memory_cleanup",
+        ("memory", "strip-usage-stats") => "handoff_memory_strip_usage_stats",
 
         // referral
         ("referral", "send" | "refer") => "handoff_refer",
@@ -457,7 +482,7 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
         // argument. Only the first `=` splits, so a value may contain more.
         if let Some((raw_key, raw_value)) = arg[2..].split_once('=') {
             let key = raw_key.replace('-', "_");
-            let value = parse_value(raw_value, &key);
+            let value = parse_flag_value(raw_value, &key, tool_name)?;
             insert_value(&mut map, &key, value, tool_name);
             i += 1;
             continue;
@@ -472,7 +497,7 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
             let Some(raw_value) = args.get(i + 1) else {
                 anyhow::bail!("--{} requires a value", arg[2..].replace('_', "-"));
             };
-            let value = parse_value(raw_value, &key);
+            let value = parse_flag_value(raw_value, &key, tool_name)?;
             insert_value(&mut map, &key, value, tool_name);
             i += 2;
             continue;
@@ -485,10 +510,10 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
         let forced = i + 2 < args.len() && args[i + 1] == "--";
         let value = if forced {
             i += 2;
-            parse_value(&args[i], &key)
+            parse_flag_value(&args[i], &key, tool_name)?
         } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
             i += 1;
-            parse_value(&args[i], &key)
+            parse_flag_value(&args[i], &key, tool_name)?
         } else {
             Value::Bool(true)
         };
@@ -528,6 +553,8 @@ fn insert_value(
                 "assignee",
                 "dependencies",
                 "order",
+                "requirement_ids",
+                "requirement_roles",
             ];
             // Fields that go into `task.schedule`.
             let schedule_fields = [
@@ -702,6 +729,9 @@ const NUMERIC_FIELDS: &[&str] = &[
     // limit を NUMERIC_FIELDS に加える" — limit was already numeric above).
     "depth",
     "max_items",
+    // `doc update-section` / `doc get`: section sequence number (integer in the
+    // tool schema; a string "1" is rejected as "'seq' is required").
+    "seq",
 ];
 
 /// Fields whose tool input is always a string array. A single value (no
@@ -740,7 +770,35 @@ const ARRAY_FIELDS: &[&str] = &[
     "depends_on",
     // `doc export --doc-ids a` (no comma) must still be a one-element array.
     "doc_ids",
+    // `session load --task-scope t75` (no comma) must still be a one-element
+    // array: `load_context` reads `task_scope` as a list of task ids.
+    "task_scope",
+    // `task list --ids t75` (no comma) must still be a one-element array.
+    "ids",
+    // `task update --requirement-ids FR-1` (no comma) must still be a
+    // one-element array: it REPLACES the task's whole requirement link set.
+    "requirement_ids",
 ];
+
+/// `parse_value` plus the one validation that needs the tool name: an empty
+/// `--requirement-ids` value is an error. `task.requirement_ids` REPLACES the
+/// whole link set, so a blank value (an unset shell variable, a stray comma)
+/// must not silently unlink every requirement. An explicit JSON `[]` still
+/// clears the links on purpose.
+fn parse_flag_value(raw: &str, key: &str, tool_name: &str) -> anyhow::Result<Value> {
+    let value = parse_value(raw, key);
+    if tool_name == "handoff_update_task"
+        && key == "requirement_ids"
+        && matches!(&value, Value::Array(items) if items.is_empty())
+        && !raw.trim_start().starts_with('[')
+    {
+        anyhow::bail!(
+            "--requirement-ids needs at least one id: an empty value would remove every \
+             requirement link of the task. Pass '[]' to clear them on purpose."
+        );
+    }
+    Ok(value)
+}
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
 /// whether numeric coercion is appropriate.
@@ -814,7 +872,10 @@ pub const GROUPS: &[(&str, &str)] = &[
         "Session management (load, save, list, get, update)",
     ),
     ("config", "Configuration (get, update)"),
-    ("memory", "Project memory (save, query, delete, cleanup)"),
+    (
+        "memory",
+        "Project memory (save, query, delete, cleanup, strip-usage-stats)",
+    ),
     (
         "referral",
         "Cross-project referrals (send, list, get, update)",
@@ -899,6 +960,7 @@ pub fn print_group_help(group: &str) {
             ("query", "Query memories (--text, --limit, --session-id)"),
             ("delete", "Delete a memory (--id)"),
             ("cleanup", "Housekeep memory store (--apply-exact-merges, --stale-days)"),
+            ("strip-usage-stats", "Remove obsolete hit_count/last_referenced_at keys from memory files (dry-run unless --apply)"),
         ],
         "referral" => &[
             ("send", "Send a referral to another project (--summary, --target-project, ...)"),
@@ -1041,6 +1103,27 @@ mod tests {
     }
 
     #[test]
+    fn list_narrowing_flags_map_to_the_tool_arguments() {
+        let flags = parse_flags(
+            &strs(&["--ids", "t75", "--limit", "3", "--fields", "id,status"]),
+            "handoff_list_tasks",
+        )
+        .unwrap();
+        assert_eq!(flags["ids"], json!(["t75"]));
+        assert_eq!(flags["limit"], json!(3));
+        assert_eq!(flags["fields"], json!(["id", "status"]));
+        let flags = parse_flags(&strs(&["--ids", "t75,t78"]), "handoff_list_tasks").unwrap();
+        assert_eq!(flags["ids"], json!(["t75", "t78"]));
+        let flags = parse_flags(
+            &strs(&["--slug", "my-doc", "--limit", "3"]),
+            "handoff_doc_list",
+        )
+        .unwrap();
+        assert_eq!(flags["slug"], json!("my-doc"));
+        assert_eq!(flags["limit"], json!(3));
+    }
+
+    #[test]
     fn doc_export_flags_map_to_the_tool_arguments() {
         assert_eq!(
             resolve_tool_name("doc", "export").unwrap(),
@@ -1064,6 +1147,21 @@ mod tests {
         assert_eq!(flags["include_toc"], json!(false));
         assert_eq!(flags["output_dir"], "out");
         assert_eq!(flags["template"], "spec");
+    }
+
+    #[test]
+    fn session_load_task_scope_and_task_tree_flags_map_to_the_tool_arguments() {
+        let flags = parse_flags(
+            &strs(&["--task-scope", "t75", "--task-tree", "full"]),
+            "handoff_load_context",
+        )
+        .unwrap();
+        assert_eq!(flags["task_scope"], json!(["t75"]));
+        assert_eq!(flags["task_tree"], "full");
+
+        let flags =
+            parse_flags(&strs(&["--task-scope", "t75,t78"]), "handoff_load_context").unwrap();
+        assert_eq!(flags["task_scope"], json!(["t75", "t78"]));
     }
 
     #[test]
@@ -1173,6 +1271,53 @@ mod tests {
     fn reason_without_a_value_is_an_error() {
         let err = parse_flags(&strs(&["--reason"]), "handoff_trace_suspect").unwrap_err();
         assert!(err.to_string().contains("--reason"), "{err}");
+    }
+
+    #[test]
+    fn empty_requirement_ids_value_is_rejected_instead_of_wiping_links() {
+        // `requirement_ids` REPLACES the whole link set, so an empty value
+        // (shell variable that expanded to nothing, stray comma) must not
+        // silently unlink every requirement.
+        for raw in ["", "  ", ",", " , "] {
+            let err = parse_flags(
+                &strs(&["--id", "t1", "--requirement-ids", raw]),
+                "handoff_update_task",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("--requirement-ids"),
+                "{raw:?}: {err}"
+            );
+            let err = parse_flags(
+                &strs(&["--id", "t1", &format!("--requirement-ids={raw}")]),
+                "handoff_update_task",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("--requirement-ids"),
+                "{raw:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_json_array_still_clears_requirement_ids() {
+        let flags = parse_flags(
+            &strs(&["--id", "t1", "--requirement-ids", "[]"]),
+            "handoff_update_task",
+        )
+        .unwrap();
+        assert_eq!(flags["task"]["requirement_ids"], json!([]));
+    }
+
+    #[test]
+    fn non_empty_requirement_ids_are_unchanged() {
+        let flags = parse_flags(
+            &strs(&["--id", "t1", "--requirement-ids", "FR-1, FR-2"]),
+            "handoff_update_task",
+        )
+        .unwrap();
+        assert_eq!(flags["task"]["requirement_ids"], json!(["FR-1", "FR-2"]));
     }
 
     #[test]

@@ -18,11 +18,11 @@ Start from this and adapt:
 
 ```html
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ホーム画面 (S_HOME)</title>
+  <title>Home screen (S_HOME)</title>
   <style>
     :root { --fg: #1a1a1a; --bg: #fafafa; --accent: #1f6feb; --border: #d0d7de; }
     * { box-sizing: border-box; }
@@ -37,14 +37,14 @@ Start from this and adapt:
 </head>
 <body>
   <header>
-    <h1>ホーム</h1>
-    <nav aria-label="メイン"><a href="settings.html">設定</a></nav>
+    <h1>Home</h1>
+    <nav aria-label="Main"><a href="settings.html">Settings</a></nav>
   </header>
   <main>
-    <a class="card" href="measure-detail.html">今日の測定: 36.5 °C</a>
-    <p>最終更新: 10:42</p>
+    <a class="card" href="measure-detail.html">Today's reading: 36.5 °C</a>
+    <p>Last updated: 10:42</p>
   </main>
-  <footer><a href="login.html">ログアウト</a></footer>
+  <footer><a href="login.html">Sign out</a></footer>
 </body>
 </html>
 ```
@@ -98,5 +98,5 @@ When a headless browser is available (the Chrome found by the tool check):
 google-chrome --headless --disable-gpu --screenshot=<out>.png --window-size=480,900 file://<abs path>.html
 ```
 
-Then the specification embeds `![ホーム画面](<out>.png)`. Without a browser, list the HTML paths in
+Then the specification embeds `![Home screen](<out>.png)`. Without a browser, list the HTML paths in
 the specification and report that the PDF has no screen images.

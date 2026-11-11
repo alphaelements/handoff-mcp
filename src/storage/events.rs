@@ -55,6 +55,11 @@ pub fn append_event(handoff_dir: &Path, event: EventRecord) -> Result<()> {
 /// `event` value of a task status transition (FR-502 / SPEC-502).
 pub const EVENT_TASK_STATUS_CHANGED: &str = "task.status_changed";
 
+/// `event` value appended by `memory_cleanup` (opt-in `apply_exact_merges`)
+/// for each group of exact-duplicate memories it merges. `detail` is
+/// `keeper=<id>; absorbed=<id>[,<id>...]`.
+pub const EVENT_MEMORY_MERGED: &str = "memory.merged";
+
 /// Append a `task.status_changed` event when `from != to`; a no-op otherwise.
 ///
 /// `detail` is the compact JSON object `{"from":"<old>","to":"<new>"}`

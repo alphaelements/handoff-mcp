@@ -1872,6 +1872,125 @@ test('closer-reported warnings and incomplete task coverage are propagated to wa
   );
 });
 
+test('a task missing from tasks_processed (no closer error) is listed in closer_failed_tasks', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    { closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'done' }] } },
+  );
+  assert.equal(r.passed, true, 'closer gap must not fail the session');
+  assert.ok(!r.closer_report.error, 'this is the no-closer-error case');
+  assert.deepEqual(r.closer_failed_tasks, ['t2']);
+});
+
+// WS1 / t430: a closer that could not write must not look like a clean close-out.
+test('the closer schema exposes optional ops_failed and unexecuted_ops per task', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const item = optsFor(r, 'closer').schema.properties.tasks_processed.items;
+  assert.equal(item.properties.ops_failed.type, 'array');
+  assert.deepEqual(item.properties.ops_failed.items.required, ['op', 'error']);
+  assert.equal(item.properties.unexecuted_ops.type, 'array');
+  assert.deepEqual(item.properties.unexecuted_ops.items.required, ['op', 'reason']);
+  // Optional: a clean close-out reports neither.
+  assert.ok(!item.required.includes('ops_failed'));
+  assert.ok(!item.required.includes('unexecuted_ops'));
+});
+
+test('a non-empty ops_failed yields closer_failed for that task, even when status_set is done', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [
+          {
+            task_id: 't1',
+            status_set: 'done',
+            ops_failed: [{ op: 'check_criterion[0]', error: 'handoff tools unavailable' }],
+          },
+          { task_id: 't2', status_set: 'done' },
+        ],
+      },
+    },
+  );
+  assert.equal(r.passed, true, 'closer failure must not fail the session');
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  const w = r.warnings.filter((x) => /closer_failed/.test(x));
+  assert.equal(w.length, 1);
+  assert.match(w[0], /t1/);
+  assert.match(w[0], /check_criterion\[0\]/);
+  assert.match(w[0], /handoff tools unavailable/);
+});
+
+test('unexecuted_ops also yields closer_failed (the task is not fully closed)', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [
+          {
+            task_id: 't1',
+            status_set: 'review',
+            unexecuted_ops: [{ op: 'trace_update', reason: 'no handoff tool and no CLI' }],
+          },
+        ],
+      },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /trace_update/.test(x)));
+});
+
+test('a clean closer result reports no closer_failed tasks', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.deepEqual(r.closer_failed_tasks, []);
+  assert.ok(!r.warnings.some((x) => /closer_failed/.test(x)));
+});
+
+test('express and a not-passed session report closer_failed_tasks as an empty list', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.deepEqual(r.closer_failed_tasks, []);
+  const notPassed = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { crashDevelopers: true },
+  );
+  assert.equal(notPassed.passed, false);
+  assert.deepEqual(notPassed.closer_failed_tasks, []);
+});
+
+// The closer definition says: with no handoff access at all, list every call
+// under unexecuted_ops AND set the top-level error. That worst case must not
+// come back as an empty closer_failed_tasks.
+test('a closer error with per-task unexecuted_ops still lists the tasks and their ops', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: {
+        error: 'no handoff access: ToolSearch returned no handoff tools, CLI not on PATH',
+        tasks_processed: [
+          { task_id: 't1', status_set: 'review', unexecuted_ops: [{ op: 'check_criterion[0]', reason: 'no handoff access' }] },
+          { task_id: 't2', status_set: 'review', unexecuted_ops: [{ op: 'update_task status', reason: 'no handoff access' }] },
+        ],
+      },
+    },
+  );
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.closer_failed_tasks, ['t1', 't2']);
+  assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /check_criterion\[0\]/.test(x)));
+  assert.ok(r.warnings.some((x) => /Closer agent failed/.test(x)));
+});
+
+test('a crashed closer lists every session task in closer_failed_tasks', async () => {
+  const r = await runWorkflow({ ...twoTasks(), profile: 'standard' }, { crashCloser: true });
+  assert.ok(r.closer_report.error);
+  assert.deepEqual(r.closer_failed_tasks, ['t1', 't2']);
+});
+
+test('the closer prompt tells the closer to report failures instead of skipping them', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const p = promptFor(r, 'closer');
+  assert.match(p, /ops_failed/);
+  assert.match(p, /unexecuted_ops/);
+});
+
 test('a closer telemetry entry is recorded', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
   const entry = r.stage_telemetry.find((e) => e.label === 'closer');

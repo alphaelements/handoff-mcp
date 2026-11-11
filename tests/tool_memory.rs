@@ -597,7 +597,7 @@ fn query_without_session_id_does_not_filter() {
 }
 
 #[test]
-fn injected_query_bumps_hit_count_and_last_referenced() {
+fn injected_query_never_rewrites_the_memory_file() {
     let (_tmp, dir) = setup_project();
     let saved = payload(&call(
         &dir,
@@ -605,21 +605,33 @@ fn injected_query_bumps_hit_count_and_last_referenced() {
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     ));
     let id = saved["id"].as_str().unwrap().to_string();
+    let path = dir.join(".handoff/memory").join(format!("{id}.json"));
+    let before = std::fs::read(&path).unwrap();
 
+    for _ in 0..3 {
+        let q = payload(&call(
+            &dir,
+            "handoff_memory_query",
+            json!({ "text": "atomic write", "session_id": "sess-A" }),
+        ));
+        // The first query injects; later ones are suppressed by the sidecar.
+        let _ = q;
+    }
     call(
         &dir,
         "handoff_memory_query",
-        json!({ "text": "atomic write", "session_id": "sess-A" }),
+        json!({ "text": "atomic write" }),
     );
 
-    // Read the on-disk memory file and confirm usage stats were bumped.
-    let path = dir.join(".handoff/memory").join(format!("{id}.json"));
-    let raw = std::fs::read_to_string(&path).unwrap();
-    let mem: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(mem["hit_count"], 1, "hit_count must increment on injection");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "memory_query must leave the memory file byte-identical"
+    );
+    let mem: Value = serde_json::from_slice(&before).unwrap();
     assert!(
-        mem["last_referenced_at"].is_string(),
-        "last_referenced_at must be set on injection"
+        mem.get("hit_count").is_none() && mem.get("last_referenced_at").is_none(),
+        "new memories carry no usage-stat fields: {mem}"
     );
 }
 
@@ -706,8 +718,25 @@ fn cleanup_merges_exact_duplicates_losslessly() {
         }),
     );
 
-    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
+    let p = payload(&call(
+        &dir,
+        "handoff_memory_cleanup",
+        json!({ "apply_exact_merges": true }),
+    ));
     assert_eq!(p["auto_merged_exact"], 1, "one duplicate absorbed");
+
+    // The merge is recorded as a memory.merged event (audit trail).
+    let events = payload(&call(
+        &dir,
+        "handoff_events",
+        json!({ "event_type": "memory.merged" }),
+    ));
+    assert_eq!(events["total"], 1, "one memory.merged event: {events}");
+    let detail = events["events"][0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("m-20260601-000000-000001") && detail.contains("m-20260602-000000-000002"),
+        "event detail names keeper and absorbed ids: {detail}"
+    );
 
     // Only the oldest survives, with the other in superseded_ids.
     let ids = list_memory_ids(&dir);
@@ -723,8 +752,8 @@ fn cleanup_merges_exact_duplicates_losslessly() {
 fn cleanup_exact_merge_preserves_absorbed_signal() {
     let (_tmp, dir) = setup_project();
     // Same canonical content, but the two entries differ in tags / scope_paths /
-    // hit_count / last_referenced_at. The keeper must inherit ALL of it — none of
-    // the indexing/scoping signal may be dropped on absorption.
+    // keywords. The keeper must inherit ALL of it — none of the indexing/scoping
+    // signal may be dropped on absorption.
     let hash = lexsim::content_hash("always use atomic_write for handoff files");
     // Ordering is by parsed instant, not by string. The keeper's stamp uses a
     // +09:00 offset that reads "08:00" but is actually 2026-05-31T23:00Z — one
@@ -737,7 +766,6 @@ fn cleanup_exact_merge_preserves_absorbed_signal() {
             "text": "always use atomic_write for handoff files", "kind": "rule",
             "tags": ["a"], "scope_paths": ["src/storage/"], "content_hash": hash,
             "created_at": "2026-06-01T08:00:00+09:00", "updated_at": "2026-06-01T08:00:00+09:00",
-            "hit_count": 3, "last_referenced_at": "2026-06-10T00:00:00Z",
             "superseded_ids": []
         }),
     );
@@ -748,12 +776,15 @@ fn cleanup_exact_merge_preserves_absorbed_signal() {
             "text": "always use atomic_write for handoff files", "kind": "rule",
             "tags": ["b"], "scope_paths": ["src/mcp/"], "content_hash": hash,
             "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z",
-            "hit_count": 40, "last_referenced_at": "2026-06-20T00:00:00Z",
             "superseded_ids": ["m-ancient"]
         }),
     );
 
-    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
+    let p = payload(&call(
+        &dir,
+        "handoff_memory_cleanup",
+        json!({ "apply_exact_merges": true }),
+    ));
     assert_eq!(p["auto_merged_exact"], 1);
 
     let ids = list_memory_ids(&dir);
@@ -787,10 +818,9 @@ fn cleanup_exact_merge_preserves_absorbed_signal() {
         scopes.contains(&"src/storage/") && scopes.contains(&"src/mcp/"),
         "scope_paths unioned: {scopes:?}"
     );
-    assert_eq!(kept["hit_count"], 43, "hit_count summed (3 + 40)");
-    assert_eq!(
-        kept["last_referenced_at"], "2026-06-20T00:00:00Z",
-        "latest last_referenced_at wins"
+    assert!(
+        kept.get("hit_count").is_none() && kept.get("last_referenced_at").is_none(),
+        "usage-stat fields are gone after a merge: {kept}"
     );
     let superseded: Vec<&str> = kept["superseded_ids"]
         .as_array()
@@ -804,13 +834,12 @@ fn cleanup_exact_merge_preserves_absorbed_signal() {
     );
 }
 
-#[test]
-fn cleanup_can_skip_exact_merges() {
-    let (_tmp, dir) = setup_project();
+/// Seed two memories that share a content_hash (an exact duplicate pair).
+fn seed_exact_duplicate_pair(dir: &std::path::Path) {
     let hash = lexsim::content_hash("same text here");
     for id in ["m-20260601-000000-000001", "m-20260602-000000-000002"] {
         write_raw_memory(
-            &dir,
+            dir,
             &json!({
                 "version": 1, "id": id, "text": "same text here", "kind": "lesson",
                 "tags": [], "scope_paths": [], "content_hash": hash,
@@ -819,6 +848,12 @@ fn cleanup_can_skip_exact_merges() {
             }),
         );
     }
+}
+
+#[test]
+fn cleanup_can_skip_exact_merges() {
+    let (_tmp, dir) = setup_project();
+    seed_exact_duplicate_pair(&dir);
     let p = payload(&call(
         &dir,
         "handoff_memory_cleanup",
@@ -826,6 +861,35 @@ fn cleanup_can_skip_exact_merges() {
     ));
     assert_eq!(p["auto_merged_exact"], 0);
     assert_eq!(list_memory_ids(&dir).len(), 2, "no merge applied");
+}
+
+/// v0.47.3 WS6: `apply_exact_merges` defaults to false, so the SessionStart
+/// cleanup (which passes no arguments) deletes no memory and writes no event.
+#[test]
+fn cleanup_without_arguments_deletes_nothing() {
+    let (_tmp, dir) = setup_project();
+    seed_exact_duplicate_pair(&dir);
+    let before: Vec<Vec<u8>> = list_memory_ids(&dir)
+        .iter()
+        .map(|id| std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .collect();
+
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
+    assert_eq!(p["auto_merged_exact"], 0, "merging is opt-in: {p}");
+
+    let after: Vec<Vec<u8>> = list_memory_ids(&dir)
+        .iter()
+        .map(|id| std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .collect();
+    assert_eq!(after.len(), 2, "both duplicates survive");
+    assert_eq!(after, before, "memory files are byte-identical");
+    assert!(
+        !dir.join(".handoff/events.jsonl").exists()
+            || !std::fs::read_to_string(dir.join(".handoff/events.jsonl"))
+                .unwrap()
+                .contains("memory.merged"),
+        "no memory.merged event without a merge"
+    );
 }
 
 #[test]
@@ -945,6 +1009,283 @@ fn cleanup_gcs_old_injected_sidecars() {
     let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(p["injected_sidecars_removed"], 1, "old sidecar gc'd");
     assert!(!injected_dir.join("old-sess.json").exists());
+}
+
+/// v0.47.3 WS6: `memory_injected_gc_days = 0` means "never delete injection
+/// records" (it used to mean cutoff = now, i.e. delete every sidecar).
+#[test]
+fn cleanup_gc_days_zero_keeps_every_injected_sidecar() {
+    let (_tmp, dir) = setup_project();
+    set_config(&dir, "settings.memory_injected_gc_days", json!(0));
+    let injected_dir = dir.join(".handoff/memory/injected");
+    std::fs::create_dir_all(&injected_dir).unwrap();
+    std::fs::write(
+        injected_dir.join("old-sess.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1, "session_id": "old-sess",
+            "updated_at": "2025-01-01T00:00:00Z", "injected": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
+    assert_eq!(p["injected_sidecars_removed"], 0, "gc disabled: {p}");
+    assert!(injected_dir.join("old-sess.json").exists());
+}
+
+/// Stale is a review-candidate list keyed on `updated_at` only: a legacy
+/// `last_referenced_at` is ignored, the entry carries no usage stats, and the
+/// output never proposes deletion.
+#[test]
+fn cleanup_stale_is_based_on_updated_at_and_ignores_legacy_usage_fields() {
+    let (_tmp, dir) = setup_project();
+    let recent = chrono::Utc::now().to_rfc3339();
+    // Old updated_at, but a (legacy) recent last_referenced_at: still a candidate.
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-old-touched",
+            "text": "an old rule", "kind": "rule",
+            "tags": [], "scope_paths": [],
+            "content_hash": lexsim::content_hash("an old rule"),
+            "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+            "hit_count": 87, "last_referenced_at": recent, "superseded_ids": []
+        }),
+    );
+    // Created long ago, updated recently: not a candidate.
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-old-edited",
+            "text": "a recently edited rule", "kind": "rule",
+            "tags": [], "scope_paths": [],
+            "content_hash": lexsim::content_hash("a recently edited rule"),
+            "created_at": "2025-01-01T00:00:00Z", "updated_at": recent,
+            "superseded_ids": []
+        }),
+    );
+
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
+    let stale = p["cleanup_recommendations"]["stale"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "only the old-updated memory: {p}");
+    assert_eq!(stale[0]["id"], "m-old-touched");
+    assert_eq!(stale[0]["updated_at"], "2025-01-01T00:00:00Z");
+    assert!(
+        stale[0].get("hit_count").is_none() && stale[0].get("last_referenced_at").is_none(),
+        "no usage stats in the review list: {}",
+        stale[0]
+    );
+    let text = serde_json::to_string(&p).unwrap().to_lowercase();
+    assert!(
+        !text.contains("delete"),
+        "cleanup output must not propose deleting stale memories: {text}"
+    );
+}
+
+/// Files written by v0.47.2 (with `hit_count` / `last_referenced_at`) still
+/// load and are queryable.
+#[test]
+fn memory_files_with_legacy_usage_fields_still_load() {
+    let (_tmp, dir) = setup_project();
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 2, "id": "m-legacy",
+            "text": "legacy usage stats memory about atomic_write", "kind": "rule",
+            "tags": [], "scope_paths": [], "keywords": [],
+            "content_hash": lexsim::content_hash("legacy usage stats memory about atomic_write"),
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "hit_count": 87, "last_referenced_at": "2026-05-01T00:00:00Z",
+            "superseded_ids": []
+        }),
+    );
+    let before = std::fs::read(dir.join(".handoff/memory/m-legacy.json")).unwrap();
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "atomic_write usage stats", "session_id": "s1" }),
+    ));
+    assert_eq!(q["memories"].as_array().unwrap().len(), 1, "{q}");
+    assert_eq!(
+        std::fs::read(dir.join(".handoff/memory/m-legacy.json")).unwrap(),
+        before,
+        "reading a legacy file does not rewrite it"
+    );
+}
+
+/// Completing / saving a session must never touch the memory store.
+#[test]
+fn saving_and_closing_sessions_never_deletes_memories() {
+    let (_tmp, dir) = setup_project();
+    seed_exact_duplicate_pair(&dir);
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "a rule that must survive session closes", "force": true }),
+    );
+    let ids_before = {
+        let mut v = list_memory_ids(&dir);
+        v.sort();
+        v
+    };
+    let bytes_before: Vec<Vec<u8>> = ids_before
+        .iter()
+        .map(|id| std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .collect();
+
+    for status in ["active", "closed", "active", "closed"] {
+        let resp = call(
+            &dir,
+            "handoff_save_context",
+            json!({ "summary": format!("session {status}"), "session_status": status }),
+        );
+        assert!(!is_error(&resp), "save_context({status}) failed: {resp}");
+    }
+
+    let mut ids_after = list_memory_ids(&dir);
+    ids_after.sort();
+    assert_eq!(ids_after, ids_before, "no memory removed by session saves");
+    let bytes_after: Vec<Vec<u8>> = ids_after
+        .iter()
+        .map(|id| std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .collect();
+    assert_eq!(bytes_after, bytes_before, "no memory rewritten either");
+}
+
+// ---------------------------------------------------------------------------
+// v0.47.3 WS6 (t439.14): memory_strip_usage_stats migration.
+// ---------------------------------------------------------------------------
+
+fn read_memory_json(dir: &std::path::Path, id: &str) -> Value {
+    serde_json::from_slice(&std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .unwrap()
+}
+
+fn seed_usage_stat_memories(dir: &std::path::Path) {
+    for (id, text, with_stats) in [
+        ("m-stats-1", "first memory with usage stats", true),
+        ("m-stats-2", "second memory with usage stats", true),
+        ("m-clean-3", "third memory without usage stats", false),
+    ] {
+        let mut m = json!({
+            "version": 2, "id": id, "text": text, "kind": "rule",
+            "tags": ["keep-me"], "keywords": [], "scope_paths": [],
+            "content_hash": lexsim::content_hash(text),
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-02-02T00:00:00Z",
+            "superseded_ids": []
+        });
+        if with_stats {
+            m["hit_count"] = json!(87);
+            m["last_referenced_at"] = json!("2026-05-01T00:00:00Z");
+        }
+        write_raw_memory(dir, &m);
+    }
+}
+
+#[test]
+fn strip_usage_stats_defaults_to_dry_run_and_reports_only_counts() {
+    let (_tmp, dir) = setup_project();
+    seed_usage_stat_memories(&dir);
+    let before: Vec<Vec<u8>> = ["m-stats-1", "m-stats-2", "m-clean-3"]
+        .iter()
+        .map(|id| std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .collect();
+
+    let p = payload(&call(&dir, "handoff_memory_strip_usage_stats", json!({})));
+    assert_eq!(p["mode"], "dry_run");
+    assert_eq!(p["scanned"], 3);
+    assert_eq!(p["with_usage_stats"], 2);
+    assert_eq!(p["stripped"], 0, "dry run strips nothing");
+    assert_eq!(p["skipped_unparseable"], 0);
+    // Counts only: no memory bodies or ids leak into the report.
+    let rendered = serde_json::to_string(&p).unwrap();
+    assert!(
+        !rendered.contains("first memory") && !rendered.contains("m-stats-1"),
+        "report must contain counts only: {rendered}"
+    );
+
+    let after: Vec<Vec<u8>> = ["m-stats-1", "m-stats-2", "m-clean-3"]
+        .iter()
+        .map(|id| std::fs::read(dir.join(format!(".handoff/memory/{id}.json"))).unwrap())
+        .collect();
+    assert_eq!(after, before, "dry run leaves every file byte-identical");
+}
+
+#[test]
+fn strip_usage_stats_apply_removes_only_the_two_keys_and_keeps_updated_at() {
+    let (_tmp, dir) = setup_project();
+    seed_usage_stat_memories(&dir);
+    let untouched_before = std::fs::read(dir.join(".handoff/memory/m-clean-3.json")).unwrap();
+
+    let p = payload(&call(
+        &dir,
+        "handoff_memory_strip_usage_stats",
+        json!({ "apply": true }),
+    ));
+    assert_eq!(p["mode"], "apply");
+    assert_eq!(p["scanned"], 3);
+    assert_eq!(p["with_usage_stats"], 2);
+    assert_eq!(p["stripped"], 2);
+
+    for id in ["m-stats-1", "m-stats-2"] {
+        let m = read_memory_json(&dir, id);
+        assert!(m.get("hit_count").is_none(), "{id}: {m}");
+        assert!(m.get("last_referenced_at").is_none(), "{id}: {m}");
+        assert_eq!(m["updated_at"], "2026-02-02T00:00:00Z", "updated_at kept");
+        assert_eq!(m["created_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(m["tags"], json!(["keep-me"]), "other fields untouched");
+        assert_eq!(m["kind"], "rule");
+    }
+    assert_eq!(
+        std::fs::read(dir.join(".handoff/memory/m-clean-3.json")).unwrap(),
+        untouched_before,
+        "files without the keys are not rewritten"
+    );
+
+    // Idempotent: a second apply finds nothing left to strip.
+    let again = payload(&call(
+        &dir,
+        "handoff_memory_strip_usage_stats",
+        json!({ "apply": true }),
+    ));
+    assert_eq!(again["with_usage_stats"], 0);
+    assert_eq!(again["stripped"], 0);
+}
+
+#[test]
+fn strip_usage_stats_skips_and_counts_unparseable_files() {
+    let (_tmp, dir) = setup_project();
+    seed_usage_stat_memories(&dir);
+    let mem_dir = dir.join(".handoff/memory");
+    std::fs::write(mem_dir.join("m-broken.json"), b"{not json").unwrap();
+    std::fs::write(mem_dir.join("m-array.json"), b"[1, 2, 3]").unwrap();
+
+    let p = payload(&call(
+        &dir,
+        "handoff_memory_strip_usage_stats",
+        json!({ "apply": true }),
+    ));
+    assert_eq!(p["scanned"], 5);
+    assert_eq!(p["skipped_unparseable"], 2, "{p}");
+    assert_eq!(p["stripped"], 2);
+    assert_eq!(
+        std::fs::read(mem_dir.join("m-broken.json")).unwrap(),
+        b"{not json",
+        "unparseable files are left as they were"
+    );
+}
+
+#[test]
+fn strip_usage_stats_is_a_write_tool_listed_in_tools_list() {
+    let resp = send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#).unwrap();
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "handoff_memory_strip_usage_stats")
+        .expect("handoff_memory_strip_usage_stats must be registered");
+    assert!(tool["inputSchema"]["properties"]["apply"].is_object());
+    assert_eq!(tool["inputSchema"]["properties"]["apply"]["default"], false);
 }
 
 // ---------------------------------------------------------------------------

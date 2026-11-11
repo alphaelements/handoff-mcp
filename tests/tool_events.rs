@@ -285,9 +285,7 @@ fn load_context_records_agent_registered_event() {
 /// (reconnect) must not append another `agent.registered` event.
 #[test]
 fn load_context_reconnect_does_not_duplicate_agent_registered_event() {
-    let _guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
-    let saved = std::env::var("CLAUDE_SESSION_ID").ok();
-    std::env::set_var("CLAUDE_SESSION_ID", "s-events-reconnect-test");
+    let _agent = PinnedAgent::new("s-events-reconnect-test");
 
     let dir = setup();
     let project_dir = init(&dir);
@@ -312,11 +310,6 @@ fn load_context_reconnect_does_not_duplicate_agent_registered_event() {
         1,
         "reconnect must not duplicate agent.registered: {parsed}"
     );
-
-    match saved {
-        Some(v) => std::env::set_var("CLAUDE_SESSION_ID", v),
-        None => std::env::remove_var("CLAUDE_SESSION_ID"),
-    }
 }
 
 /// `handoff_save_context` with `session_status='active'` creating a brand
@@ -352,6 +345,9 @@ fn save_context_records_session_created_event() {
 /// `session.closed` event.
 #[test]
 fn save_context_records_session_closed_event() {
+    // Pinned: an active session is only closed by its owner, so the identity
+    // must not change between the two saves.
+    let _agent = PinnedAgent::new("agent-closed-event");
     let dir = setup();
     let project_dir = init(&dir);
 
@@ -410,6 +406,337 @@ fn save_context_new_directly_closed_session_does_not_record_closed_event() {
         0,
         "no active session existed to close: {parsed}"
     );
+}
+
+/// Holds `AGENT_ID_GLOBAL` and pins the process-wide agent identity to `id`
+/// for the guard's lifetime, then restores the unregistered (`None`) state.
+struct PinnedAgent {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl PinnedAgent {
+    fn new(id: &str) -> Self {
+        let lock = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        handoff_mcp::mcp::router::set_agent_id(id.to_string());
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for PinnedAgent {
+    fn drop(&mut self) {
+        handoff_mcp::mcp::router::reset_agent_id_for_test();
+    }
+}
+
+fn events_of(project_dir: &str, event_type: &str) -> Vec<Value> {
+    let resp = call(
+        "handoff_events",
+        json!({ "project_dir": project_dir, "event_type": event_type }),
+    );
+    text_of(&resp)["events"].as_array().unwrap().clone()
+}
+
+/// The `session_id` out of a `save_context` reply ("Session ID: <id>").
+fn saved_session_id(resp: &Value) -> String {
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    text.lines()
+        .find_map(|l| l.strip_prefix("Session ID: "))
+        .unwrap_or_else(|| panic!("no Session ID line in: {text}"))
+        .trim()
+        .to_string()
+}
+
+fn session_json(project_dir: &str, session_id: &str) -> Value {
+    let dir = std::path::Path::new(project_dir).join(".handoff/sessions");
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if v["id"] == session_id {
+            return v;
+        }
+    }
+    panic!("session {session_id} not found");
+}
+
+/// t439.4 AC1: a new *active* session's `session.created` carries the
+/// caller's `agent_id` and the new session's id.
+#[test]
+fn save_context_active_created_event_carries_agent_id() {
+    let _agent = PinnedAgent::new("agent-created-active");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    let resp = call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "session_status": "active", "summary": "a" }),
+    );
+    let sid = saved_session_id(&resp);
+
+    let events = events_of(&project_dir, "session.created");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["agent_id"], "agent-created-active");
+    assert_eq!(events[0]["session_id"], sid);
+}
+
+/// t439.4 AC1+AC3: a brand-new *closed* session also emits `session.created`
+/// with `agent_id`, and stores `agent_id` / `worktree` / `scope` itself.
+#[test]
+fn save_context_new_closed_session_emits_created_and_records_ownership() {
+    let _agent = PinnedAgent::new("agent-created-closed");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    let resp = call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "summary": "one-shot closed" }),
+    );
+    let sid = saved_session_id(&resp);
+
+    let events = events_of(&project_dir, "session.created");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["agent_id"], "agent-created-closed");
+    assert_eq!(events[0]["session_id"], sid);
+
+    let session = session_json(&project_dir, &sid);
+    assert_eq!(session["agent_id"], "agent-created-closed");
+    assert_eq!(session["worktree"], project_dir);
+    assert!(
+        session["scope"].is_string(),
+        "scope must be auto-detected and stored: {session}"
+    );
+}
+
+/// Closing an existing active session is not a creation: no extra
+/// `session.created`, and the owner recorded at creation is kept.
+#[test]
+fn save_context_closing_active_session_emits_no_second_created() {
+    let _agent = PinnedAgent::new("agent-close-existing");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "session_status": "active", "summary": "start" }),
+    );
+    // Another caller's close never reaches this session (it is refused and
+    // saved as that caller's own session; see `session_ownership_e2e`), so this
+    // closes it as its owner.
+    let closed = call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "summary": "end" }),
+    );
+    let sid = saved_session_id(&closed);
+
+    assert_eq!(events_of(&project_dir, "session.created").len(), 1);
+    assert_eq!(
+        session_json(&project_dir, &sid)["agent_id"],
+        "agent-close-existing"
+    );
+}
+
+/// t439.4 AC1: `import_context` creating a session emits `session.created`.
+#[test]
+fn import_context_session_emits_created_with_agent_id() {
+    let _agent = PinnedAgent::new("agent-import");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    call(
+        "handoff_import_context",
+        json!({
+            "project_dir": project_dir,
+            "source": { "description": "notes", "format": "other" },
+            "session": { "summary": "imported work" }
+        }),
+    );
+
+    let events = events_of(&project_dir, "session.created");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["agent_id"], "agent-import");
+    let sid = events[0]["session_id"].as_str().unwrap();
+    assert_eq!(session_json(&project_dir, sid)["summary"], "imported work");
+}
+
+/// t439.4 AC1: the raw_notes-only import path creates a session too.
+#[test]
+fn import_context_raw_notes_emits_created_with_agent_id() {
+    let _agent = PinnedAgent::new("agent-import-raw");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    call(
+        "handoff_import_context",
+        json!({
+            "project_dir": project_dir,
+            "source": { "description": "chat log", "format": "other" },
+            "raw_notes": "some notes"
+        }),
+    );
+
+    let events = events_of(&project_dir, "session.created");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["agent_id"], "agent-import-raw");
+}
+
+/// t439.4 AC1: `fork_session` emits `session.created` for the forked id.
+#[test]
+fn fork_session_emits_created_with_agent_id() {
+    let _agent = PinnedAgent::new("agent-fork");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    let src = call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "session_status": "active", "summary": "source" }),
+    );
+    let source_id = saved_session_id(&src);
+
+    let resp = call(
+        "handoff_fork_session",
+        json!({
+            "project_dir": project_dir,
+            "source_session_id": source_id,
+            "summary": "forked"
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let forked_id = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Session ID: "))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let created = events_of(&project_dir, "session.created");
+    let fork_event = created
+        .iter()
+        .find(|e| e["session_id"] == forked_id)
+        .unwrap_or_else(|| panic!("no session.created for fork: {created:?}"));
+    assert_eq!(fork_event["agent_id"], "agent-fork");
+}
+
+/// SPEC-V0473-107 (provisional): merge updates an existing target and
+/// creates nothing, so it must not emit `session.created`.
+#[test]
+fn merge_sessions_emits_no_session_created() {
+    let _agent = PinnedAgent::new("agent-merge");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    let a = saved_session_id(&call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "session_status": "active", "summary": "a" }),
+    ));
+    let b = saved_session_id(&call(
+        "handoff_fork_session",
+        json!({ "project_dir": project_dir, "source_session_id": a, "summary": "b" }),
+    ));
+    let before = events_of(&project_dir, "session.created").len();
+
+    call(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": project_dir,
+            "source_session_ids": [a, b],
+            "target_session_id": a
+        }),
+    );
+
+    assert_eq!(events_of(&project_dir, "session.created").len(), before);
+}
+
+/// t439.4 AC2: open -> active (implicit activation by `load_context`) emits
+/// `session.activated` for the transitioned session, with the caller's id.
+#[test]
+fn load_context_implicit_activation_emits_session_activated() {
+    let _agent = PinnedAgent::new("agent-activate");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    call(
+        "handoff_import_context",
+        json!({
+            "project_dir": project_dir,
+            "source": { "description": "notes", "format": "other" },
+            "session": { "summary": "open one" }
+        }),
+    );
+    let created = events_of(&project_dir, "session.created");
+    let sid = created[0]["session_id"].as_str().unwrap().to_string();
+
+    call(
+        "handoff_load_context",
+        json!({ "project_dir": project_dir }),
+    );
+
+    let events = events_of(&project_dir, "session.activated");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["session_id"], sid);
+    assert_eq!(events[0]["agent_id"], "agent-activate");
+    assert!(events_of(&project_dir, "session.resumed").is_empty());
+}
+
+/// t439.4 AC2: `load_context(session_id=<open>)` also emits `session.activated`.
+#[test]
+fn load_context_explicit_open_session_emits_session_activated() {
+    let _agent = PinnedAgent::new("agent-activate-explicit");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    for summary in ["open one", "open two"] {
+        call(
+            "handoff_import_context",
+            json!({
+                "project_dir": project_dir,
+                "source": { "description": "notes", "format": "other" },
+                "session": { "summary": summary },
+                "skip_session_close": true
+            }),
+        );
+    }
+    let created = events_of(&project_dir, "session.created");
+    let sid = created[1]["session_id"].as_str().unwrap().to_string();
+
+    call(
+        "handoff_load_context",
+        json!({ "project_dir": project_dir, "session_id": sid }),
+    );
+
+    let events = events_of(&project_dir, "session.activated");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["session_id"], sid);
+}
+
+/// t439.4 AC2: paused -> active emits `session.resumed` (and not
+/// `session.activated`).
+#[test]
+fn load_context_resuming_paused_session_emits_session_resumed() {
+    let _agent = PinnedAgent::new("agent-resume");
+    let dir = setup();
+    let project_dir = init(&dir);
+
+    let sid = saved_session_id(&call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "session_status": "active", "summary": "p" }),
+    ));
+    call(
+        "handoff_save_context",
+        json!({ "project_dir": project_dir, "pause_only": true, "pause_active": true }),
+    );
+
+    call(
+        "handoff_load_context",
+        json!({ "project_dir": project_dir, "session_id": sid }),
+    );
+
+    let events = events_of(&project_dir, "session.resumed");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["session_id"], sid);
+    assert_eq!(events[0]["agent_id"], "agent-resume");
+    assert!(events_of(&project_dir, "session.activated").is_empty());
 }
 
 fn update_status(project_dir: &str, task_id: &str, status: &str) {

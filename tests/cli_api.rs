@@ -49,8 +49,8 @@ fn init_project(dir: &std::path::Path) {
     std::fs::write(&cfg, s).unwrap();
 }
 
-/// The CLI has no `doc` group, so a layer document is saved through the
-/// binary's stdio JSON-RPC transport (one request, then the server is closed).
+/// Saves a layer document through the binary's stdio JSON-RPC transport (one
+/// request, then the server is closed), independently of the CLI under test.
 fn save_requirement_doc_over_stdio(project_dir: &str) {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
@@ -332,6 +332,68 @@ fn session_load_via_cli() {
 }
 
 #[test]
+fn session_load_task_tree_and_task_scope_flags_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+    for title in ["Alpha", "Beta"] {
+        let task = serde_json::json!({
+            "title": title,
+            "status": "done",
+            "priority": "low",
+            "schedule": { "estimate_hours": 1 },
+        })
+        .to_string();
+        let (stdout, _, code) = run(&["task", "update", "--project-dir", dir, "--task", &task]);
+        assert_eq!(code, 0, "task update failed: {stdout}");
+    }
+
+    // Compact is the default; a single --task-scope value is a one-item list,
+    // and a done task named by it is not included.
+    let (stdout, _, code) = run(&[
+        "session",
+        "load",
+        "--project-dir",
+        dir,
+        "--task-scope",
+        "t1",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let compact: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(compact["task_tree_meta"]["mode"], "compact");
+    assert_eq!(compact["task_tree"].as_array().unwrap().len(), 0);
+    assert_eq!(compact["task_tree_meta"]["omitted_total"], 2);
+
+    let (stdout, _, code) = run(&[
+        "session",
+        "load",
+        "--project-dir",
+        dir,
+        "--task-tree",
+        "full",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let full: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(full["task_tree_meta"]["mode"], "full");
+    assert_eq!(full["task_tree"].as_array().unwrap().len(), 2);
+
+    let (stdout, stderr, code) = run(&[
+        "session",
+        "load",
+        "--project-dir",
+        dir,
+        "--task-tree",
+        "wide",
+    ]);
+    assert_ne!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("compact") && stdout.contains("full")
+            || stderr.contains("compact") && stderr.contains("full"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn config_get_via_cli() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().to_str().unwrap();
@@ -597,4 +659,166 @@ fn trace_test_run_campaign_via_cli() {
 
     let (stdout, _, _) = run(&["trace", "--help"]);
     assert!(stdout.contains("test-run"), "{stdout}");
+}
+
+/// Creates task `t1` through the CLI and returns its requirement stable_ids as
+/// `task get` reports them (the `requirement` entries of `task_links`).
+fn linked_requirements(dir: &str, task_id: &str) -> Vec<String> {
+    let (stdout, stderr, code) = run(&["task", "get", "--project-dir", dir, "--task-id", task_id]);
+    assert_eq!(code, 0, "task get failed: {stdout} {stderr}");
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let mut ids: Vec<String> = task["task_links"]
+        .as_array()
+        .map(|links| {
+            links
+                .iter()
+                .filter(|l| l["link_type"] == "requirement")
+                .filter_map(|l| l["label"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+fn create_cli_task(dir: &str) {
+    let (stdout, _, code) = run(&[
+        "task",
+        "update",
+        "--project-dir",
+        dir,
+        "--id",
+        "t1",
+        "--title",
+        "CLI task",
+        "--status",
+        "todo",
+    ]);
+    assert_eq!(code, 0, "create failed: {stdout}");
+}
+
+/// WS1 / t430 (SPEC-V0473-101): the CLI-equivalent table given to sub-agents
+/// writes `requirement_ids` through `--task '{...}'`; `task get` must show the
+/// stored link.
+#[test]
+fn task_update_json_task_arg_stores_requirement_ids() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+    save_requirement_doc_over_stdio(dir);
+    create_cli_task(dir);
+
+    let (stdout, stderr, code) = run(&[
+        "task",
+        "update",
+        "--project-dir",
+        dir,
+        "--task",
+        r#"{"id":"t1","requirement_ids":["REQ-001"]}"#,
+    ]);
+    assert_eq!(code, 0, "update failed: {stdout} {stderr}");
+    assert_eq!(linked_requirements(dir, "t1"), vec!["REQ-001".to_string()]);
+}
+
+/// The flat `--requirement-ids` flag used to land at the top level of the
+/// arguments and be silently dropped; it must be routed into `task`, and a
+/// single value (no comma) must still be a one-element array.
+#[test]
+fn task_update_flat_requirement_ids_flag_is_routed_into_task() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+    save_requirement_doc_over_stdio(dir);
+    create_cli_task(dir);
+
+    let (stdout, stderr, code) = run(&[
+        "task",
+        "update",
+        "--project-dir",
+        dir,
+        "--id",
+        "t1",
+        "--requirement-ids",
+        "REQ-001",
+    ]);
+    assert_eq!(code, 0, "update failed: {stdout} {stderr}");
+    assert_eq!(linked_requirements(dir, "t1"), vec!["REQ-001".to_string()]);
+}
+
+/// `trace update` reports an invalid op as `failed` in a normal response. The
+/// CLI used to exit 0 on it, so a sub-agent branching on `$?` believed the
+/// write had landed.
+#[test]
+fn trace_update_failure_exits_non_zero() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+    save_requirement_doc_over_stdio(dir);
+
+    let (stdout, _, code) = run(&[
+        "trace",
+        "update",
+        "--project-dir",
+        dir,
+        "--ops",
+        r#"[{"op":"set","item":"NO-SUCH-ITEM","dev_stage":"implemented"}]"#,
+    ]);
+    assert_eq!(code, 1, "a failed op must exit 1: {stdout}");
+    let out: serde_json::Value = serde_json::from_str(&stdout).expect("failure body stays JSON");
+    assert!(out["failed"].is_object(), "{stdout}");
+
+    let (stdout, _, code) = run(&[
+        "trace",
+        "update",
+        "--project-dir",
+        dir,
+        "--ops",
+        r#"[{"op":"set","item":"REQ-001","dev_stage":"implemented"}]"#,
+    ]);
+    assert_eq!(code, 0, "a valid op must still exit 0: {stdout}");
+}
+
+/// `doc update-section --seq 1`: `seq` is an integer parameter, so the CLI has
+/// to coerce it (the session-spec-reconciler's CLI fallback table relies on
+/// this command).
+#[test]
+fn doc_update_section_accepts_numeric_seq_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+    let body = tmp.path().join("plain.md");
+    std::fs::write(&body, "# A\n\nfirst\n\n## B\n\nsecond\n").unwrap();
+    let (stdout, stderr, code) = run(&[
+        "doc",
+        "save",
+        "--project-dir",
+        dir,
+        "--slug",
+        "plain",
+        "--title",
+        "Plain",
+        "--body-file",
+        body.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "doc save failed: {stdout} {stderr}");
+    let saved: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let doc_id = saved["doc_id"].as_str().unwrap().to_string();
+
+    let (stdout, stderr, code) = run(&[
+        "doc",
+        "update-section",
+        "--project-dir",
+        dir,
+        "--doc-id",
+        &doc_id,
+        "--seq",
+        "1",
+        "--new-content",
+        "## B\n\nchanged\n",
+    ]);
+    assert_eq!(code, 0, "update-section failed: {stdout} {stderr}");
+
+    let (stdout, _, code) = run(&["doc", "get", "--project-dir", dir, "--doc-id", &doc_id]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("changed"), "section not updated: {stdout}");
 }

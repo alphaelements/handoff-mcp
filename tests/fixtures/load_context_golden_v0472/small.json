@@ -1,0 +1,306 @@
+{
+  "project": "golden-small",
+  "task_tree": [
+    {
+      "id": "t1",
+      "title": "Epic A",
+      "status": "in_progress",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "estimate_hours": 20.0,
+        "milestone": "M1"
+      }
+    },
+    {
+      "id": "t1.1",
+      "title": "A child done",
+      "status": "done",
+      "schedule": {
+        "due_date": "2020-01-10",
+        "milestone": "M1"
+      }
+    },
+    {
+      "id": "t1.2",
+      "title": "A child in progress",
+      "status": "in_progress",
+      "schedule": {
+        "due_date": "2020-01-10",
+        "estimate_hours": 4.0,
+        "milestone": "M1"
+      },
+      "assignee": "alice"
+    },
+    {
+      "id": "t1.2.1",
+      "title": "A grandchild todo",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t1.2.2",
+      "title": "A grandchild review",
+      "status": "review",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t1.3",
+      "title": "A child blocked",
+      "status": "blocked",
+      "schedule": {
+        "due_date": "2020-01-10"
+      },
+      "dependencies": [
+        "t1.1"
+      ]
+    },
+    {
+      "id": "t10",
+      "title": "Standalone 10",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t11",
+      "title": "Standalone 11",
+      "status": "done",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t12",
+      "title": "Standalone 12",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2020-01-10"
+      }
+    },
+    {
+      "id": "t13",
+      "title": "Standalone 13",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t14",
+      "title": "Standalone 14",
+      "status": "done",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t15",
+      "title": "Standalone 15",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t2",
+      "title": "Epic B",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t2.1",
+      "title": "B child 1",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t2.2",
+      "title": "B child 2",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t2.3",
+      "title": "B child 3",
+      "status": "done",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t2.4",
+      "title": "B child 4",
+      "status": "skipped",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t2.5",
+      "title": "B child 5",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t2.6",
+      "title": "B child 6",
+      "status": "in_progress",
+      "schedule": {
+        "due_date": "2099-12-31",
+        "milestone": "M2"
+      }
+    },
+    {
+      "id": "t3",
+      "title": "Epic C all done",
+      "status": "done"
+    },
+    {
+      "id": "t3.1",
+      "title": "C child 1",
+      "status": "done"
+    },
+    {
+      "id": "t3.2",
+      "title": "C child 2",
+      "status": "done"
+    },
+    {
+      "id": "t3.3",
+      "title": "C child 3",
+      "status": "done"
+    },
+    {
+      "id": "t4",
+      "title": "Standalone 4",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2020-01-10"
+      }
+    },
+    {
+      "id": "t5",
+      "title": "Standalone 5",
+      "status": "done",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t6",
+      "title": "Standalone 6",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t7",
+      "title": "Standalone 7",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    },
+    {
+      "id": "t9",
+      "title": "Standalone 9",
+      "status": "todo",
+      "schedule": {
+        "due_date": "2099-12-31"
+      }
+    }
+  ],
+  "task_summary": {
+    "total": 29,
+    "by_status": {
+      "todo": 13,
+      "blocked": 1,
+      "skipped": 1,
+      "in_progress": 3,
+      "review": 1,
+      "done": 10
+    },
+    "total_estimate_hours": 24.0,
+    "total_actual_hours": 0.0,
+    "completion_rate": 0.3793103448275862,
+    "overdue_count": 4
+  },
+  "agent_id": "<agent_id>",
+  "claimed_tasks": [],
+  "warnings": [
+    {
+      "severity": "warning",
+      "code": "INCOMPLETE_TASKS",
+      "message": "1 task(s) from the previous session are still in progress: t1.2",
+      "fix_hint": "Review these tasks and mark them done or blocked."
+    }
+  ],
+  "previous_session": {
+    "summary": "golden previous session",
+    "ended_at": "<ts>",
+    "branch": "unknown",
+    "commit": "unknown",
+    "id": "<session_id>"
+  },
+  "session_guidance": {
+    "action": "create_session",
+    "message": "No active session. Before starting work, call handoff_save_context with session_status='active' to establish a session. Include inherited context (decisions, context_pointers, references) from the previous session so your work survives interruptions.",
+    "suggested_fields": {
+      "summary": "Continuing: golden previous session",
+      "related_task_ids": [
+        "t1",
+        "t1.2",
+        "t1.2.1",
+        "t1.2.2",
+        "t1.3",
+        "t10",
+        "t12",
+        "t13",
+        "t15",
+        "t2",
+        "t2.1",
+        "t2.2",
+        "t2.5",
+        "t2.6",
+        "t4",
+        "t6",
+        "t7",
+        "t9"
+      ]
+    }
+  },
+  "child_projects": [],
+  "trace_health": {
+    "has_data": false,
+    "warnings": []
+  },
+  "suspect_summary": null,
+  "requirements_health": {
+    "has_data": false,
+    "warnings": []
+  },
+  "docs_health": {
+    "has_data": false,
+    "warnings": []
+  }
+}

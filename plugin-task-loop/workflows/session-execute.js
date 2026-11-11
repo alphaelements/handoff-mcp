@@ -411,7 +411,7 @@ function resolveResponseLanguage(value, taskList) {
     const normalized = value.trim();
     // A free-form phrase is not a language label and becomes prompt content
     // when interpolated below. Accept either a single Unicode word (English,
-    // Français, 日本語) or the safe, commonly used BCP-47 subset
+    // Français, Deutsch) or the safe, commonly used BCP-47 subset
     // language[-Script][-REGION] (ja, en-US, zh-Hant-TW). This deliberately
     // excludes sentence punctuation, whitespace, and arbitrary variant text.
     const isLanguageName = /^[\p{L}\p{M}]+$/u.test(normalized);
@@ -725,6 +725,26 @@ const CLOSER_SCHEMA = {
           },
           // True when update_task's response carried `schedule_stale: true`.
           schedule_stale: { type: 'boolean' },
+          // Calls the closer attempted for this task that failed (handoff tool
+          // error, CLI non-zero exit, a `failed` op in a trace update).
+          ops_failed: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { op: { type: 'string' }, error: { type: 'string' } },
+              required: ['op', 'error'],
+            },
+          },
+          // Calls the closer could not attempt at all (no handoff tool and no
+          // working CLI, or skipped because a prerequisite call failed).
+          unexecuted_ops: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { op: { type: 'string' }, reason: { type: 'string' } },
+              required: ['op', 'reason'],
+            },
+          },
           notes: { type: 'string' },
         },
         required: ['task_id', 'status_set'],
@@ -1961,8 +1981,11 @@ function buildCloserPrompt() {
     `   role: 'implements'}, {op: 'set', item: <stable_id>, dev_stage: 'implemented'}])\`.`,
     `4. Link the same stable_ids (plus any pre-linked above) with`,
     `   \`handoff_update_task(task={id, requirement_ids: [...]})\`.`,
-    `5. If a call fails for one task, record it in \`warnings\` and continue with the remaining`,
-    `   tasks. Never abort the whole close-out for one task's error.`,
+    `5. If a call fails for one task, record it in that task's \`ops_failed\` ({op, error}) and`,
+    `   continue with the remaining tasks. Never abort the whole close-out for one task's error.`,
+    `   A call you could not attempt (no handoff tool and no working CLI) goes in that task's`,
+    `   \`unexecuted_ops\` ({op, reason}). Never skip a call silently and never report a task as`,
+    `   closed when one of its calls failed.`,
     ``,
     `Do not edit code or re-run tests. Report exactly what you did in the structured result.`,
     ``,
@@ -3238,6 +3261,11 @@ if (sessionPassed && HAS_RECONCILE_STAGE) {
 // the close-out by hand instead of silently skipping it.
 let closerResult = null;
 const closerWarnings = [...specPrepWarnings, ...reconcileWarnings];
+// Tasks whose close-out the closer reported as failed or incomplete
+// (ops_failed / unexecuted_ops), tasks missing from its tasks_processed, or
+// every task when the closer itself failed (`error`). Empty when the closer
+// did not run.
+const closerFailedTasks = [];
 if (sessionPassed && HAS_TEST_STAGE) {
   phase('Close');
   log(`--- Close | Session ${session_id} ---`);
@@ -3273,7 +3301,31 @@ if (sessionPassed && HAS_TEST_STAGE) {
     for (const t of tasks) {
       if (!processed.has(t.id)) {
         closerWarnings.push(`Closer did not report on task ${t.id}: not processed — close it manually.`);
+        if (!closerFailedTasks.includes(t.id)) closerFailedTasks.push(t.id);
       }
+    }
+  }
+  // A failed or unattempted call means the task is NOT closed, whatever
+  // status_set claims: surface it instead of treating the result as clean.
+  // This runs with a top-level `error` too: a closer with no handoff access is
+  // told to list every call under `unexecuted_ops` AND set `error`.
+  for (const p of closerResult.tasks_processed) {
+    const failed = Array.isArray(p.ops_failed) ? p.ops_failed : [];
+    const unexecuted = Array.isArray(p.unexecuted_ops) ? p.unexecuted_ops : [];
+    if (failed.length === 0 && unexecuted.length === 0) continue;
+    closerFailedTasks.push(p.task_id);
+    const parts = [
+      ...failed.map((o) => `${o.op} failed: ${o.error}`),
+      ...unexecuted.map((o) => `${o.op} not executed: ${o.reason}`),
+    ];
+    closerWarnings.push(
+      `closer_failed: task ${p.task_id} close-out is incomplete (${parts.join('; ')}) — finish it manually.`,
+    );
+  }
+  // A closer-level error leaves every task of the session to close by hand.
+  if (closerResult.error) {
+    for (const id of TASK_IDS) {
+      if (!closerFailedTasks.includes(id)) closerFailedTasks.push(id);
     }
   }
   if (Array.isArray(closerResult.warnings)) {
@@ -3320,6 +3372,10 @@ return {
   // pass), and the manager-facing warnings it produced (closer failure, tasks
   // it skipped, per-task errors it reported).
   closer_report: closerResult,
+  // Task ids the closer reported as failed/incomplete (ops_failed or
+  // unexecuted_ops non-empty), or every task when the closer failed
+  // (`closer_report.error`); the manager closes these by hand.
+  closer_failed_tasks: closerFailedTasks,
   warnings: closerWarnings,
   // Findings still unresolved when the last main-loop round ran out, one entry
   // per finding (not bucketed by task — see extractUnresolvedFindings). Empty

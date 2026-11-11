@@ -1,14 +1,112 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use super::HandlerContext;
+use super::save_context::{
+    append_session_event, prune_sessions_per_config, transition_group_member,
+};
+use super::{lineage, HandlerContext};
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
+use crate::storage::session_target::{own_active_group, Caller, OWNER_V};
 use crate::storage::sessions::{
-    close_active_sessions, enforce_history_limit, write_open_session, SessionData,
+    generate_session_id, read_session_entries, write_open_session, SessionData,
 };
 use crate::storage::tasks::*;
+
+/// Write an imported session as `open` and record its `session.created`
+/// event (carrying the caller's `agent_id`). The id is assigned here so the
+/// event can name the session the writer creates.
+fn write_imported_session(
+    ctx: &HandlerContext,
+    sessions_dir: &Path,
+    mut data: SessionData,
+    closed_active: Option<String>,
+) -> Result<()> {
+    let session_id = data.id.get_or_insert_with(generate_session_id).clone();
+    // The import replaces the caller's own active session, so it continues
+    // that one; with none to replace it decides like any other creation.
+    let continues = match closed_active {
+        Some(id) => {
+            lineage::forget(&ctx.handoff_dir, &ctx.project_dir.to_string_lossy());
+            vec![id]
+        }
+        None => {
+            let entries = read_session_entries(sessions_dir)?;
+            lineage::continues_for_new(&lineage::NewSessionLineage {
+                ctx,
+                sessions_dir,
+                entries: &entries,
+                explicit: None,
+                token: None,
+                parent: None,
+                scope: crate::storage::detect_session_scope(&ctx.project_dir),
+            })?
+            .continues
+        }
+    };
+    lineage::stamp_new(&mut data, continues, &ctx.project_dir);
+    write_open_session(sessions_dir, &data)?;
+    append_session_event(
+        &ctx.handoff_dir,
+        "session.created",
+        Some(&session_id),
+        ctx.agent_id.as_deref(),
+    );
+    Ok(())
+}
+
+/// Close the caller's own active sessions (and ownerless ones) before an
+/// imported session replaces them. Another agent's active session is never
+/// closed by an import, and neither is one that changed hands since it was
+/// read (reported in `notes`). Returns the id of the most recently updated
+/// session it closed, which the import continues.
+fn close_own_active_sessions(
+    ctx: &HandlerContext,
+    sessions_dir: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<String>> {
+    let worktree = ctx.project_dir.to_string_lossy().to_string();
+    let caller = Caller {
+        agent_id: ctx.agent_id.as_deref(),
+        worktree: &worktree,
+    };
+    let entries = read_session_entries(sessions_dir)?;
+    let mut latest: Option<(Option<&str>, &str)> = None;
+    for entry in own_active_group(&entries, &caller) {
+        if !transition_group_member(ctx, sessions_dir, entry, &caller, "closed", notes)? {
+            continue;
+        }
+        append_session_event(
+            &ctx.handoff_dir,
+            "session.closed",
+            entry.data.id.as_deref(),
+            ctx.agent_id.as_deref(),
+        );
+        if let Some(id) = entry.data.id.as_deref() {
+            let key = (entry.data.ended_at.as_deref(), id);
+            if latest.is_none_or(|l| key > l) {
+                latest = Some(key);
+            }
+        }
+    }
+    Ok(latest.map(|(_, id)| id.to_string()))
+}
+
+/// Ownership of a session written by this call: the caller's identity (none
+/// for the CLI), worktree and scope.
+fn imported_owner(
+    ctx: &HandlerContext,
+) -> (Option<String>, Option<u32>, Option<String>, Option<String>) {
+    (
+        ctx.agent_id.clone(),
+        ctx.agent_id.as_ref().map(|_| OWNER_V),
+        Some(ctx.project_dir.to_string_lossy().to_string()),
+        Some(crate::storage::detect_session_scope(&ctx.project_dir).to_string()),
+    )
+}
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let project_dir = &ctx.project_dir;
@@ -84,6 +182,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .unwrap_or(false);
 
     let mut session_saved = false;
+    let mut prune_lines: Vec<String> = Vec::new();
+    let mut close_notes: Vec<String> = Vec::new();
     if let Some(session) = arguments.get("session") {
         let summary = session
             .get("summary")
@@ -92,9 +192,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 anyhow::anyhow!("'session.summary' is required when session is provided")
             })?;
 
-        if !skip_session_close {
-            close_active_sessions(&sessions_dir)?;
-        }
+        let closed_active = if skip_session_close {
+            None
+        } else {
+            close_own_active_sessions(ctx, &sessions_dir, &mut close_notes)?
+        };
         let git_state = capture_git_state(project_dir)?;
         let now = Utc::now().to_rfc3339();
 
@@ -123,6 +225,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             );
         }
 
+        let owner = imported_owner(ctx);
         let data = SessionData {
             version: 2,
             id: None,
@@ -142,31 +245,29 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             label: None,
             parent_session_id: None,
             related_task_ids: Vec::new(),
-            agent_id: None,
-            worktree: None,
-            scope: None,
+            agent_id: owner.0,
+            owner_v: owner.1,
+            worktree: owner.2,
+            scope: owner.3,
+            ..Default::default()
         };
 
-        write_open_session(&sessions_dir, &data)?;
+        write_imported_session(ctx, &sessions_dir, data, closed_active)?;
 
-        let history_limit = if config_path.exists() {
-            read_config(&config_path)
-                .map(|c| c.settings.history_limit)
-                .unwrap_or(20)
-        } else {
-            20
-        };
-        enforce_history_limit(&sessions_dir, history_limit)?;
+        prune_lines.extend(prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?);
 
         session_saved = true;
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
         if !raw_notes.is_empty() {
-            if !skip_session_close {
-                close_active_sessions(&sessions_dir)?;
-            }
+            let closed_active = if skip_session_close {
+                None
+            } else {
+                close_own_active_sessions(ctx, &sessions_dir, &mut close_notes)?
+            };
             let git_state = capture_git_state(project_dir)?;
             let now = Utc::now().to_rfc3339();
 
+            let owner = imported_owner(ctx);
             let data = SessionData {
                 version: 2,
                 id: None,
@@ -194,21 +295,16 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 label: None,
                 parent_session_id: None,
                 related_task_ids: Vec::new(),
-                agent_id: None,
-                worktree: None,
-                scope: None,
+                agent_id: owner.0,
+                owner_v: owner.1,
+                worktree: owner.2,
+                scope: owner.3,
+                ..Default::default()
             };
 
-            write_open_session(&sessions_dir, &data)?;
+            write_imported_session(ctx, &sessions_dir, data, closed_active)?;
 
-            let history_limit = if config_path.exists() {
-                read_config(&config_path)
-                    .map(|c| c.settings.history_limit)
-                    .unwrap_or(20)
-            } else {
-                20
-            };
-            enforce_history_limit(&sessions_dir, history_limit)?;
+            prune_lines.extend(prune_sessions_per_config(handoff, ctx.agent_id.as_deref())?);
 
             session_saved = true;
         }
@@ -226,6 +322,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     if session_saved {
         msg.push_str("\n  Session saved: yes");
+    }
+    for line in prune_lines.iter().chain(&close_notes) {
+        msg.push_str("\n  ");
+        msg.push_str(line);
     }
 
     if arguments
@@ -329,8 +429,7 @@ fn create_task_recursive(
     let base_dir = parent_dir.unwrap_or(tasks_dir);
     let task_dir = base_dir.join(&dir_name);
 
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
+    create_task_dir_all(&task_dir, task_id)?;
 
     let now = Utc::now().to_rfc3339();
     let status = task_status(task_val);

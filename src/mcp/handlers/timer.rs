@@ -55,6 +55,11 @@ fn timer_dir(handoff: &Path) -> PathBuf {
 }
 
 fn ensure_timer_dir(handoff: &Path) -> Result<PathBuf> {
+    // Timer state is shared with the editor extension on this machine only.
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::TIMER_DIR,
+    )?;
     let dir = timer_dir(handoff);
     if !dir.exists() {
         std::fs::create_dir_all(&dir)

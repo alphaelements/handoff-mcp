@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionData {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +47,14 @@ pub struct SessionData {
     /// outside an agent-identified call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Ownership format version (v0.47.3). Present only on sessions whose
+    /// `agent_id` was written by a build that keeps `agent_id` stable for the
+    /// life of an MCP process. A session without it carries an `agent_id`
+    /// from the older per-call generator, which says nothing about who owns
+    /// the session, so it is treated as having no owner (see
+    /// `session_target::effective_owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_v: Option<u32>,
     /// The resolved `project_dir` this session was saved from (the worktree
     /// checkout path, or the primary repo path for a non-worktree session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +64,33 @@ pub struct SessionData {
     /// parameter. `None` for sessions predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Lineage format version (v0.47.3). Present only on sessions created by a
+    /// build that records `continues`; its absence marks old data, which the
+    /// lineage rules treat as one chronological lineage (see
+    /// `storage::lineage`). Never added to an existing session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_v: Option<u32>,
+    /// Ids of the sessions this one continues. `Some(vec![])` (serialized as
+    /// `[]`) is a deliberate new lineage origin; `None` is old data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<Vec<String>>,
+    /// `true` removes a closed session from the head set (written by hand;
+    /// no tool sets it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_end: Option<bool>,
+    /// Which checkout the session was saved from, comparable across machines
+    /// (`main` for the primary checkout, the `.git/worktrees/<name>` name for a
+    /// linked worktree). The absolute `worktree` path differs between a Mac host
+    /// and a container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_key: Option<String>,
+}
+
+impl SessionData {
+    /// The ids in `continues`, empty for old data.
+    pub fn continues_ids(&self) -> &[String] {
+        self.continues.as_deref().unwrap_or_default()
+    }
 }
 
 pub fn generate_session_id() -> String {
@@ -68,19 +104,24 @@ pub fn generate_session_filename(summary: &str, timestamp: &str) -> String {
 }
 
 fn summary_to_slug(summary: &str) -> String {
-    let slug: String = summary
-        .chars()
-        .take(40)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else if !c.is_ascii() {
-                c
-            } else {
-                '-'
+    let mut slug = String::new();
+    for c in summary.chars().take(40) {
+        if matches!(c, '\u{0300}'..='\u{036F}' | '\u{3099}'..='\u{309A}') {
+            // Combining marks (NFD voiced/accent marks) stay attached to the
+            // preceding kept character; one with nothing to attach to is dropped.
+            if slug.chars().last().is_some_and(|p| p != '-') {
+                slug.push(c);
             }
-        })
-        .collect();
+        } else if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !c.is_ascii() && c.is_alphanumeric() {
+            // Letters/digits of any script stay; non-ASCII symbols,
+            // punctuation, spaces and emoji become separators.
+            slug.push(c);
+        } else {
+            slug.push('-');
+        }
+    }
     let slug = slug.trim_matches('-').to_string();
     let mut result = String::new();
     let mut prev_dash = false;
@@ -147,7 +188,7 @@ fn synthesize_id_from_filename(filename: &str) -> String {
     }
 }
 
-fn ids_match(candidate: &str, query: &str) -> bool {
+pub(crate) fn ids_match(candidate: &str, query: &str) -> bool {
     candidate == query || candidate.starts_with(query) || query.starts_with(candidate)
 }
 
@@ -169,6 +210,19 @@ pub fn write_open_session(sessions_dir: &Path, data: &SessionData) -> Result<Pat
     Ok(path)
 }
 
+/// Read and parse one session file, synthesizing an id for old files that
+/// carry none.
+fn read_session_file(path: &Path, name: &str) -> Result<SessionData> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read session: {}", path.display()))?;
+    let mut data: SessionData = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+    if data.id.is_none() {
+        data.id = Some(synthesize_id_from_filename(name));
+    }
+    Ok(data)
+}
+
 pub fn read_sessions_by_status(sessions_dir: &Path, status: &str) -> Result<Vec<SessionData>> {
     let mut sessions = Vec::new();
     let suffix = format!(".{status}.json");
@@ -185,18 +239,71 @@ pub fn read_sessions_by_status(sessions_dir: &Path, status: &str) -> Result<Vec<
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.ends_with(&suffix) {
-            let content = std::fs::read_to_string(entry.path())
-                .with_context(|| format!("Failed to read session: {}", entry.path().display()))?;
-            let mut data: SessionData = serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse session: {}", entry.path().display()))?;
-            if data.id.is_none() {
-                data.id = Some(synthesize_id_from_filename(&name));
-            }
-            sessions.push(data);
+            sessions.push(read_session_file(&entry.path(), &name)?);
         }
     }
 
     Ok(sessions)
+}
+
+/// A session file a lenient reader could not use, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSession {
+    pub file: String,
+    pub reason: String,
+}
+
+impl SkippedSession {
+    /// The warning line a handler shows for this file.
+    pub fn warning(&self) -> String {
+        format!(
+            "Warning: skipped unreadable session file {} ({}); fix or remove it.",
+            self.file, self.reason
+        )
+    }
+}
+
+/// Sessions read leniently: the files that could not be read or parsed are
+/// listed in `skipped` instead of failing the whole read.
+#[derive(Debug, Default)]
+pub struct SessionRead {
+    pub sessions: Vec<SessionData>,
+    pub skipped: Vec<SkippedSession>,
+}
+
+/// Read the named files of `sessions_dir`, collecting the unusable ones. Used
+/// for closed sessions, which only feed lineage: one file with a git conflict
+/// marker must not stop a save or a `load_context`.
+fn read_named_leniently<'a>(
+    sessions_dir: &Path,
+    names: impl IntoIterator<Item = &'a String>,
+) -> SessionRead {
+    let mut read = SessionRead::default();
+    for name in names {
+        match read_session_file(&sessions_dir.join(name), name) {
+            Ok(data) => read.sessions.push(data),
+            Err(e) => read.skipped.push(SkippedSession {
+                file: name.clone(),
+                reason: format!("{e:#}"),
+            }),
+        }
+    }
+    read
+}
+
+/// [`read_sessions_by_status`] that skips unusable files and reports them.
+pub fn read_sessions_by_status_lenient(sessions_dir: &Path, status: &str) -> Result<SessionRead> {
+    if !sessions_dir.exists() {
+        return Ok(SessionRead::default());
+    }
+    let suffix = format!(".{status}.json");
+    let mut names: Vec<String> = std::fs::read_dir(sessions_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(&suffix))
+        .collect();
+    names.sort_unstable();
+    Ok(read_named_leniently(sessions_dir, &names))
 }
 
 pub fn read_open_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
@@ -209,20 +316,39 @@ pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
 
 /// Find the id of an active session tagged `scope: "primary"` in
 /// `sessions_dir` (t250.1 — auto-parenting: a worktree session's
-/// `parent_session_id` is set to whichever primary session is active when
-/// the worktree session starts, or left `None` if the primary has not
-/// started one yet). `sessions_dir` here is always the shared `.handoff/`
-/// dir — the same physical directory a worktree session resolves to via
-/// `resolve_handoff_dir` — so this is a plain scan, not a cross-worktree
-/// lookup. When multiple primary-scope active sessions exist (unusual but
-/// not impossible), the most recently started one wins.
-pub fn find_active_primary_session_id(sessions_dir: &Path) -> Result<Option<String>> {
-    let active = read_active_sessions(sessions_dir)?;
-    Ok(active
+/// `parent_session_id` is set to the primary session that is active when the
+/// worktree session starts, or left `None` if there is none).
+/// `sessions_dir` here is always the shared `.handoff/` dir — the same
+/// physical directory a worktree session resolves to via `resolve_handoff_dir`
+/// — so this is a plain scan, not a cross-worktree lookup.
+///
+/// Only the caller's own primary session (`agent_id`) or an ownerless one
+/// qualifies, in that order; another agent's primary session is never adopted
+/// as a parent, because the new session would then be attributed to work it is
+/// not part of. Within a tier the most recently started one wins.
+pub fn find_active_primary_session_id(
+    sessions_dir: &Path,
+    agent_id: Option<&str>,
+) -> Result<Option<String>> {
+    let primaries: Vec<SessionData> = read_active_sessions(sessions_dir)?
         .into_iter()
         .filter(|s| s.scope.as_deref() == Some("primary"))
-        .filter_map(|s| s.id)
-        .next_back())
+        .collect();
+    let newest = |want_own: bool| -> Option<String> {
+        primaries
+            .iter()
+            .filter(|s| {
+                let owner = crate::storage::session_target::effective_owner(s);
+                if want_own {
+                    agent_id.is_some() && owner == agent_id
+                } else {
+                    owner.is_none()
+                }
+            })
+            .filter_map(|s| s.id.clone())
+            .next_back()
+    };
+    Ok(newest(true).or_else(|| newest(false)))
 }
 
 /// Append `decision` to active session(s). When `target_session_id` is Some,
@@ -411,19 +537,122 @@ pub fn close_paused_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
     transition_sessions(sessions_dir, "paused", "closed")
 }
 
+/// The newest closed session by [`session_age`] (the order pruning uses). A
+/// session without `ended_at` is placed by the time in its id rather than
+/// treated as the oldest.
 pub fn read_latest_closed_session(sessions_dir: &Path) -> Result<Option<SessionData>> {
-    let mut sessions = read_sessions_by_status(sessions_dir, "closed")?;
-    sessions.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
-    Ok(sessions.into_iter().last())
+    let sessions = read_sessions_by_status(sessions_dir, "closed")?;
+    Ok(sessions
+        .into_iter()
+        .max_by_key(|s| (session_age(s), s.id.clone())))
+}
+
+/// How many closed sessions [`read_recent_closed_sessions`] reads at most.
+pub const RECENT_CLOSED_MAX: usize = 100;
+
+/// The newest `limit` closed sessions, newest file first.
+///
+/// File names start with the `ended_at` second, so name order is age order to
+/// within a second, and only the files that are read are parsed: with
+/// retention unlimited (v0.47.3) the closed set grows without bound while
+/// `load_context` only ever needs the recent lineage. A file that cannot be
+/// read or parsed is skipped and reported in [`SessionRead::skipped`].
+pub fn read_recent_closed_sessions(sessions_dir: &Path, limit: usize) -> Result<SessionRead> {
+    if !sessions_dir.exists() {
+        return Ok(SessionRead::default());
+    }
+    let mut names: Vec<String> = std::fs::read_dir(sessions_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".closed.json"))
+        .collect();
+    names.sort_unstable_by(|a, b| b.cmp(a));
+    names.truncate(limit);
+    Ok(read_named_leniently(sessions_dir, &names))
+}
+
+/// When a session last ended: the parsed `ended_at`, else the time embedded in
+/// its id (a session closed by id keeps whatever `ended_at` it had, possibly
+/// none). `None` sorts as the oldest. Pruning and head detection share this so
+/// "newest" means the same thing in both.
+pub fn session_age(data: &SessionData) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    data.ended_at
+        .as_deref()
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .or_else(|| data.id.as_deref().and_then(timestamp_from_id))
+}
+
+/// How [`update_session_at`] combines the update with what the session holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// The writer owns the session (or it has no owner): provided fields
+    /// replace the stored ones.
+    Replace,
+    /// The writer is not the owner: nothing the owner recorded is replaced.
+    /// List fields gain the entries the session does not have yet, the owner's
+    /// summary and checkout state are kept.
+    MergeForeign,
+}
+
+/// Same checklist item (by text) or same value.
+fn same_entry(a: &Value, b: &Value) -> bool {
+    match (a.get("item"), b.get("item")) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+fn append_missing<T: Clone>(into: &mut Vec<T>, from: &[T], same: impl Fn(&T, &T) -> bool) {
+    for item in from {
+        if !into.iter().any(|existing| same(existing, item)) {
+            into.push(item.clone());
+        }
+    }
 }
 
 fn apply_session_updates(
     data: &mut SessionData,
     updates: &SessionData,
     provided_keys: Option<&Value>,
+    mode: WriteMode,
 ) {
-    data.summary = updates.summary.clone();
     data.ended_at = updates.ended_at.clone();
+    match mode {
+        WriteMode::Replace => apply_replacing(data, updates, provided_keys),
+        WriteMode::MergeForeign => apply_merging(data, updates),
+    }
+    // Auto-detected, not caller-provided (t250.1): only overwrite when the
+    // update actually carries a value, so a `session_status` other than
+    // "active" — which leaves these `None` in `handoff_updates` — doesn't
+    // erase scope/agent_id/worktree/parent_session_id on close.
+    //
+    // Ownership travels as a unit and is only (re)written when the session
+    // has no trustworthy owner or the writer already is the owner: an update
+    // that reaches another agent's session (an explicit id, `force_other_owner`)
+    // must not move it to the writer (FR-V0473-008 AC3).
+    let may_claim = match crate::storage::session_target::effective_owner(data) {
+        None => true,
+        Some(owner) => updates.agent_id.as_deref() == Some(owner),
+    };
+    if may_claim {
+        if updates.scope.is_some() {
+            data.scope = updates.scope.clone();
+        }
+        if updates.agent_id.is_some() {
+            data.agent_id = updates.agent_id.clone();
+            data.owner_v = Some(crate::storage::session_target::OWNER_V);
+        }
+        if updates.worktree.is_some() {
+            data.worktree = updates.worktree.clone();
+        }
+        if updates.parent_session_id.is_some() {
+            data.parent_session_id = updates.parent_session_id.clone();
+        }
+    }
+}
+
+fn apply_replacing(data: &mut SessionData, updates: &SessionData, provided_keys: Option<&Value>) {
+    data.summary = updates.summary.clone();
     data.branch = updates.branch.clone();
     data.commit = updates.commit.clone();
     data.dirty_files = updates.dirty_files.clone();
@@ -460,22 +689,360 @@ fn apply_session_updates(
     if was_provided("related_task_ids") && !updates.related_task_ids.is_empty() {
         data.related_task_ids = updates.related_task_ids.clone();
     }
-    // Auto-detected, not caller-provided (t250.1): only overwrite when the
-    // update actually carries a value, so a `session_status` other than
-    // "active" — which leaves these `None` in `handoff_updates` — doesn't
-    // erase scope/agent_id/worktree/parent_session_id on close.
-    if updates.scope.is_some() {
-        data.scope = updates.scope.clone();
+}
+
+fn apply_merging(data: &mut SessionData, updates: &SessionData) {
+    append_missing(&mut data.decisions, &updates.decisions, |a, b| a == b);
+    append_missing(&mut data.blockers, &updates.blockers, |a, b| a == b);
+    append_missing(&mut data.checklist, &updates.checklist, same_entry);
+    append_missing(&mut data.handoff_notes, &updates.handoff_notes, |a, b| {
+        a == b
+    });
+    append_missing(&mut data.references, &updates.references, |a, b| a == b);
+    append_missing(
+        &mut data.context_pointers,
+        &updates.context_pointers,
+        |a, b| a == b,
+    );
+    append_missing(
+        &mut data.related_task_ids,
+        &updates.related_task_ids,
+        |a, b| a == b,
+    );
+    if data.environment.is_none() {
+        data.environment = updates.environment.clone();
     }
-    if updates.agent_id.is_some() {
-        data.agent_id = updates.agent_id.clone();
+    if data.timeline.is_none() {
+        data.timeline = updates.timeline.clone();
     }
-    if updates.worktree.is_some() {
-        data.worktree = updates.worktree.clone();
+    if data.label.is_none() {
+        data.label = updates.label.clone();
     }
-    if updates.parent_session_id.is_some() {
-        data.parent_session_id = updates.parent_session_id.clone();
+}
+
+/// An unfinished (`active` / `open` / `paused`) session together with the
+/// file it lives in. This is what the ownership rules in
+/// [`crate::storage::session_target`] operate on: the status is not part of
+/// [`SessionData`], it is the file-name suffix.
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    pub data: SessionData,
+    pub status: String,
+    pub path: PathBuf,
+}
+
+const UNFINISHED_STATUSES: [&str; 3] = ["active", "open", "paused"];
+
+/// Every active, open and paused session, oldest file name first.
+pub fn read_session_entries(sessions_dir: &Path) -> Result<Vec<SessionEntry>> {
+    let mut entries = Vec::new();
+    if !sessions_dir.exists() {
+        return Ok(entries);
     }
+    let mut files: Vec<_> = std::fs::read_dir(sessions_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+    for file in files {
+        let name = file.file_name().to_string_lossy().to_string();
+        let Some(status) = UNFINISHED_STATUSES
+            .iter()
+            .find(|s| name.ends_with(&format!(".{s}.json")))
+        else {
+            continue;
+        };
+        let path = file.path();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read session: {}", path.display()))?;
+        let mut data: SessionData = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+        if data.id.is_none() {
+            data.id = Some(synthesize_id_from_filename(&name));
+        }
+        entries.push(SessionEntry {
+            data,
+            status: (*status).to_string(),
+            path,
+        });
+    }
+    Ok(entries)
+}
+
+/// Rename a session file to another status (`foo.active.json` ->
+/// `foo.paused.json`) and return the new path.
+pub fn transition_session_file(path: &Path, to: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid session path: {}", path.display()))?;
+    let base = name
+        .strip_suffix(".json")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .map(|(base, _)| base)
+        .ok_or_else(|| anyhow::anyhow!("Not a session file name: {name}"))?;
+    let new_path = path.with_file_name(format!("{base}.{to}.json"));
+    std::fs::rename(path, &new_path).with_context(|| {
+        format!(
+            "Failed to transition session file {} -> {}",
+            path.display(),
+            new_path.display()
+        )
+    })?;
+    Ok(new_path)
+}
+
+/// What a caller saw when it chose the session it is about to write: the id and
+/// the owner it was classified against (see
+/// [`crate::storage::session_target`]). A write re-reads the session under the
+/// sessions lock and refuses when the owner is no longer this one, so a
+/// decision made on a stale read can never act on a session that changed hands
+/// in the meantime (e.g. adopted by another agent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenSession {
+    pub id: String,
+    pub owner: Option<String>,
+}
+
+impl SeenSession {
+    pub fn of(entry: &SessionEntry) -> Self {
+        SeenSession {
+            id: entry.data.id.clone().unwrap_or_default(),
+            owner: crate::storage::session_target::effective_owner(&entry.data).map(String::from),
+        }
+    }
+}
+
+/// Why a checked session write did not happen. Nothing was written.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionWriteError {
+    /// The session is no longer unfinished (closed or removed by someone else).
+    #[error("Session '{id}' is no longer available: it was closed or removed by another process.")]
+    Gone { id: String },
+    /// The session changed owner after the caller read it.
+    #[error(
+        "Session '{id}' changed owner while it was being written (now owned by {}).",
+        owner.as_deref().unwrap_or("nobody")
+    )]
+    OwnerChanged { id: String, owner: Option<String> },
+}
+
+/// An exclusive hold on the sessions lock (`agents/_sessions.lock`), shared by
+/// every path that rewrites or renames an unfinished session file. The lock is
+/// not reentrant: code that already holds it must call the `*_locked` helpers.
+struct SessionsLock(std::fs::File);
+
+impl Drop for SessionsLock {
+    fn drop(&mut self) {
+        // The OS releases the lock when the handle closes right after; an
+        // explicit unlock failing changes nothing.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn lock_sessions(sessions_dir: &Path) -> Result<SessionsLock> {
+    use fs2::FileExt;
+
+    let handoff = sessions_dir.parent().unwrap_or(sessions_dir);
+    let lock_dir = handoff.join("agents");
+    std::fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("Failed to create lock dir: {}", lock_dir.display()))?;
+    crate::storage::gitignore::ensure_gitignore_entries(
+        handoff,
+        &[
+            crate::storage::gitignore::AGENTS_DIR,
+            crate::storage::gitignore::LOCK_FILES,
+        ],
+    )?;
+    let lock_path = lock_dir.join("_sessions.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+    file.lock_exclusive()
+        .context("Failed to lock the sessions directory")?;
+    Ok(SessionsLock(file))
+}
+
+/// Under the sessions lock: re-read the session `seen` names, check that its
+/// owner is still the one the caller saw, and run `write` on the fresh entry.
+/// Errors with [`SessionWriteError`] (nothing written) otherwise.
+fn with_checked_session<T>(
+    sessions_dir: &Path,
+    seen: &SeenSession,
+    write: impl FnOnce(&SessionEntry) -> Result<T>,
+) -> Result<T> {
+    let _lock = lock_sessions(sessions_dir)?;
+    let entry = read_session_entries(sessions_dir)?
+        .into_iter()
+        .find(|e| e.data.id.as_deref() == Some(seen.id.as_str()))
+        .ok_or_else(|| SessionWriteError::Gone {
+            id: seen.id.clone(),
+        })?;
+    let current = crate::storage::session_target::effective_owner(&entry.data);
+    if current != seen.owner.as_deref() {
+        return Err(SessionWriteError::OwnerChanged {
+            id: seen.id.clone(),
+            owner: current.map(String::from),
+        }
+        .into());
+    }
+    write(&entry)
+}
+
+/// Rename the session `seen` names to another status, provided it still has
+/// the owner `seen` recorded (see [`SeenSession`]).
+pub fn transition_session_checked(
+    sessions_dir: &Path,
+    seen: &SeenSession,
+    to: &str,
+) -> Result<PathBuf> {
+    with_checked_session(sessions_dir, seen, |entry| {
+        transition_session_file(&entry.path, to)
+    })
+}
+
+/// Apply `updates` to the session `seen` names and optionally move it to
+/// another status, returning the final path. Works on any unfinished status,
+/// so a `close_session_id` of a paused session records its summary too. The
+/// session is re-read and its owner re-checked under the sessions lock (see
+/// [`SeenSession`]).
+pub fn update_session_at(
+    sessions_dir: &Path,
+    seen: &SeenSession,
+    updates: &SessionData,
+    provided_keys: Option<&Value>,
+    transition_to: Option<&str>,
+    mode: WriteMode,
+) -> Result<PathBuf> {
+    with_checked_session(sessions_dir, seen, |entry| {
+        let path = &entry.path;
+        let mut data = entry.data.clone();
+        apply_session_updates(&mut data, updates, provided_keys, mode);
+        let updated = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+        crate::storage::atomic_write(path, updated.as_bytes())
+            .with_context(|| format!("Failed to write session: {}", path.display()))?;
+        match transition_to {
+            Some(status) => {
+                let ts_part = compact_timestamp(&data);
+                let base = generate_session_filename(&data.summary, &ts_part);
+                let new_path = path.with_file_name(format!("{base}.{status}.json"));
+                std::fs::rename(path, &new_path).with_context(|| {
+                    format!(
+                        "Failed to transition session to {status}: {}",
+                        path.display()
+                    )
+                })?;
+                Ok(new_path)
+            }
+            None => Ok(path.to_path_buf()),
+        }
+    })
+}
+
+/// Read-modify-write one session in place: `change` receives the freshly read
+/// session (not the caller's earlier copy, so concurrent additions are kept)
+/// and the result is written back, all under the sessions lock and only while
+/// the owner is still the one `seen` recorded. Returns what `change` returned
+/// and the session as written.
+pub fn modify_session<T>(
+    sessions_dir: &Path,
+    seen: &SeenSession,
+    change: impl FnOnce(&mut SessionData) -> Result<T>,
+) -> Result<(T, SessionData)> {
+    with_checked_session(sessions_dir, seen, |entry| {
+        let mut data = entry.data.clone();
+        let out = change(&mut data)?;
+        let updated = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+        crate::storage::atomic_write(&entry.path, updated.as_bytes())
+            .with_context(|| format!("Failed to write session: {}", entry.path.display()))?;
+        Ok((out, data))
+    })
+}
+
+/// Who a session is being handed to by [`adopt_session`].
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerStamp<'a> {
+    pub agent_id: &'a str,
+    pub worktree: &'a str,
+    pub scope: &'a str,
+}
+
+/// What a session looked like before [`adopt_session`] rewrote it.
+#[derive(Debug, Clone)]
+pub struct AdoptOutcome {
+    pub path: PathBuf,
+    pub data: SessionData,
+    pub previous_owner: Option<String>,
+    pub previous_worktree: Option<String>,
+    pub previous_scope: Option<String>,
+}
+
+/// Hand an unfinished session to `stamp` and put it in `to_status`.
+///
+/// `expected_owner` is the owner the caller saw when it decided to adopt. The
+/// comparison and the rewrite happen under the sessions lock, so of two
+/// processes adopting the same session at once exactly one wins and the other
+/// gets an error naming the new owner instead of silently overwriting it
+/// (spec §4.4' SHOULD-FIX 12). The body's `agent_id`, `worktree` and `scope`
+/// are replaced by the new owner's; the old values are returned for the
+/// event detail.
+pub fn adopt_session(
+    sessions_dir: &Path,
+    session_id: &str,
+    expected_owner: Option<&str>,
+    stamp: &OwnerStamp<'_>,
+    to_status: &str,
+) -> Result<AdoptOutcome> {
+    let _lock = lock_sessions(sessions_dir)?;
+    adopt_locked(sessions_dir, session_id, expected_owner, stamp, to_status)
+}
+
+fn adopt_locked(
+    sessions_dir: &Path,
+    session_id: &str,
+    expected_owner: Option<&str>,
+    stamp: &OwnerStamp<'_>,
+    to_status: &str,
+) -> Result<AdoptOutcome> {
+    let entries = read_session_entries(sessions_dir)?;
+    let entry = entries
+        .iter()
+        .find(|e| e.data.id.as_deref() == Some(session_id))
+        .ok_or_else(|| anyhow::anyhow!("Session '{session_id}' is no longer available"))?;
+    let current_owner = crate::storage::session_target::effective_owner(&entry.data);
+    if current_owner != expected_owner {
+        anyhow::bail!(
+            "Session '{session_id}' changed owner while it was being adopted (now owned by {}). \
+             Reload and try again.",
+            current_owner.unwrap_or("nobody")
+        );
+    }
+    let previous_owner = current_owner.map(String::from);
+    let previous_worktree = entry.data.worktree.clone();
+    let previous_scope = entry.data.scope.clone();
+
+    let mut data = entry.data.clone();
+    data.agent_id = Some(stamp.agent_id.to_string());
+    data.owner_v = Some(crate::storage::session_target::OWNER_V);
+    data.worktree = Some(stamp.worktree.to_string());
+    data.scope = Some(stamp.scope.to_string());
+    let content = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+    crate::storage::atomic_write(&entry.path, content.as_bytes())
+        .with_context(|| format!("Failed to write session: {}", entry.path.display()))?;
+    let path = if entry.status == to_status {
+        entry.path.clone()
+    } else {
+        transition_session_file(&entry.path, to_status)?
+    };
+    Ok(AdoptOutcome {
+        path,
+        data,
+        previous_owner,
+        previous_worktree,
+        previous_scope,
+    })
 }
 
 fn find_and_update_active_session(
@@ -533,7 +1100,7 @@ fn find_and_update_active_session(
         let mut data: SessionData = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse session: {}", path.display()))?;
 
-        apply_session_updates(&mut data, updates, provided_keys);
+        apply_session_updates(&mut data, updates, provided_keys, WriteMode::Replace);
 
         let updated_content =
             serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
@@ -627,15 +1194,38 @@ pub fn read_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Optio
     Ok(matches.into_iter().next().map(|(data, _)| data))
 }
 
+/// The caller a forked session is created for.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkOwner<'a> {
+    pub agent_id: Option<&'a str>,
+    pub worktree: &'a str,
+    pub scope: &'a str,
+}
+
+/// What the forked session says about itself.
+#[derive(Debug, Clone)]
+pub struct ForkSpec<'a> {
+    pub summary: &'a str,
+    pub label: Option<&'a str>,
+    pub timeline: Option<&'a str>,
+    pub related_task_ids: Vec<String>,
+    /// Source fields the fork copies (`decisions`, `context_pointers`, ...).
+    pub inherit: &'a [&'a str],
+}
+
 pub fn fork_session(
     sessions_dir: &Path,
     source: &SessionData,
-    summary: &str,
-    label: Option<&str>,
-    timeline: Option<&str>,
-    related_task_ids: Vec<String>,
-    inherit: &[&str],
+    spec: ForkSpec<'_>,
+    owner: &ForkOwner<'_>,
 ) -> Result<SessionData> {
+    let ForkSpec {
+        summary,
+        label,
+        timeline,
+        related_task_ids,
+        inherit,
+    } = spec;
     let source_id = source
         .id
         .as_deref()
@@ -662,9 +1252,19 @@ pub fn fork_session(
         label: label.map(String::from),
         parent_session_id: Some(source_id.to_string()),
         related_task_ids,
-        agent_id: source.agent_id.clone(),
-        worktree: source.worktree.clone(),
-        scope: source.scope.clone(),
+        // The fork belongs to whoever forked it, not to the source's owner
+        // (FR-V0473-008 AC3).
+        agent_id: owner.agent_id.map(String::from),
+        owner_v: owner
+            .agent_id
+            .map(|_| crate::storage::session_target::OWNER_V),
+        worktree: Some(owner.worktree.to_string()),
+        scope: Some(owner.scope.to_string()),
+        // A fork continues the session it was forked from.
+        lineage_v: Some(crate::storage::lineage::LINEAGE_V),
+        continues: Some(vec![source_id.to_string()]),
+        lineage_end: None,
+        worktree_key: crate::storage::worktree_key(Path::new(owner.worktree)),
     };
 
     for field in inherit {
@@ -689,6 +1289,7 @@ pub fn merge_sessions(
     source_ids: &[&str],
     target_id: &str,
     close_sources: bool,
+    caller_agent_id: Option<&str>,
 ) -> Result<MergeResult> {
     let mut sources: Vec<SessionData> = Vec::new();
     for sid in source_ids {
@@ -776,6 +1377,34 @@ pub fn merge_sessions(
         }
     }
 
+    // The target now continues every other source. Old data gets `lineage_v`
+    // with the first appended id, because `continues` alone is ignored without it.
+    let appended: Vec<String> = sources
+        .iter()
+        .filter_map(|s| s.id.clone())
+        .filter(|id| *id != target_actual_id)
+        .collect();
+    if !appended.is_empty() {
+        let continues = target.continues.get_or_insert_with(Vec::new);
+        for id in appended {
+            if !continues.contains(&id) {
+                continues.push(id);
+            }
+        }
+        target
+            .lineage_v
+            .get_or_insert(crate::storage::lineage::LINEAGE_V);
+    }
+
+    // The merge target is an existing session, not a new one: its owner is
+    // only ever filled in, never replaced (FR-V0473-008 AC3).
+    if crate::storage::session_target::effective_owner(&target).is_none() {
+        if let Some(agent) = caller_agent_id {
+            target.agent_id = Some(agent.to_string());
+            target.owner_v = Some(crate::storage::session_target::OWNER_V);
+        }
+    }
+
     update_session_in_place(sessions_dir, &target_actual_id, &target)?;
 
     Ok(MergeResult {
@@ -858,34 +1487,160 @@ pub struct MergeResult {
     pub closed_sessions: Vec<String>,
 }
 
-pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
-    if !sessions_dir.exists() {
-        return Ok(0);
+/// One closed session removed by [`prune_closed_sessions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedSession {
+    /// The session id from the file body, or the id synthesized from the
+    /// file name for old files that carry none.
+    pub id: String,
+    pub file_name: String,
+}
+
+#[derive(Debug, Default)]
+pub struct PruneOutcome {
+    pub removed: Vec<PrunedSession>,
+    /// Closed sessions still on disk above `limit` solely because they are
+    /// heads (see [`prune_closed_sessions`]).
+    pub retained_for_head: u32,
+}
+
+/// A closed session file with the data the prune order and head choice need.
+struct ClosedEntry {
+    path: PathBuf,
+    file_name: String,
+    id: String,
+    ended_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+/// The UTC instant embedded in a session id (`s-YYYYMMDD-HHMMSS-uuuuuu`, or
+/// the `-000000` form synthesized from an old file name).
+pub(crate) fn timestamp_from_id(id: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let rest = id.strip_prefix("s-")?;
+    let naive = chrono::NaiveDateTime::parse_from_str(rest.get(..22)?, "%Y%m%d-%H%M%S-%6f").ok()?;
+    Some(naive.and_utc().fixed_offset())
+}
+
+/// Every `*.closed.json`, oldest first.
+///
+/// Age is the parsed `ended_at` (the same notion of "newest" as
+/// [`read_latest_closed_session`]), with the file name as tie-breaker. The
+/// file name alone is not an age order: it carries the `ended_at` second
+/// followed by the summary slug, so two saves within one second would sort by
+/// slug. When `ended_at` is absent or unreadable the timestamp in the session
+/// id stands in; a file with neither sorts as the oldest.
+fn closed_entries_oldest_first(sessions_dir: &Path) -> Result<Vec<ClosedEntry>> {
+    let mut entries: Vec<ClosedEntry> = Vec::new();
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.ends_with(".closed.json") {
+            continue;
+        }
+        let path = entry.path();
+        // An unreadable or unparseable file is still a closed session that
+        // counts toward the limit; it just has no id or timestamp of its own.
+        let parsed: Option<SessionData> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok());
+        let (id, ended_at) = match parsed {
+            Some(mut d) => {
+                let id =
+                    d.id.get_or_insert_with(|| synthesize_id_from_filename(&file_name))
+                        .clone();
+                (id, session_age(&d))
+            }
+            None => (synthesize_id_from_filename(&file_name), None),
+        };
+        entries.push(ClosedEntry {
+            path,
+            file_name,
+            id,
+            ended_at,
+        });
     }
+    entries.sort_by(|a, b| {
+        a.ended_at
+            .cmp(&b.ended_at)
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
+    Ok(entries)
+}
 
-    let mut closed_files: Vec<PathBuf> = Vec::new();
-
+/// The ids of the closed sessions that are lineage heads (see
+/// [`crate::storage::lineage`]), over every closed session on disk. Callers
+/// hand the result to [`prune_closed_sessions`], which never removes them.
+pub fn closed_head_ids(sessions_dir: &Path) -> Result<HashSet<String>> {
+    if !sessions_dir.exists() {
+        return Ok(HashSet::new());
+    }
+    // Like the prune loop, an unparseable file is skipped rather than failing
+    // the save that triggered pruning: it can only make a head go unnoticed
+    // when the file itself was that head, and a file that cannot be read is not
+    // one `load_context` could return either.
+    let mut closed = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".closed.json") {
-            closed_files.push(entry.path());
+        if !name.ends_with(".closed.json") {
+            continue;
+        }
+        let parsed: Option<SessionData> = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok());
+        if let Some(mut data) = parsed {
+            data.id
+                .get_or_insert_with(|| synthesize_id_from_filename(&name));
+            closed.push(data);
         }
     }
+    Ok(crate::storage::lineage::head_ids(&closed))
+}
 
-    closed_files.sort();
-
-    let mut removed = 0u32;
-    while closed_files.len() > limit as usize {
-        if let Some(oldest) = closed_files.first() {
-            std::fs::remove_file(oldest)
-                .with_context(|| format!("Failed to remove old session: {}", oldest.display()))?;
-            closed_files.remove(0);
-            removed += 1;
-        }
+/// Prune the oldest closed sessions down to `limit`, never removing a head.
+///
+/// `limit == 0` means "no limit" and removes nothing: a zero used to wipe
+/// every closed session. Sessions whose id is in `heads` are skipped, so the
+/// result can exceed `limit`; the overshoot is reported in
+/// [`PruneOutcome::retained_for_head`]. Only closed sessions are considered.
+pub fn prune_closed_sessions(
+    sessions_dir: &Path,
+    limit: u32,
+    heads: &HashSet<String>,
+) -> Result<PruneOutcome> {
+    let mut outcome = PruneOutcome::default();
+    if limit == 0 || !sessions_dir.exists() {
+        return Ok(outcome);
     }
 
-    Ok(removed)
+    let entries = closed_entries_oldest_first(sessions_dir)?;
+    let mut remaining = entries.len();
+    for entry in &entries {
+        if remaining <= limit as usize {
+            break;
+        }
+        if heads.contains(&entry.id) {
+            continue;
+        }
+        std::fs::remove_file(&entry.path)
+            .with_context(|| format!("Failed to remove old session: {}", entry.path.display()))?;
+        outcome.removed.push(PrunedSession {
+            id: entry.id.clone(),
+            file_name: entry.file_name.clone(),
+        });
+        remaining -= 1;
+    }
+    outcome.retained_for_head = remaining.saturating_sub(limit as usize) as u32;
+
+    Ok(outcome)
+}
+
+/// Count-only prune: delete the oldest closed sessions beyond `limit`,
+/// head-agnostic, and return how many were removed. `limit == 0` removes
+/// nothing. Head-aware pruning with events is [`prune_closed_sessions`].
+pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
+    Ok(prune_closed_sessions(sessions_dir, limit, &HashSet::new())?
+        .removed
+        .len() as u32)
 }
 
 pub fn write_session_with_status(

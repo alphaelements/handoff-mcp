@@ -265,16 +265,17 @@ Before assembling, check the inputs are complete:
 
 ### Document layout
 
-One Markdown document, language of the user, headings in this order:
+One Markdown document in the language of the user (translate the headings below into that
+language; the order and numbering must hold), headings in this order:
 
 ```
-# 要求仕様書: <topic>            (or "Requirements Specification: <topic>")
-## 1. 概要                       purpose, actors, source brainstorm report (doc id), status
-## 2. スコープ                   in-scope table (BS-* id | title | priority), out-of-scope, undecided
-## 3. システムアーキテクチャ      ```mermaid blocks + components, interfaces, data flows
-## 4. 画面設計                   screens table, mock images/paths, ```mermaid stateDiagram-v2  (or "Phase 2 skipped: no GUI")
-## 5. ユースケース               one subsection per use case (section 4 template), ```mermaid sequenceDiagram blocks
-## 6. 制約・未決事項             constraints, NFR candidates (from BS-HINT), open questions, skipped phases
+# Requirements Specification: <topic>
+## 1. Overview                   purpose, actors, source brainstorm report (doc id), status
+## 2. Scope                      in-scope table (BS-* id | title | priority), out-of-scope, undecided
+## 3. System architecture        ```mermaid blocks + components, interfaces, data flows
+## 4. Screen design             screens table, mock images/paths, ```mermaid stateDiagram-v2  (or "Phase 2 skipped: no GUI")
+## 5. Use cases                  one subsection per use case (section 4 template), ```mermaid sequenceDiagram blocks
+## 6. Constraints, open items   constraints, NFR candidates (from BS-HINT), open questions, skipped phases
 ```
 
 - Keep the `BS-*` ids in the scope table and in each use case ("Realizes: BS-SCOPE-002") so
@@ -343,12 +344,12 @@ Only Approve starts the hand-off. Never treat silence or a vague answer as appro
 
    | Specification section | Used for |
    |---|---|
-   | 1 概要 | purpose and actors: confirm, do not re-ask |
-   | 2 スコープ | requirement candidates; each derived requirement keeps `- refines: BS-SCOPE-NNN` |
-   | 3 アーキテクチャ | Phase 1 architecture input, interfaces and data model |
-   | 4 画面設計 | the GUI project flow (screens, transitions, mock paths) |
-   | 5 ユースケース | one or more requirements per `UC-<n>`; its exceptions seed acceptance criteria |
-   | 6 制約・未決事項 | NFR candidates and the open-question list for the Phase 1 interview |
+   | 1 Overview | purpose and actors: confirm, do not re-ask |
+   | 2 Scope | requirement candidates; each derived requirement keeps `- refines: BS-SCOPE-NNN` |
+   | 3 Architecture | Phase 1 architecture input, interfaces and data model |
+   | 4 Screen design | the GUI project flow (screens, transitions, mock paths) |
+   | 5 Use cases | one or more requirements per `UC-<n>`; its exceptions seed acceptance criteria |
+   | 6 Constraints and open items | NFR candidates and the open-question list for the Phase 1 interview |
 
 4. Tell the user the next step is `/requirement-loop`. Do not start it yourself and do not push.
 

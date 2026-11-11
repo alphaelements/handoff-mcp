@@ -194,9 +194,11 @@ def main() -> int:
         return 0
 
     if event in CLEANUP_EVENTS:
-        # Housekeeping only: merge exact duplicates and gc sidecars. We do not
-        # inject the cleanup recommendations as context (that is for an explicit
-        # AI-driven pass), so there is no additionalContext to emit here.
+        # Housekeeping only: gc old injection sidecars. No arguments are passed,
+        # so apply_exact_merges keeps its default (false) and no memory file is
+        # rewritten or deleted. We do not inject the review candidates as context
+        # (that is for an explicit AI-driven pass), so there is no
+        # additionalContext to emit here.
         _call(bin_path, "handoff_memory_cleanup", {"project_dir": project_dir})
         return 0
 

@@ -631,6 +631,106 @@ fn bulk_update_reports_per_task_errors() {
     assert_eq!(result["errors"][0]["task_id"], "t99");
 }
 
+/// FR-V0473-014 AC1 (B-8): an `updates[]` element's `id` is accepted as an
+/// alias of `task_id`.
+#[test]
+fn bulk_update_accepts_id_as_task_id_alias() {
+    let dir = setup_project();
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task": { "title": "Aliased" } }),
+    );
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "updates": [ { "id": "t1", "priority": "high" } ]
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(result["applied"], 1, "{result}");
+    assert_eq!(result["errors"].as_array().unwrap().len(), 0, "{result}");
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": "t1" }),
+    );
+    let t1: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(t1["priority"], "high");
+}
+
+/// FR-V0473-014 AC1: `id` and `task_id` naming different tasks is ambiguous
+/// and rejected, not resolved by silently preferring one.
+#[test]
+fn bulk_update_rejects_conflicting_id_and_task_id() {
+    let dir = setup_project();
+    for title in ["A", "B", "C"] {
+        call_tool(
+            "handoff_update_task",
+            json!({ "project_dir": dir.path().to_string_lossy(), "task": { "title": title } }),
+        );
+    }
+    let priority_of = |id: &str| -> Value {
+        let resp = call_tool(
+            "handoff_get_task",
+            json!({ "project_dir": dir.path().to_string_lossy(), "task_id": id }),
+        );
+        let task: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+        task["priority"].clone()
+    };
+    let before = [priority_of("t1"), priority_of("t2")];
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "updates": [
+                { "id": "t1", "task_id": "t2", "priority": "low" },
+                { "task_id": "t3", "priority": "high" }
+            ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    // Only the conflicting element is rejected; the other one in the same call applies.
+    assert_eq!(result["applied"], 1, "{result}");
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1, "{result}");
+    let err = result["errors"][0]["error"].as_str().unwrap();
+    assert!(err.contains("conflicting task ids"), "{err}");
+    assert_eq!(priority_of("t3"), "high");
+    // Neither task named by the conflicting element is touched.
+    assert_eq!([priority_of("t1"), priority_of("t2")], before);
+}
+
+/// FR-V0473-014 AC2 / DS-V0473-014 AC2: the `missing task_id` error carries
+/// `"task_id"` and an `Example` of the expected shape, names the `id` alias,
+/// and the other elements of the same call are still applied.
+#[test]
+fn bulk_update_missing_task_id_error_shows_expected_shape() {
+    let dir = setup_project();
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task": { "title": "Other" } }),
+    );
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "updates": [ { "priority": "high" }, { "task_id": "t1", "priority": "low" } ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(result["applied"], 1, "{result}");
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1, "{result}");
+    let err = result["errors"][0]["error"].as_str().unwrap();
+    assert!(err.starts_with("missing task_id"), "{err}");
+    assert!(err.contains(r#""task_id""#), "{err}");
+    assert!(err.contains("Example"), "example missing: {err}");
+    assert!(
+        err.contains(r#"{"task_id": "t1""#),
+        "example shape missing: {err}"
+    );
+    assert!(err.contains(r#""id""#), "alias not named: {err}");
+}
+
 // --- bulk_update honours the estimate_hours requirement (t80) ---
 
 /// Re-enable the estimate requirement, which setup_project() disables by default.

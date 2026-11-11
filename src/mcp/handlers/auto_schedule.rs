@@ -245,12 +245,30 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             "reason": "handoff_auto_schedule applied computed start/due dates",
             "confidence": "confirmed",
         });
+        // The decision goes to the caller's own active session only; another
+        // agent's session is not the place to log this caller's scheduling.
         let sessions_dir = handoff.join("sessions");
-        decision_recorded_in = crate::storage::sessions::append_decision_to_active_sessions(
-            &sessions_dir,
-            decision,
-            None,
-        )?;
+        let worktree = ctx.project_dir.to_string_lossy().to_string();
+        let caller = crate::storage::session_target::Caller {
+            agent_id: ctx.agent_id.as_deref(),
+            worktree: &worktree,
+        };
+        let entries = crate::storage::sessions::read_session_entries(&sessions_dir)?;
+        if let crate::storage::session_target::Resolution::Target(target) =
+            crate::storage::session_target::resolve_session_target(
+                &entries,
+                &caller,
+                None,
+                crate::storage::session_target::TargetOp::Append,
+                false,
+            )
+        {
+            decision_recorded_in = crate::storage::sessions::append_decision_to_active_sessions(
+                &sessions_dir,
+                decision,
+                Some(&target.id),
+            )?;
+        }
     }
 
     // Agent capacity: how many tasks each registered agent currently holds
@@ -2059,6 +2077,64 @@ mod tests {
         )
         .unwrap();
         serde_json::from_str(&out).unwrap()
+    }
+
+    fn write_active_session(handoff: &std::path::Path, id: &str, owner: Option<&str>) {
+        let mut body = json!({ "version": 2, "id": id, "summary": format!("session {id}") });
+        if let Some(owner) = owner {
+            body["agent_id"] = json!(owner);
+            body["owner_v"] = json!(1);
+        }
+        let data: crate::storage::sessions::SessionData = serde_json::from_value(body).unwrap();
+        let sessions = handoff.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        crate::storage::sessions::write_session_with_status(&sessions, &data, "active").unwrap();
+    }
+
+    fn decisions_of(handoff: &std::path::Path, id: &str) -> usize {
+        crate::storage::sessions::read_active_sessions(&handoff.join("sessions"))
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(id))
+            .unwrap()
+            .decisions
+            .len()
+    }
+
+    #[test]
+    fn applied_schedule_decision_goes_to_the_callers_own_active_session_only() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 1.0, Some("alice"), &[]);
+        write_active_session(&handoff, "s-20260101-000001-000001", Some("agent-a"));
+        write_active_session(&handoff, "s-20260101-000002-000002", Some("agent-b"));
+        let mut c = ctx(handoff.clone());
+        c.agent_id = Some("agent-b".to_string());
+
+        let out = handle(&c, &json!({ "start_date": "2026-03-02", "dry_run": false })).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["decision_recorded_in_sessions"], 1);
+        assert_eq!(decisions_of(&handoff, "s-20260101-000002-000002"), 1);
+        assert_eq!(
+            decisions_of(&handoff, "s-20260101-000001-000001"),
+            0,
+            "another agent's session must not receive the decision"
+        );
+    }
+
+    #[test]
+    fn applied_schedule_decision_is_dropped_when_only_foreign_sessions_are_active() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 1.0, Some("alice"), &[]);
+        write_active_session(&handoff, "s-20260101-000001-000001", Some("agent-a"));
+        let mut c = ctx(handoff.clone());
+        c.agent_id = Some("agent-b".to_string());
+
+        let out = handle(&c, &json!({ "start_date": "2026-03-02", "dry_run": false })).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["decision_recorded_in_sessions"], 0);
+        assert_eq!(decisions_of(&handoff, "s-20260101-000001-000001"), 0);
     }
 
     fn new_start_of(v: &Value, id: &str) -> Option<String> {

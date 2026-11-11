@@ -4004,12 +4004,12 @@ fn fork_then_immediate_close_survives_history_limit() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Set history_limit to 5
+    // Set session_prune_limit to 5
     call_tool(
         "handoff_update_config",
         json!({
             "project_dir": &pd,
-            "updates": { "settings.session_history_limit": 5 }
+            "updates": { "settings.session_prune_limit": 5 }
         }),
     );
 
@@ -4381,13 +4381,15 @@ fn save_context_active_auto_detects_primary_scope() {
     );
 }
 
+/// t439.4 AC3: a brand-new *closed* session records who/where it was created
+/// (`scope`, `worktree`) but never a parent link. `agent_id` is not asserted
+/// here: it is a process-wide global that other tests in this binary may set
+/// (see `tool_events.rs` for the agent_id assertion with a pinned identity).
 #[test]
-fn save_context_closed_session_omits_scope_fields() {
+fn save_context_new_closed_session_records_scope_and_worktree() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Default session_status ("closed") should not tag scope — scope is
-    // only meaningful for an active session.
     call_tool(
         "handoff_save_context",
         json!({
@@ -4407,8 +4409,16 @@ fn save_context_closed_session_omits_scope_fields() {
     let session: Value = serde_json::from_str(&content).unwrap();
 
     assert!(
-        session.get("scope").is_none(),
-        "a closed (non-active) session should not carry a scope tag: {session}"
+        session["scope"].is_string(),
+        "a new closed session should carry the auto-detected scope: {session}"
+    );
+    assert_eq!(
+        session["worktree"], pd,
+        "a new closed session should carry its worktree: {session}"
+    );
+    assert!(
+        session.get("parent_session_id").is_none(),
+        "a closed session has no parent link: {session}"
     );
 }
 

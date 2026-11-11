@@ -153,7 +153,7 @@ Each leaf gets an acceptance block (GWT or EARS). Before calling a leaf done:
   explicitly rather than skipping);
 - run the **INVEST** check (Independent, Negotiable, Valuable, Estimable, Small, Testable);
   split, rewrite or merge a leaf that fails;
-- split any leaf that joins several behaviours with "and" / 「かつ」 / 「および」.
+- split any leaf that joins several behaviours with "and" (or its Japanese equivalents "かつ" / "および" in Japanese requirement text).
 
 ### 4. Save the document
 

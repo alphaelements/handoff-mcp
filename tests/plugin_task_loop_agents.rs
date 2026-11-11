@@ -147,3 +147,190 @@ fn test_spec_worker_is_registered_and_listed_in_readme() {
         "README.md does not mention test-spec-worker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WS1 / t430: sub-agents (Agent tool and Workflow `agentType`) must be able to
+// reach the handoff tools. An agent definition with a `tools:` allow-list
+// receives neither ToolSearch nor MCP tools unless they are named in it, so
+// the definitions list the MCP tools explicitly, carry a CLI fallback table
+// and a "report failure, never skip silently" section.
+// ---------------------------------------------------------------------------
+
+/// MCP tool name forms a `tools:` allow-list needs: the standalone server
+/// (`.mcp.json`) and the one bundled with the `handoff-mcp` plugin.
+const MCP_TOOL_PATTERNS: [&str; 2] = ["mcp__handoff__*", "mcp__plugin_handoff-mcp_handoff__*"];
+
+/// Agents that write handoff state, and the handoff tools each one calls
+/// (every one must have a CLI equivalent row).
+const HANDOFF_WRITER_AGENTS: [(&str, &[&str]); 3] = [
+    (
+        "session-closer",
+        &[
+            "handoff_get_task",
+            "handoff_check_criterion",
+            "handoff_update_task",
+            "handoff_trace_update",
+            "handoff_doc_verify",
+        ],
+    ),
+    (
+        "session-spec-writer",
+        &[
+            "handoff_get_task",
+            "handoff_get_config",
+            "handoff_doc_query",
+            "handoff_doc_list",
+            "handoff_doc_save",
+            "handoff_trace_scaffold",
+            "handoff_trace_lint",
+        ],
+    ),
+    (
+        "session-spec-reconciler",
+        &[
+            "handoff_get_task",
+            "handoff_doc_query",
+            "handoff_doc_update_section",
+            "handoff_trace_lint",
+            "handoff_trace_suspect",
+            "handoff_trace_update",
+        ],
+    ),
+];
+
+fn agent_text(name: &str) -> String {
+    fs::read_to_string(agents_dir().join(format!("{name}.md")))
+        .unwrap_or_else(|e| panic!("{name}: cannot read agent file: {e}"))
+}
+
+/// `(mcp_tool, group, action)` for every CLI-equivalent table row
+/// (`| \`handoff_x\` | \`handoff-mcp <group> <action> ...\` | ... |`).
+fn cli_table_rows(text: &str) -> Vec<(String, String, String)> {
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|l| l.trim_start().starts_with('|')) {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // cells[0] is the empty text before the leading pipe.
+        let (Some(tool), Some(cli)) = (cells.get(1), cells.get(2)) else {
+            continue;
+        };
+        let (Some(tool), Some(cli)) = (
+            tool.strip_prefix('`').and_then(|t| t.strip_suffix('`')),
+            cli.strip_prefix('`').and_then(|c| c.strip_suffix('`')),
+        ) else {
+            continue;
+        };
+        let Some(rest) = cli.strip_prefix("handoff-mcp ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        if let (Some(group), Some(action)) = (words.next(), words.next()) {
+            rows.push((tool.to_string(), group.to_string(), action.to_string()));
+        }
+    }
+    rows
+}
+
+#[test]
+fn handoff_writer_agents_list_mcp_tools_in_both_name_forms() {
+    for (name, _) in HANDOFF_WRITER_AGENTS {
+        let text = agent_text(name);
+        let fm = frontmatter(&text).unwrap_or_else(|| panic!("{name}: bad frontmatter"));
+        let have: Vec<&str> = fm["tools"].split(',').map(str::trim).collect();
+        assert!(have.contains(&"ToolSearch"), "{name}: ToolSearch dropped");
+        assert!(have.contains(&"Bash"), "{name}: Bash is the CLI fallback");
+        for pattern in MCP_TOOL_PATTERNS {
+            assert!(
+                have.contains(&pattern),
+                "{name}: tools: must list {pattern} explicitly (an allow-list agent gets no MCP tools otherwise), got {have:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn handoff_writer_agents_document_cli_fallback_and_failure_reporting() {
+    for (name, tools) in HANDOFF_WRITER_AGENTS {
+        let text = agent_text(name);
+        assert!(
+            text.contains("CLI equivalents"),
+            "{name}: missing the CLI equivalents section"
+        );
+        assert!(
+            text.contains("Report failures, never skip silently"),
+            "{name}: missing the failure-reporting section"
+        );
+        // JSON argument form: flat flags for nested fields are silently
+        // dropped by some actions, so a table that writes nested arguments
+        // (`task`, `ops`) must show `--task '{...}'` / `--ops '[...]'`.
+        if tools.contains(&"handoff_update_task") {
+            assert!(
+                text.contains("--task '{"),
+                "{name}: update_task row must use --task '{{...}}'"
+            );
+        }
+        if tools.contains(&"handoff_trace_update") {
+            assert!(
+                text.contains("--ops '["),
+                "{name}: trace_update row must use --ops '[...]'"
+            );
+            // trace update writes in a fixed category order, not input order,
+            // and `failed.op_index` is the first op of the failing category:
+            // "resend the failed op and the ops after it" silently drops
+            // unwritten ops with a lower index. The retry set is exactly the
+            // ops missing from `applied`.
+            assert!(
+                text.contains("not in `applied[].op_index`"),
+                "{name}: must tell the agent to resend exactly the ops missing from `applied`"
+            );
+            assert!(
+                !text.contains("ops after it"),
+                "{name}: the 'failed op and the ops after it' retry rule drops unwritten ops"
+            );
+        }
+        // A CLI call has no agent identity: session commands need an explicit id.
+        assert!(
+            text.contains("--session-id"),
+            "{name}: must mention --session-id for session commands over the CLI"
+        );
+        // `trace update` exits 1 when an op failed: resend only the failed ops.
+        assert!(
+            text.contains("exit code 1") && text.contains("failed"),
+            "{name}: must document the trace update exit code / failed ops"
+        );
+        let rows = cli_table_rows(&text);
+        for tool in tools {
+            assert!(
+                rows.iter().any(|(t, _, _)| t == tool),
+                "{name}: no CLI equivalent row for {tool}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_command_in_the_cli_tables_exists_in_the_binary() {
+    // Probe the real binary in an empty directory: a command it does not know
+    // fails with "Unknown command"; a known one fails later (no `.handoff/`).
+    let empty = tempfile::TempDir::new().unwrap();
+    let mut seen = 0;
+    for (name, _) in HANDOFF_WRITER_AGENTS {
+        for (tool, group, action) in cli_table_rows(&agent_text(name)) {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_handoff-mcp"))
+                .args([&group, &action, "--project-dir"])
+                .arg(empty.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stdout.contains("Unknown command") && !stderr.contains("Unknown command"),
+                "{name}: `handoff-mcp {group} {action}` (for {tool}) is not a CLI command:\n{stdout}{stderr}"
+            );
+            seen += 1;
+        }
+    }
+    assert!(
+        seen >= 15,
+        "expected the CLI tables to be parsed, saw {seen} rows"
+    );
+}

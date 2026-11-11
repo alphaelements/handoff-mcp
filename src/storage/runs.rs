@@ -454,27 +454,6 @@ fn read_run_record(path: &Path) -> Result<RunRecord> {
     serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
-/// Idempotently appends `entry` to `.handoff/.gitignore` (creating the file
-/// if absent) unless it already contains that exact line — the user's own
-/// `.handoff/` is expected to be its own independent git repo (see project
-/// memory), so a derived cache like `runs/_latest.json` needs its own
-/// gitignore entry there, same as any other build artifact.
-pub(crate) fn ensure_gitignore_entry(handoff: &Path, entry: &str) -> Result<()> {
-    let path = handoff.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == entry) {
-        return Ok(());
-    }
-    let mut new_content = existing;
-    if !new_content.is_empty() && !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    new_content.push_str(entry);
-    new_content.push('\n');
-    crate::storage::atomic_write(&path, new_content.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))
-}
-
 /// Pure reconciliation core shared by [`sync`] (which persists the result)
 /// and [`load_latest_readonly`] (wiki/260-vmodel-m2-design.md §2.1/E6, M2-08
 /// — which never does): given the current `runs/` directory listing (`files`)
@@ -566,7 +545,10 @@ pub fn sync(handoff: &Path) -> Result<LatestCache> {
         crate::storage::atomic_write(&path, content.as_bytes())
             .with_context(|| format!("Failed to write {}", path.display()))?;
         crate::mcp::handlers::docs::record_derived_write_for_test(&path, content.len());
-        ensure_gitignore_entry(handoff, "/runs/_latest.json")?;
+        crate::storage::gitignore::ensure_gitignore_entry(
+            handoff,
+            crate::storage::gitignore::RUNS_LATEST,
+        )?;
     }
 
     Ok(new_cache)
@@ -1728,27 +1710,6 @@ mod tests {
         assert!(
             !latest_path.exists(),
             "load_latest_readonly must not materialize _latest.json as a side effect"
-        );
-    }
-
-    #[test]
-    fn ensure_gitignore_entry_is_idempotent_and_preserves_existing_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handoff = setup(tmp.path());
-        std::fs::write(handoff.join(".gitignore"), "existing-line\n").unwrap();
-
-        ensure_gitignore_entry(&handoff, "/runs/_latest.json").unwrap();
-        ensure_gitignore_entry(&handoff, "/runs/_latest.json").unwrap();
-
-        let content = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
-        assert_eq!(
-            content.matches("/runs/_latest.json").count(),
-            1,
-            "must not duplicate the entry across repeated calls: {content:?}"
-        );
-        assert!(
-            content.contains("existing-line"),
-            "must preserve pre-existing content: {content:?}"
         );
     }
 

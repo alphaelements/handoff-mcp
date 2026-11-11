@@ -28,7 +28,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_load_context".to_string(),
-            description: "Load handoff context for the current project. Call at session start to resume work. Can also resume a paused session by ID.".to_string(),
+            description: "Load handoff context for the current project. Call at session start to resume work. Can also resume a paused session by ID. The returned task_tree is compact by default (only the tasks that belong to this session, with scope_reason; task_tree_meta counts the rest); pass task_tree:'full' for every task.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -38,7 +38,26 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Session ID to activate and load. Searches open sessions first, then paused sessions. If omitted, activates all open sessions and returns the latest."
+                        "description": "Session ID to activate and load. Searches active, open and paused sessions. If omitted, your own active session is loaded (or your own open session is activated); other agents' sessions are never picked implicitly, they are listed in adoptable_sessions."
+                    },
+                    "adopt": {
+                        "type": "boolean",
+                        "description": "Take over a session that is still ACTIVE under another agent (e.g. after a restart, --continue or MCP reconnect gave you a new agent_id). Required together with session_id for another agent's active session; a paused or open session of another agent is resumed by session_id alone. The session's owner, worktree and scope become yours and a session.adopted event is logged."
+                    },
+                    "continue_from": {
+                        "type": "string",
+                        "description": "ID of the closed session your work continues. Normally NOT needed: the previous session is chosen automatically (previous_session.inferred:true). Pass it only when the response has ambiguous:true: pick the entry of other_heads whose summary matches the user's request and call again with its id. Skips the automatic choice; the choice is carried to your next save_context that creates a session."
+                    },
+                    "task_tree": {
+                        "type": "string",
+                        "enum": ["compact", "full"],
+                        "default": "compact",
+                        "description": "Which tasks task_tree lists. 'compact' (default): the tasks that belong to this session, each with a scope_reason (active = in_progress/blocked/review, scope = task_scope, previous_session, sibling, unblocked, branch = named by the branch/recent commits, milestone, priority); everything else is only counted in task_tree_meta (included, omitted_total, omitted_by_status, omitted_without_milestone, truncated, hint). The number of tasks beyond the active ones is capped by config settings.compact_task_limit (default 40). 'full': every task, as before v0.47.3. task_summary always counts every task. To fetch tasks compact left out, use handoff_list_tasks."
+                    },
+                    "task_scope": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Task IDs (e.g. ['t75','t439.1']) whose unfinished subtrees compact task_tree includes with scope_reason 'scope', regardless of compact_task_limit. Use it when the session works on specific tasks. Unknown IDs are reported in warnings. Ignored by task_tree:'full'."
                     }
                 }
             }),
@@ -71,9 +90,26 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Session ID to pause instead of close. The paused session can be resumed later via load_context with the same session_id. Use this when switching to different work temporarily."
                     },
+                    "force_other_owner": {
+                        "type": "boolean",
+                        "description": "Override the protection of another agent's ACTIVE session: allow close_session_id / session_id (closed) / pause_session_id to act on it, applying summary and decisions to that session first. Requires 'reason'. Without it such a call is refused with an error (a session.close_refused event is logged) and nothing is saved or changed. Writing to another agent's active session with session_status 'active' is not refused: it is allowed with a warning and a session.foreign_write event, and the owner is unchanged."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why force_other_owner is needed (e.g. \"owner window crashed\"). Recorded in the event log."
+                    },
+                    "continues": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ids of the closed sessions a NEWLY CREATED session continues. Normally NOT needed: the session load_context settled on is recorded automatically. Overrides it when given (an empty array starts a new lineage). Ignored when an existing session is updated or closed."
+                    },
+                    "lineage_token": {
+                        "type": "string",
+                        "description": "The lineage_token handoff_load_context returned. Optional: it names which earlier load_context result this new session continues when several conversations or worktrees share one MCP process. Unknown or already-used tokens are ignored with a warning."
+                    },
                     "pause_active": {
                         "type": "boolean",
-                        "description": "If true, pause all active sessions instead of closing them. Cannot be combined with close_session_id."
+                        "description": "If true, pause your own active sessions in this worktree instead of closing them (other agents' sessions are not touched). Cannot be combined with close_session_id."
                     },
                     "pause_only": {
                         "type": "boolean",
@@ -234,6 +270,25 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "include_children": {
                         "type": "boolean",
                         "description": "If true, recursively scan project_dir for child .handoff/ projects and include their tasks. Each task gets project_name, project_dir, and task_ref fields (task_ref is a composite '{project_name}-{hash}:{id}' identifier unique across projects). The original 'id' field is left unchanged so it stays usable with handoff_get_task/handoff_update_task/dependencies when paired with the task's own project_dir. Default: false."
+                    },
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Return only these task ids (exact match; whitespace is trimmed, blanks and duplicates dropped; unknown ids are silently absent) plus the ancestors of each match so the tree stays connected. A matched parent keeps only the children that are themselves in ids, unless include_descendants is true. [] matches nothing. Combined with the other filters (AND). task_summary still counts every task. When fields is given, children is always kept for an ids selection (and for any other active filter), so a requested subtask never disappears behind its ancestor. Use this instead of listing all todo tasks when the task ids are already known."
+                    },
+                    "include_descendants": {
+                        "type": "boolean",
+                        "description": "Only meaningful with ids; default false. If true, a task matched by ids keeps its whole subtree (all depths), still narrowed by the other filters: ids=[\"t439\"], status_filter=\"todo\" returns t439 (as the path) with every todo subtask below it, which is how a parent task id selects its unfinished subtasks. Without ids it has no effect. Must be a boolean."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Return at most this many task_tree nodes (after the filters and ids), counted depth-first: a parent and each of its descendants count one each, so nested output is bounded too. With include_children it applies per project. When nodes were cut, the response carries task_tree_meta {truncated, limit, returned, matched}; it is absent otherwise. task_summary is unaffected. Omit for no cap."
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Keys to keep on each task node (duplicates collapse). Allowed: id, title, status, schedule, dependencies, order, assignee, lock, children. id is always kept. Keys a task does not have are omitted, never null. Without 'children' nodes carry no nested children (unless ids or another filter is active, which always keep them), so include it to keep the tree. project_name/project_dir/task_ref from include_children are always kept. An unknown name is an error that lists the allowed names. Omit or [] for all keys."
                     }
                 }
             }),
@@ -288,7 +343,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_update_task".to_string(),
-            description: "Add, update, or move a task. Manages the tasks/ directory structure. Include task.schedule.estimate_hours (raw human-effort hours, > 0) when moving a leaf task to in_progress/review/done; it is rejected without one unless the task is a parent, todo, blocked, or skipped. Done guard ([trace] done_guard in config.toml, default \"warn\"; either done_guard = \"block\" or a [trace.done_guard] table with mode plus check_suspects/check_profile_layers/check_code_drift, each default true): when task.status is set to \"review\" or \"done\" and this task has at least one requirement-type task_links entry with a blocker (not_run/failing/blocked/reverify verifier, a stale task-link suspect [check_suspects], a linked item missing a layer its profile requires [check_profile_layers, missing_profile_layer lint], or a linked item whose impl_refs/test_refs file changed since its content_hash [check_code_drift]), \"warn\" lists them in the response's warnings (the transition still applies), \"block\" rejects the whole call unless force=true, and \"off\" does nothing. A task with no requirement links is never affected. Schedule signal (REQ-PLA-005): when an update to an existing task actually changes status, dependencies, or schedule.start_date/due_date/estimate_hours, the response ends with a `schedule_stale: true` line recommending handoff_auto_schedule; no such line means the schedule is not stale. When the update moves a task to `done` and the task is linked to items of a `plan` document, the response ends with a `plan_update_needed: [{doc_id, stable_id, current_dev_stage, suggested_dev_stage}]` line (suggested_dev_stage is `implemented`); the line is absent when there is nothing to update or the status did not change.".to_string(),
+            description: "Add, update, or move a task. Manages the tasks/ directory structure. Include task.schedule.estimate_hours (raw human-effort hours, > 0) when moving a leaf task to in_progress/review/done; it is rejected without one unless the task is a parent, todo, blocked, or skipped. Done guard ([trace] done_guard in config.toml, default \"warn\"; either done_guard = \"block\" or a [trace.done_guard] table with mode plus check_suspects/check_profile_layers/check_code_drift, each default true): when task.status is set to \"review\" or \"done\" and this task has at least one requirement-type task_links entry with a blocker (not_run/failing/blocked/reverify verifier, a stale task-link suspect [check_suspects], a linked item missing a layer its profile requires [check_profile_layers, missing_profile_layer lint], or a linked item whose impl_refs/test_refs file changed since its content_hash [check_code_drift]), \"warn\" lists them in the response's warnings (the transition still applies), \"block\" rejects the whole call unless force=true, and \"off\" does nothing. A task with no requirement links is never affected. Schedule signal (REQ-PLA-005): when an update to an existing task actually changes status, dependencies, or schedule.start_date/due_date/estimate_hours, the response ends with a `schedule_stale: true` line recommending handoff_auto_schedule; no such line means the schedule is not stale (or the project set `[settings] schedule_stale_notice = false`, which never adds the line). When the update moves a task to `done` and the task is linked to items of a `plan` document, the response ends with a `plan_update_needed: [{doc_id, stable_id, current_dev_stage, suggested_dev_stage}]` line (suggested_dev_stage is `implemented`); the line is absent when there is nothing to update or the status did not change.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -418,7 +473,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "updates": {
                         "type": "object",
-                        "description": "Key-value pairs to update (dot-notation keys like 'settings.history_limit')"
+                        "description": "Key-value pairs to update (dot-notation keys like 'settings.session_prune_limit')"
                     }
                 },
                 "required": ["updates"]
@@ -957,6 +1012,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "type": "object",
                             "properties": {
                                 "task_id": { "type": "string", "description": "Task ID to update." },
+                                "id": { "type": "string", "description": "Alias of task_id. If both are given they must name the same task." },
                                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"], "description": "Moving a leaf task into in_progress/review/done requires schedule.estimate_hours to be present or supplied in the same update. Parent tasks (any task with children) and the statuses todo/blocked/skipped are exempt." },
                                 "priority": { "type": "string", "enum": ["low", "medium", "high"] },
                                 "assignee": { "type": "string" },
@@ -978,7 +1034,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     }
                                 }
                             },
-                            "required": ["task_id"]
+                            "anyOf": [
+                                { "required": ["task_id"] },
+                                { "required": ["id"] }
+                            ]
                         }
                     }
                 },
@@ -1185,7 +1244,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "tool_name": { "type": "string", "description": "Name of the tool about to run (e.g. 'Edit'); added to the query." },
                     "file_paths": { "type": "array", "items": { "type": "string" }, "description": "File paths in play; basenames are added to the query and scope_paths are matched against these." },
                     "limit": { "type": "integer", "description": "Maximum memories to return.", "default": 5 },
-                    "mark_injected": { "type": "boolean", "description": "Record returned memories in the session sidecar and bump their hit_count/last_referenced_at. Requires session_id.", "default": true }
+                    "mark_injected": { "type": "boolean", "description": "Record returned memories in the session sidecar (local .handoff/memory/injected/ state) so they are not re-injected in the same session. The memory files themselves are never written. Requires session_id.", "default": true }
                 },
                 "required": ["text"]
             }),
@@ -1204,13 +1263,24 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_memory_cleanup".to_string(),
-            description: "Housekeep the project memory store (intended for SessionStart). Silently merges exact duplicates (lossless), then returns recommendations the AI should act on: near-duplicate clusters (merge with memory_save merge_into=…) and stale memories (consider memory_delete). Also garbage-collects old per-session injection sidecars. Returns a JSON string {\"auto_merged_exact\":n,\"cleanup_recommendations\":{\"similar_clusters\":[…],\"stale\":[…]},\"injected_sidecars_removed\":k}.".to_string(),
+            description: "Housekeep the project memory store (safe to run at SessionStart: by default it deletes and rewrites no memory). Returns review candidates: near-duplicate clusters (merge with memory_save merge_into=…) and old memories whose updated_at is past stale_days (an age signal only — an old memory is not necessarily obsolete, and nothing here proposes deleting it). With apply_exact_merges=true it also merges exact duplicates losslessly (oldest kept, others deleted and recorded in superseded_ids; one memory.merged event per group). Garbage-collects old per-session injection sidecars (settings.memory_injected_gc_days; 0 = never). Returns a JSON string {\"auto_merged_exact\":n,\"cleanup_recommendations\":{\"similar_clusters\":[…],\"stale\":[…]},\"injected_sidecars_removed\":k}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "apply_exact_merges": { "type": "boolean", "description": "Auto-merge exact-duplicate memories (same content hash). Lossless and safe.", "default": true },
-                    "stale_days": { "type": "integer", "description": "Flag memories not referenced for this many days as stale recommendations.", "default": 60 }
+                    "apply_exact_merges": { "type": "boolean", "description": "Merge exact-duplicate memories (same content hash) losslessly, deleting the absorbed files and logging memory.merged. Opt-in: off by default so cleanup never changes tracked memory files.", "default": false },
+                    "stale_days": { "type": "integer", "description": "List memories whose updated_at is older than this many days as review candidates.", "default": 60 }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_memory_strip_usage_stats".to_string(),
+            description: "Opt-in migration for projects upgraded from v0.47.2 or earlier: remove the obsolete hit_count / last_referenced_at keys from existing memory files (they are no longer written or read). Dry-run unless apply=true. Only those two keys are removed; updated_at and every other field are left unchanged, and files without the keys are not rewritten. Unparseable files are skipped and counted. Returns counts only: {\"mode\":\"dry_run\"|\"apply\",\"scanned\":n,\"with_usage_stats\":n,\"stripped\":n,\"skipped_unparseable\":n}. CLI: handoff-mcp memory strip-usage-stats [--apply].".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "apply": { "type": "boolean", "description": "Rewrite the files. Without it the call only reports how many files would change.", "default": false }
                 }
             }),
         },
@@ -1277,6 +1347,14 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "close_sources": {
                         "type": "boolean",
                         "description": "Close non-target source sessions after merge. Default: true."
+                    },
+                    "force_other_owner": {
+                        "type": "boolean",
+                        "description": "Allow merging (and closing) another agent's ACTIVE session. Requires 'reason'. Without it the whole merge is refused and nothing changes."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why force_other_owner is needed. Recorded in the event log."
                     }
                 },
                 "required": ["source_session_ids", "target_session_id"]
@@ -1419,7 +1497,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         // ---- Document management tools (P1-6a, v5 rearchitecture) ----
         ToolDefinition {
             name: "handoff_doc_save".to_string(),
-            description: "Save a complete document. The body MUST be a whole, human-readable Markdown document starting with a level-1 heading (e.g. `# Authentication Spec`) — group related content into ONE document (for example, all ADRs belong in a single `# Architecture Decision Records` document with each ADR as an `## ADR-001: ...` section, NOT as separate documents). MCP handles section-level indexing internally, so do not pre-split content yourself. To append a new section to an existing document (e.g. adding ADR-003) without rewriting the whole body, pass `append_body` with just the new section instead of `body` — `body` and `append_body` are mutually exclusive, and `append_body` requires an existing `doc_id` (there is nothing to append to when creating a new document). To update only metadata (e.g. `task_ids`, `tags`, `auto_inject`) on an existing document without touching its content, pass `doc_id` and omit both `body` and `append_body` — the existing body is kept verbatim (sections/content_hash are recomputed from it, but nothing is rewritten to disk). New documents (no `doc_id`) always require `body`. The body (or, for append_body, the resulting combined body) is stored verbatim at _doc.<slug>.md and split in-memory into a `sections` byte-offset index (no per-section files), syncing the bidirectional task<->doc link when task_ids is given. Omit doc_id to create a new document (slug is then required and must be unique); pass an existing doc_id to update it (slug is taken from the existing document — it cannot be renamed via doc_save). Returns a JSON string {doc_id,slug,title,doc_type,section_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved, and includes a soft notice when the saved body does not start with a level-1 heading (the save is never rejected for this). Response also carries `scaffold_suggestions` ([{stable_id, title}] of requirement items in a doc_type=plan document that no task links to yet; empty for other doc types; suggestion only, nothing is created) and `schedule_stale` (true when this save changed the document's task_ids, i.e. handoff_auto_schedule should be re-run). When the save removes requirement item(s) that no document owns anymore (a requirement merely moved to another document keeps its links), the task-side requirement links to them are removed automatically and tasks left with no requirement link at all are returned as `orphaned_tasks` ([{task_id, title}], present only when non-empty); task status is never changed. Layer documents: a `- parent:` attribute (requirement tree; several comma-separated parents make a DAG) that newly names a nonexistent, other-layer or self parent, or closes a parent cycle, rejects the save before anything is written — the error message ends with `errors: [{code: self_parent|parent_dangling|parent_cross_layer|tree_cycle, item, message, path?}]`; a dotted heading id (`### DSP-1.2.3`, which the ID grammar splits into `DSP-1` plus a title) is saved with a `dotted_id` warning. SPEC-TREE-013: when the write removed items that other items declared as their `parent`, the response includes orphaned_children:[stable_id] — the decomposition children left with no surviving parent (a DAG child that still has another existing parent is not orphaned); the key is absent when there are none.".to_string(),
+            description: "Save a complete document. The body MUST be a whole, human-readable Markdown document starting with a level-1 heading (e.g. `# Authentication Spec`) — group related content into ONE document (for example, all ADRs belong in a single `# Architecture Decision Records` document with each ADR as an `## ADR-001: ...` section, NOT as separate documents). MCP handles section-level indexing internally, so do not pre-split content yourself. To append a new section to an existing document (e.g. adding ADR-003) without rewriting the whole body, pass `append_body` with just the new section instead of `body` — `body` and `append_body` are mutually exclusive, and `append_body` requires an existing `doc_id` (there is nothing to append to when creating a new document). To update only metadata (e.g. `task_ids`, `tags`, `auto_inject`) on an existing document without touching its content, pass `doc_id` and omit both `body` and `append_body` — the existing body is kept verbatim (sections/content_hash are recomputed from it, but nothing is rewritten to disk). New documents (no `doc_id`) always require `body`. The body (or, for append_body, the resulting combined body) is stored verbatim at _doc.<slug>.md and split in-memory into a `sections` byte-offset index (no per-section files), syncing the bidirectional task<->doc link when task_ids is given. Omit doc_id to create a new document (slug is then required and must be unique); pass an existing doc_id to update it (slug is taken from the existing document — it cannot be renamed via doc_save). Returns a JSON string {doc_id,slug,title,doc_type,section_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved, and includes a soft notice when the saved body does not start with a level-1 heading (the save is never rejected for this). Response also carries `scaffold_suggestions` ([{stable_id, title}] of requirement items in a doc_type=plan document that no task links to yet; empty for other doc types; suggestion only, nothing is created) and `schedule_stale` (true when this save changed the document's task_ids, i.e. handoff_auto_schedule should be re-run; always false when `[settings] schedule_stale_notice = false`). A `spec`/`design` document saved without a layer adds a structured `DIAG-D001` warning unless `[settings] layer_missing_notice = false`. When the save removes requirement item(s) that no document owns anymore (a requirement merely moved to another document keeps its links), the task-side requirement links to them are removed automatically and tasks left with no requirement link at all are returned as `orphaned_tasks` ([{task_id, title}], present only when non-empty); task status is never changed. Layer documents: a `- parent:` attribute (requirement tree; several comma-separated parents make a DAG) that newly names a nonexistent, other-layer or self parent, or closes a parent cycle, rejects the save before anything is written — the error message ends with `errors: [{code: self_parent|parent_dangling|parent_cross_layer|tree_cycle, item, message, path?}]`; a dotted heading id (`### DSP-1.2.3`, which the ID grammar splits into `DSP-1` plus a title) is saved with a `dotted_id` warning. SPEC-TREE-013: when the write removed items that other items declared as their `parent`, the response includes orphaned_children:[stable_id] — the decomposition children left with no surviving parent (a DAG child that still has another existing parent is not orphaned); the key is absent when there are none.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1547,7 +1625,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: document must have every listed tag (AND)." },
                     "task_id": { "type": "string", "description": "Filter: only documents linked to this task." },
                     "include_body": { "type": "boolean", "description": "Include each document's full body.", "default": false },
-                    "query": { "type": "string", "description": "BM25 text search over title + tags + body." }
+                    "query": { "type": "string", "description": "BM25 text search over title + tags + body." },
+                    "doc_id": { "type": "string", "description": "Exact match on the document id (case-sensitive, not trimmed; an empty string matches nothing). If no document has that id but one has that slug, it is matched as the slug and warnings says so; if neither exists, warnings carries a hint. Combined with the other filters (AND). To fetch one known document, prefer this or slug over listing everything." },
+                    "slug": { "type": "string", "description": "Exact match on the document slug (case-sensitive, not trimmed; an empty string matches nothing). Combined with the other filters (AND)." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Return at most this many documents, taken from the front of the result (after filters and, when query is given, relevance ranking). Omit for no cap." },
+                    "fields": { "type": "array", "items": { "type": "string" }, "description": "Metadata keys to keep on each document (duplicates collapse). Allowed: id, slug, title, doc_type, tags, scope_paths, parent_id, children, related, auto_inject, task_ids, layer, trace_profile, milestone, has_bom, line_ending, sections, section_count, created_at, updated_at, content_hash. An unknown name is an error that lists the allowed names. include_body still adds body after the projection. Omit or [] for all keys." }
                 }
             }),
         },
@@ -2333,7 +2415,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_events".to_string(),
-            description: "Query .handoff/events.jsonl (lease/agent/session lifecycle events: task.claimed, task.released, task.expired, task.reclaimed, agent.registered, session.created, session.closed) with optional filters. Returns matching events oldest-first, most-recent-first when truncated by limit.".to_string(),
+            description: "Query .handoff/events.jsonl (lease/agent/session lifecycle events: task.claimed, task.released, task.expired, task.reclaimed, agent.registered, session.created, session.activated, session.resumed, session.closed, session.pruned, memory.merged) with optional filters. Returns matching events oldest-first, most-recent-first when truncated by limit.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -105,6 +105,14 @@ Skipping this breaks the handoff chain.
 ```
 handoff_load_context
 -> Review previous session's decisions / context_pointers / next_actions / handoff_notes
+-> The lineage is decided automatically: `previous_session.inferred: true` is used as is
+   (the next session-creating save records it in `continues`). Only if the response says
+   `ambiguous: true` (no `previous_session`/`next_actions`; candidates in `other_heads`):
+   match each candidate's `summary` against the user's request and this session's tasks,
+   then call `handoff_load_context(continue_from="<id>")`. If you cannot decide, ask the
+   user. Never pass `continue_from` otherwise.
+-> `/clear` does not close the handoff session: `handoff_save_context` (close) BEFORE
+   `/clear` if you want a boundary
 -> If no active session (= previous session was properly closed):
   handoff_save_context(
     session_status="active",
@@ -117,10 +125,19 @@ handoff_load_context
 ### 1. Fetch tasks and split into sessions
 
 ```
+# Tasks were specified (`/session-loop t75,t78`, or a closed range `t5-t9` expanded to
+# t5,t6,...,t9): fetch exactly those. Do NOT fetch all todo tasks.
+handoff_list_tasks(ids=["t75","t78"], include_descendants=true)
+
+# No task selector (or an open-ended `t5-`): the only case that needs every todo task
 handoff_list_tasks(status_filter="todo")
 ```
 
-- Fetch all todo tasks
+- With a task selector, fetch only the specified tasks by `ids` with
+  `include_descendants=true` (unknown ids are simply absent). A named parent stands for
+  its unfinished subtasks: the response nests each matched task's whole subtree, so the
+  subtask ids (e.g. `t75.1`) and their statuses are visible without a full todo fetch
+- Without a task selector, fetch all todo tasks
 - Analyze dependencies, priorities, and complexity
 - **1 session = 1-5 tasks** (adjust based on scale)
   - Group tasks in the same functional area (avoid file conflicts between developers)
@@ -431,7 +448,8 @@ The workflow returns:
 | `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran |
 | `spec_prep_report` | object\|null | Stage 0 (Spec-Prep, `standard`/`full`) result: `{ specs_generated[], scaffolds_created[], low_confidence_items[], checker_result{ verdict, issues[] }, error? }`. Low-confidence items, a failing checker, or a crash are added to `warnings` (never fails the session). `null` under `express` |
 | `spec_reconcile_report` | object\|null | Stage 3.5 (Spec-Reconcile, `standard`/`full`) result: `{ mode: audit\|apply, reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[], error? }`. Each `contract_ambiguity` is also appended to `pending_followups` (source `spec-reconciler`) and each `verification_impact` to `warnings`. `null` under `express` or when `passed: false` |
-| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
+| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, ops_failed[{ op, error }], unexecuted_ops[{ op, reason }], notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
+| `closer_failed_tasks` | string[] | Task ids whose close-out the closer reported as failed or incomplete (`ops_failed` / `unexecuted_ops` non-empty), session tasks missing from `closer_report.tasks_processed` (the closer reported no error but skipped them), or every session task when the closer itself failed (`closer_report.error`). A reported-failed/incomplete task has a `closer_failed:` entry in `warnings`; a skipped task has a `Closer did not report on task …` entry. Close these by hand; never trust their `status_set`. Empty when the closer ran clean or did not run |
 | `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
 | `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged |
 | `session_log` | object[] | per-round trace |
@@ -451,7 +469,8 @@ The workflow returns:
 > sets each task to `done` (fully verified) or `review`, and runs `trace_update` /
 > `requirement_ids` linking. Read `closer_report` and **verify rather than repeat** it. Do the
 > manual procedure below only for what it did not cover: when `warnings` is non-empty or
-> `closer_report.error` is set, for any task missing from `closer_report.tasks_processed`,
+> `closer_report.error` is set, for any task listed in `closer_failed_tasks` (this includes a
+> task missing from `closer_report.tasks_processed`),
 > and under `express` / `passed: false` where no closer runs. Surface every closer warning to
 > the user.
 
@@ -659,7 +678,9 @@ handoff_save_context(
 ## Task selector (argument parsing)
 
 Users can scope the loop via arguments to `/session-loop`.
-The manager parses these and filters `handoff_list_tasks` results accordingly.
+The manager parses these and fetches the matching tasks with `handoff_list_tasks`
+(`ids=[...], include_descendants=true` when task ids are specified; `status_filter="todo"`
+only when they are not).
 
 | Format | Meaning | Example |
 |---|---|---|
@@ -669,7 +690,9 @@ The manager parses these and filters `handoff_list_tasks` results accordingly.
 | `goal: <cond>` | Natural language stop condition | `/session-loop goal: ...` |
 | (no args) | All todo tasks | `/session-loop` |
 
-- Tasks with non-`todo` status are skipped (reported to user).
+- Tasks with non-`todo` status are skipped (reported to user). A named parent that is
+  not `todo` (for example `in_progress`) is not skipped as a whole: its `todo` subtasks
+  are the work to run, and the parent itself is only reported.
 - Open-ended ranges (`t5-`) include all todo tasks with IDs >= t5.
 - Mixed formats (`t1,t3-t5`) are supported.
 
@@ -678,7 +701,14 @@ The manager parses these and filters `handoff_list_tasks` results accordingly.
 With task selector: Stop when all specified tasks are done.
 Without args (default): **Stop when zero todo tasks remain in handoff.**
 
-Each iteration checks `handoff_list_tasks(status_filter="todo")`.
+Each iteration checks the target tasks:
+- With a task selector naming ids:
+  `handoff_list_tasks(ids=[<the specified ids>], include_descendants=true)` and look for any
+  task or subtask that is still `todo` (never fetch all todo tasks for this check). A named
+  parent that is not `todo` (for example `in_progress`) does not keep the loop running by
+  itself: once none of its subtasks is `todo`, report the parent so the user can close it.
+- Without a task selector (or an open-ended `t5-`): `handoff_list_tasks(status_filter="todo")`.
+
 If target tasks remain, continue. If zero, run completion procedure.
 
 ## Completion (when goal is met)

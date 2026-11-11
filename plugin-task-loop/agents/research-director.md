@@ -54,7 +54,11 @@ Use ToolSearch to load the schemas first.
 When the workflow indicates this is the **final round** and your verdict is
 still negative, you MUST write escalation context:
 
-1. **`handoff_save_context`**: Persist findings for the next session.
+1. **`handoff_update_session`**: Persist findings for the next session in the
+   active session (append notes/decisions). If there is no active session, call
+   `handoff_save_context(session_status: "active")`. Never a default (closed)
+   `handoff_save_context`: sub-agents share the parent's `agent_id`, so a closed
+   save would close the parent's own active session.
 2. **`handoff_memory_save`**: Record lessons learned.
 3. **`handoff_doc_save`**: persist research output as a structured document
    (spec, design, report) for future sessions, when the gate decision itself

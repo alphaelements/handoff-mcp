@@ -96,3 +96,26 @@ fn detect_session_scope_primary_stays_primary_after_worktree_added() {
 
     assert_eq!(detect_session_scope(primary.path()), "primary");
 }
+
+/// `worktree_key` names the checkout in a way that survives a different
+/// absolute path: `main` for the primary checkout, the worktree's name for a
+/// linked one, nothing outside git.
+#[test]
+fn worktree_key_is_main_for_primary_and_the_name_for_a_linked_worktree() {
+    use handoff_mcp::storage::worktree_key;
+
+    let not_git = tempfile::tempdir().unwrap();
+    assert_eq!(worktree_key(not_git.path()), None);
+
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    assert_eq!(worktree_key(primary.path()), Some("main".to_string()));
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = wt_parent.path().join("feature-wt");
+    run(
+        primary.path(),
+        &["worktree", "add", "-b", "feat", wt.to_str().unwrap()],
+    );
+    assert_eq!(worktree_key(&wt), Some("feature-wt".to_string()));
+}

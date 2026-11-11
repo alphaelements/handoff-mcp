@@ -22,8 +22,9 @@ const DEFAULT_LEASE_TTL_SECONDS: u64 = 1800;
 // `UNKNOWN_IDENTITY` (fallback agent/session identity used when the caller
 // does not yet carry one) is defined in `storage::tasks` and re-exported
 // here so ownership-check code (`release_task`) and this handler agree on
-// the exact sentinel value. `ctx.agent_id` is `None` until this process has
-// called `handoff_load_context` (see `crate::mcp::router::set_agent_id`);
+// the exact sentinel value. `ctx.agent_id` is always set in the server (fixed
+// at startup, see `crate::mcp::router::set_agent_id`); it is `None` only for
+// the CLI and for in-process tests that never called `handoff_load_context`;
 // `session_id` has no equivalent context field at all yet, so it is always
 // taken from `arguments` with this same fallback.
 

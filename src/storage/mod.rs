@@ -7,12 +7,16 @@ pub mod deltas;
 pub mod docs;
 pub mod events;
 pub mod git;
+pub mod gitignore;
 pub mod layer_status;
+pub mod lineage;
 pub mod memory;
 pub mod metrics_snapshots;
 pub mod referrals;
 pub mod runs;
+pub mod session_target;
 pub mod sessions;
+pub mod task_scope;
 pub mod tasks;
 pub mod test_results;
 pub mod test_runs;
@@ -442,6 +446,33 @@ pub fn detect_session_scope(project_dir: &Path) -> &'static str {
     }
 }
 
+/// Name of the checkout for comparing sessions across machines: `main` for a
+/// primary checkout, the `.git/worktrees/<name>` name for a linked worktree,
+/// `None` outside git. The absolute `worktree` path differs between a Mac host
+/// and a container; this does not.
+///
+/// Reads the `.git` entry only (no `git` process): a directory is a primary
+/// checkout, a file holds `gitdir: <path>` and a linked worktree's path ends in
+/// `worktrees/<name>` (a submodule's points under `modules/` and counts as a
+/// primary checkout of its own repository).
+pub fn worktree_key(project_dir: &Path) -> Option<String> {
+    let dot_git = project_dir.join(".git");
+    if dot_git.is_dir() {
+        return Some("main".to_string());
+    }
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = Path::new(content.trim().strip_prefix("gitdir:")?.trim());
+    match (
+        gitdir.parent().and_then(Path::file_name),
+        gitdir.file_name(),
+    ) {
+        (Some(parent), Some(name)) if parent == "worktrees" => {
+            Some(name.to_string_lossy().to_string())
+        }
+        _ => Some("main".to_string()),
+    }
+}
+
 /// Read `[worktree] handoff_root` from `primary_handoff/config.toml`, if
 /// present, expand a leading `~/`, and return it as the actual shared
 /// `.handoff/` path to use instead of `primary_handoff`. Returns `None`
@@ -511,6 +542,9 @@ pub fn init_handoff(project_dir: &Path, project_name: &str, description: &str) -
 
     let config = config::Config::new(project_name, description);
     config::write_config(&dir.join("config.toml"), &config)?;
+    // Only `.handoff/.gitignore`; the project's own repo and `.gitignore` are
+    // never touched.
+    gitignore::ensure_recommended_gitignore(&dir)?;
 
     Ok(())
 }

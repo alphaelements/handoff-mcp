@@ -8,11 +8,37 @@ description: "Session handoff — load context at start, save at end, track task
 ## Session Start
 
 1. Call `handoff_load_context` (uses current working directory).
+   **Which earlier session you continue is decided automatically.** With
+   `previous_session.inferred: true` (and its `evidence`) use it as is — pass
+   nothing extra, and your next `handoff_save_context` that creates a session
+   records it in `continues` on its own. Only when the response says
+   `ambiguous: true` (no `previous_session`, no `next_actions`, a list of
+   `other_heads`) compare each candidate's `summary` with the user's request
+   and the tasks you are about to work on, then call `handoff_load_context`
+   again with `continue_from: "<id>"` of the matching one. If you cannot
+   decide, ask the user. A candidate with `in_flight_by` is already continued
+   by another agent's active session — if that is yours (after a restart),
+   resume it with `session_id` set to the ACTIVE session id listed in
+   `in_flight_by` (not the candidate's head id) plus `adopt: true` instead. Never pass
+   `continue_from` when `inferred: true` came back.
 2. If the project is not initialized, call `handoff_init` with the project name
    derived from the directory name.
 3. If `paused_sessions` are returned, show them to the user (ID, summary,
    branch). To resume: `handoff_load_context(session_id: "s-...")`.
-   To discard: `handoff_save_context(close_session_id: "s-...")`.
+   To discard: `handoff_save_context(close_session_id: "s-...")` — a paused
+   (or open) session may be closed even when another agent owns it (a
+   `session.foreign_close` event is logged).
+   **Sessions owned by another agent** (another window) are never picked
+   implicitly. They appear in `adoptable_sessions` (ID, summary, branch,
+   `updated_at`; no body). If one is yours — after a restart, `--continue` or
+   an MCP reconnect gave you a new `agent_id` — resume it with
+   `handoff_load_context(session_id: "s-...")`; an **active** one also needs
+   `adopt: true`, because the other window may still be working on it.
+   An *active* session of another agent cannot be closed or paused by ID:
+   the call is refused with an error and nothing is saved or changed. Only
+   with `force_other_owner: true` plus a `reason` is it closed anyway.
+   `/clear` does not close the handoff session: close it with
+   `handoff_save_context` before `/clear`, or it stays active.
 4. **Establish an active session immediately** — if `session_guidance` is
    present in the response (meaning no active session exists), call
    `handoff_save_context` with `session_status: "active"` **before starting
@@ -263,6 +289,9 @@ Before assigning dates to tasks, check available capacity:
   - A `depends_on` cycle rejects the whole run before anything is written; the error names the cycle path (`a → b → a`). Fix `depends_on` with `handoff_update_milestone`.
   - The response always carries `milestone_summary` (per milestone: `milestone`, `date`, `task_count`, `total_estimate_hours`, `latest_due`, `overdue`) for the tasks scheduled in this run. A task due after its milestone `date` also adds a `warnings` entry.
   - A task without `estimate_hours` is scheduled with `settings.default_estimate_hours` (config.toml `[settings]`, default `8.0`; set via `handoff_update_config` with `settings.default_estimate_hours`, a number > 0). When any task fell back to that default, `warnings` gains one entry: `N tasks have no estimate_hours — using default Xh each. Set estimate_hours on tasks or settings.default_estimate_hours in config.toml.` No such entry appears when every scheduled task has an estimate.
+
+  - `handoff_update_task` ends its response with `schedule_stale: true` after a change that moves the schedule (status, dependencies, dates, estimate). Projects that do not auto-schedule can silence it with `settings.schedule_stale_notice = false` (`handoff_update_config`, boolean, default `true`); `handoff_doc_save` then returns `schedule_stale: false`.
+  - A dependency on a task ID that does not exist yet is accepted with a `DANGLING_DEPENDENCY` warning, which also says the dependency may become circular if that ID is later assigned to a different task.
 
 ### Team & Assignee Management
 

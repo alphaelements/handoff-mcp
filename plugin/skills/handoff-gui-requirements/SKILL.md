@@ -1,6 +1,6 @@
 ---
 name: handoff-gui-requirements
-description: "GUI 要件管理 — brainstorm から VRT 検証完了まで。Triggers: GUI要件, GUI requirement, mock属性, ゴールデン, VRT, ビジュアルリグレッション, gui-vrt, 画面設計, ワイヤーフレーム, GUI verification pipeline, mock/golden/viewport"
+description: "GUI requirement management, from brainstorm to a recorded VRT verdict. Triggers: GUI要件, GUI requirement, mock属性, ゴールデン, VRT, ビジュアルリグレッション, gui-vrt, 画面設計, ワイヤーフレーム, GUI verification pipeline, mock/golden/viewport"
 ---
 
 # Handoff GUI Requirements (end-to-end navigator)

@@ -124,7 +124,7 @@ coverage and state (lint `layer_outside_profile`, info).
 | `[trace.profiles.<name>]` | table | none | custom profile (§4.4) | `[trace.profiles.web]` |
 | `[trace.lint.rules]` `<rule> = "<sev>"` | table of strings | `{}` | per-rule severity override (§7) | `unverified = "error"` |
 | `[[trace.lint.require]]` | array of tables | none | project policy rules (§7) | see §7 |
-| `[trace] auto_layer` | bool | `false` | `doc_save` without a `layer` argument infers one from `doc_type` (§6) | `auto_layer = true` |
+| `[trace] auto_layer` | bool | `false` | `doc_save` without a `layer` argument infers one from `doc_type` (§6) — only when the document is created; an existing document's layer is never changed by `append_body` or a metadata update | `auto_layer = true` |
 | `[trace] plan_default_layer` | string | `"detailed_spec"` | the layer `auto_layer` gives `plan` documents | `plan_default_layer = "basic_spec"` |
 | `[trace.requirement_gate]` | table | unset | quality-gate settings for the requirement workflow (§9) | `[trace.requirement_gate]` |
 
@@ -135,6 +135,15 @@ coverage and state (lint `layer_outside_profile`, info).
 | `fail_on` | `"error"` \| `"warning"` | `"error"` | the finding severity that fails the gate |
 | `required_checks` | string array | `[]` | checks that must run: `iso29148`, `nfr`, `completeness` |
 | `skip_checks` | string array | `[]` | checks the gate skips (same names; a check cannot be in both lists) |
+
+Two advisory switches live under `[settings]`, not `[trace]`; both are
+booleans that default to `true`, and `handoff_update_config` rejects any
+non-boolean value:
+
+| key | effect when `false` |
+|---|---|
+| `[settings] layer_missing_notice` | `doc_save` no longer returns the `DIAG-D001` warning for a `spec`/`design` document saved without a `layer`. Nothing else about the save changes |
+| `[settings] schedule_stale_notice` | `update_task` no longer ends its response with `schedule_stale: true`, and `doc_save` returns `schedule_stale: false`, for projects that do not run `handoff_auto_schedule` |
 
 `[[trace.layer]]` entry:
 
@@ -184,6 +193,8 @@ coverage and state (lint `layer_outside_profile`, info).
 | `system_test` | システムテスト | right | 2 | `basic_spec` | `ST` |
 | `unit_test` | ユニットテスト | right | 3 | `detailed_spec` | `UT` |
 
+The display names are the Japanese built-in labels (English: Requirements, Basic spec,
+Detailed spec, Acceptance verification, System test, Unit test).
 The built-ins cannot be redefined or removed. To use fewer of them, choose a
 profile or set `layers`.
 
@@ -211,7 +222,7 @@ An **origin layer** has no verification pair. Declare it with
 use `level = 0` (above `requirement`), and may reuse a prefix another layer
 already owns (the document's `layer`, not the prefix, decides an item's layer).
 Its items get no horizontal coverage (reported as `na`) and no implicit
-acceptance items. The brainstorm report layer is one:
+acceptance items. The brainstorm report layer is one (its Japanese display name means "Brainstorming"):
 
 ```toml
 [[trace.layer]]

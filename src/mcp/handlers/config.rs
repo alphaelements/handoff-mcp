@@ -40,11 +40,15 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     // Separate typed keys (settings/dashboard/project) from raw TOML keys
     let typed_keys = [
         "settings.history_limit",
+        "settings.session_prune_limit",
         "settings.done_task_limit",
+        "settings.compact_task_limit",
         "settings.auto_git_summary",
         "settings.require_estimate_hours",
         "settings.ai_estimate_multiplier",
         "settings.default_estimate_hours",
+        "settings.schedule_stale_notice",
+        "settings.layer_missing_notice",
         "settings.context_files",
         "settings.memory_enabled",
         "settings.memory_dup_threshold",
@@ -87,9 +91,46 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         for (key, value) in updates {
             match key.as_str() {
                 "settings.history_limit" => {
-                    if let Some(n) = value.as_u64() {
-                        config.settings.history_limit = n as u32;
+                    // Deprecated since v0.47.3 and inert: a number is still
+                    // stored (DS-V0473-311) but never prunes, and the reply
+                    // says so; null removes the key.
+                    if value.is_null() {
+                        config.settings.history_limit = None;
+                        applied.push("settings.history_limit = null (removed)".to_string());
+                    } else {
+                        let n = value
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "settings.history_limit must be a non-negative integer or null"
+                                )
+                            })?;
+                        config.settings.history_limit = Some(n);
                         applied.push(format!("settings.history_limit = {n}"));
+                        applied.push(
+                            "Warning: settings.history_limit is deprecated and no longer prunes \
+                             sessions; use settings.session_prune_limit (pass null to remove \
+                             history_limit)"
+                                .to_string(),
+                        );
+                    }
+                }
+                "settings.session_prune_limit" => {
+                    if value.is_null() {
+                        config.settings.session_prune_limit = None;
+                        applied.push("settings.session_prune_limit = null (removed)".to_string());
+                    } else {
+                        let n = value
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "settings.session_prune_limit must be a non-negative integer or null"
+                                )
+                            })?;
+                        config.settings.session_prune_limit = Some(n);
+                        applied.push(format!("settings.session_prune_limit = {n}"));
                     }
                 }
                 "settings.done_task_limit" => {
@@ -97,6 +138,18 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                         config.settings.done_task_limit = n as u32;
                         applied.push(format!("settings.done_task_limit = {n}"));
                     }
+                }
+                "settings.compact_task_limit" => {
+                    let n = value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "settings.compact_task_limit must be a non-negative integer"
+                            )
+                        })?;
+                    config.settings.compact_task_limit = n;
+                    applied.push(format!("settings.compact_task_limit = {n}"));
                 }
                 "settings.auto_git_summary" => {
                     if let Some(b) = value.as_bool() {
@@ -109,6 +162,20 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                         config.settings.require_estimate_hours = b;
                         applied.push(format!("settings.require_estimate_hours = {b}"));
                     }
+                }
+                "settings.schedule_stale_notice" => {
+                    let Some(b) = value.as_bool() else {
+                        anyhow::bail!("settings.schedule_stale_notice must be a boolean");
+                    };
+                    config.settings.schedule_stale_notice = b;
+                    applied.push(format!("settings.schedule_stale_notice = {b}"));
+                }
+                "settings.layer_missing_notice" => {
+                    let Some(b) = value.as_bool() else {
+                        anyhow::bail!("settings.layer_missing_notice must be a boolean");
+                    };
+                    config.settings.layer_missing_notice = b;
+                    applied.push(format!("settings.layer_missing_notice = {b}"));
                 }
                 "settings.ai_estimate_multiplier" => {
                     if let Some(n) = value.as_f64() {

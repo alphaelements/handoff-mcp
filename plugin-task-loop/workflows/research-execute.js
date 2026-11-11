@@ -266,7 +266,7 @@ function buildGatePrompt(round, isLastRound, prevGaps) {
       ``,
       `## ESCALATION`,
       `If you cannot PASS, issue a qualified PASS with explicit caveats.`,
-      `Write escalation context to handoff (handoff_save_context + handoff_memory_save).`,
+      `Write escalation context to handoff (handoff_update_session on the active session, or handoff_save_context with session_status "active" if there is none — never a closed save, it would close the parent's session — plus handoff_memory_save).`,
     );
   }
 
@@ -384,7 +384,7 @@ function buildReviewPrompt(revisionRound, isLastRound) {
       ``,
       `## ESCALATION`,
       `If you cannot APPROVE, issue a qualified APPROVE with explicit caveats.`,
-      `Write escalation context to handoff (handoff_save_context + handoff_memory_save).`,
+      `Write escalation context to handoff (handoff_update_session on the active session, or handoff_save_context with session_status "active" if there is none — never a closed save, it would close the parent's session — plus handoff_memory_save).`,
     );
   }
 

@@ -95,7 +95,7 @@ test('requirement-reviewer: covers cross-review perspectives, inputs and REDO re
   ]) {
     assert.ok(body.includes(needle), `body must mention ${needle}`);
   }
-  for (const re of [/duplicate|重複/i, /contradict|矛盾/i, /omission|missing|gap|漏れ/i, /granularity|abstraction/i, /interface/i]) {
+  for (const re of [/duplicate/i, /contradict/i, /omission|missing|gap/i, /granularity|abstraction/i, /interface/i]) {
     assert.match(body, re);
   }
 });

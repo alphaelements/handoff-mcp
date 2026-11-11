@@ -179,10 +179,24 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsConfig {
-    #[serde(default = "default_history_limit")]
-    pub history_limit: u32,
+    /// Deprecated (v0.47.3): no longer prunes anything. Still read so an old
+    /// `config.toml` (including the `20` that `handoff_init` used to write)
+    /// parses, and `load_context` warns while it is set. `init` never writes
+    /// it; `handoff_update_config` can delete it with `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_limit: Option<u32>,
+    /// Opt-in cap on closed sessions kept on disk. `None` (the default) keeps
+    /// every session; `0` is treated the same as `None`. Heads are never
+    /// pruned (see `storage::sessions::prune_closed_sessions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_prune_limit: Option<u32>,
     #[serde(default = "default_done_task_limit")]
     pub done_task_limit: u32,
+    /// How many tasks beyond the active ones the compact `task_tree` of
+    /// `handoff_load_context` adds (previous-session, sibling, unblocked,
+    /// branch, milestone and priority tasks together).
+    #[serde(default = "default_compact_task_limit")]
+    pub compact_task_limit: u32,
     #[serde(default = "default_auto_git_summary")]
     pub auto_git_summary: bool,
     /// Require `estimate_hours` when creating/updating leaf tasks. Default true.
@@ -197,6 +211,17 @@ pub struct SettingsConfig {
     /// `estimate_hours`. Unset = 8.0 (one working day). Must be > 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_estimate_hours: Option<f64>,
+    /// Whether `handoff_update_task` / `handoff_doc_save` tell the caller to
+    /// re-run `handoff_auto_schedule` (`schedule_stale: true`) after a change
+    /// that moves the schedule. Set `false` in projects that do not use
+    /// auto-scheduling. Default true.
+    #[serde(default = "default_schedule_stale_notice")]
+    pub schedule_stale_notice: bool,
+    /// Whether `handoff_doc_save` warns with `DIAG-D001` when a layer-capable
+    /// document is saved without a V-model `layer`. Set `false` for projects
+    /// that keep plain documents on purpose. Default true.
+    #[serde(default = "default_layer_missing_notice")]
+    pub layer_missing_notice: bool,
     #[serde(default)]
     pub context_files: Vec<String>,
     /// Master switch for the memory feature (save/query/cleanup). Default true.
@@ -220,12 +245,13 @@ pub struct SettingsConfig {
     /// Maximum number of memories `memory_query` returns per call. Default 5.
     #[serde(default = "default_memory_query_limit")]
     pub memory_query_limit: u32,
-    /// Days after which an un(re)referenced memory is flagged `stale` by
-    /// `memory_cleanup`. Default 60.
+    /// Days since a memory's `updated_at` after which `memory_cleanup` lists it
+    /// as a review candidate (`stale`). A display aid only: nothing is deleted.
+    /// Default 60.
     #[serde(default = "default_memory_stale_days")]
     pub memory_stale_days: i64,
     /// Age (days) past which `memory_cleanup` garbage-collects a per-session
-    /// `injected/` sidecar. Default 14.
+    /// `injected/` sidecar. Default 14; `0` = never delete injection records.
     #[serde(default = "default_memory_injected_gc_days")]
     pub memory_injected_gc_days: i64,
     /// Timer provider mode: "auto" (authority-based), "vscode" (always delegate),
@@ -532,10 +558,6 @@ fn default_merge_strategy() -> String {
 
 fn default_max_concurrent_wts() -> u32 {
     4
-}
-
-fn default_history_limit() -> u32 {
-    20
 }
 
 /// `[trace]` config (wiki/220-vmodel-integration-design.md §2.1, M1
@@ -974,7 +996,19 @@ fn default_done_task_limit() -> u32 {
     10
 }
 
+fn default_compact_task_limit() -> u32 {
+    40
+}
+
 fn default_auto_git_summary() -> bool {
+    true
+}
+
+fn default_schedule_stale_notice() -> bool {
+    true
+}
+
+fn default_layer_missing_notice() -> bool {
     true
 }
 
@@ -1037,12 +1071,16 @@ fn default_max_depth() -> usize {
 impl Default for SettingsConfig {
     fn default() -> Self {
         Self {
-            history_limit: default_history_limit(),
+            history_limit: None,
+            session_prune_limit: None,
             done_task_limit: default_done_task_limit(),
+            compact_task_limit: default_compact_task_limit(),
             auto_git_summary: default_auto_git_summary(),
             require_estimate_hours: default_require_estimate_hours(),
             ai_estimate_multiplier: default_ai_estimate_multiplier(),
             default_estimate_hours: None,
+            schedule_stale_notice: default_schedule_stale_notice(),
+            layer_missing_notice: default_layer_missing_notice(),
             context_files: Vec::new(),
             memory_enabled: default_memory_enabled(),
             memory_dup_threshold: default_memory_dup_threshold(),
@@ -1144,6 +1182,21 @@ pub fn read_config_lenient(handoff_dir: &Path) -> (Option<Config>, Option<String
         Err(_) if !path.exists() => (None, None),
         Err(e) => (None, Some(config_load_warning(&e))),
     }
+}
+
+/// `[settings] schedule_stale_notice` (default and fallback `true`: a missing
+/// or unreadable config keeps the advisory on, which is today's behaviour).
+pub fn schedule_stale_notice_enabled(handoff_dir: &Path) -> bool {
+    read_config_lenient(handoff_dir)
+        .0
+        .is_none_or(|c| c.settings.schedule_stale_notice)
+}
+
+/// `[settings] layer_missing_notice` (default and fallback `true`, as above).
+pub fn layer_missing_notice_enabled(handoff_dir: &Path) -> bool {
+    read_config_lenient(handoff_dir)
+        .0
+        .is_none_or(|c| c.settings.layer_missing_notice)
 }
 
 /// [`read_config_lenient`] narrowed to the `[trace]` table.

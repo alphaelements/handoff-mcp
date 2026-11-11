@@ -213,7 +213,7 @@ fn mixed_typed_and_raw_batch_with_invalid_gate_applies_nothing() {
     let resp = update(
         &pd,
         json!({
-            "settings.history_limit": 7,
+            "settings.done_task_limit": 7,
             "trace.requirement_gate": "not-a-table"
         }),
     );

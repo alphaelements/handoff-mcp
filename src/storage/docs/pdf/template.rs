@@ -553,6 +553,8 @@ pub fn render_preamble(import_path: &str, meta: &CoverMeta, fonts: &FontSelectio
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(unix, not(feature = "bundled-typst")))]
+    use crate::storage::docs::pdf::test_support::write_executable_script;
     use std::fs;
 
     fn handoff() -> tempfile::TempDir {
@@ -893,15 +895,12 @@ mod tests {
     #[cfg(all(unix, not(feature = "bundled-typst")))]
     #[test]
     fn detect_fonts_runs_typst_fonts_and_selects() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("typst");
-        fs::write(
+        write_executable_script(
             &fake,
-            "#!/bin/sh\n[ \"$1\" = fonts ] || exit 9\nprintf 'Noto Sans CJK JP\\nIPAMincho\\n'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            "[ \"$1\" = fonts ] || exit 9\nprintf 'Noto Sans CJK JP\\nIPAMincho\\n'\n",
+        );
 
         let sel = detect_fonts(&fake).unwrap();
 
@@ -912,11 +911,9 @@ mod tests {
     #[cfg(all(unix, not(feature = "bundled-typst")))]
     #[test]
     fn detect_fonts_surfaces_a_failing_typst() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("typst");
-        fs::write(&fake, "#!/bin/sh\necho boom >&2\nexit 2\n").unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_script(&fake, "echo boom >&2\nexit 2\n");
         let err = detect_fonts(&fake).unwrap_err().to_string();
         assert!(err.contains("boom"), "{err}");
     }

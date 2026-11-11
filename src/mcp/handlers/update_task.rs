@@ -760,8 +760,7 @@ pub(super) fn handle_create(
     // Create the directory only once every validation has passed. A rejected
     // create must leave nothing behind: an orphan dir would burn the task ID,
     // because `next_top_level_id` counts directories, not task files.
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
+    create_task_dir_all(&task_dir, &new_id)?;
 
     write_task(&task_dir, status, &data)?;
 
@@ -895,8 +894,7 @@ fn handle_upsert_create(
 
     // Create the directory only once every validation has passed, so a rejected
     // upsert-create leaves no orphan dir shadowing the requested ID.
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
+    create_task_dir_all(&task_dir, task_id)?;
 
     write_task(&task_dir, status, &data)?;
 
@@ -1006,7 +1004,7 @@ fn handle_update(
                 preloaded_doc_set,
                 &mut msg,
             )?;
-            append_schedule_stale(schedule_stale, &mut msg);
+            append_schedule_stale(handoff_dir, schedule_stale, &mut msg);
             append_plan_update_needed(
                 handoff_dir,
                 tasks_dir,
@@ -1050,7 +1048,7 @@ fn handle_update(
         preloaded_doc_set,
         &mut msg,
     )?;
-    append_schedule_stale(schedule_stale, &mut msg);
+    append_schedule_stale(handoff_dir, schedule_stale, &mut msg);
     append_plan_update_needed(
         handoff_dir,
         tasks_dir,
@@ -1062,8 +1060,11 @@ fn handle_update(
     Ok(msg)
 }
 
-fn append_schedule_stale(schedule_stale: bool, msg: &mut String) {
-    if schedule_stale {
+/// Appends the `schedule_stale: true` line when this update made the schedule
+/// stale, unless the project opted out with `[settings] schedule_stale_notice =
+/// false`. Whether the schedule *is* stale is computed regardless.
+fn append_schedule_stale(handoff_dir: &std::path::Path, schedule_stale: bool, msg: &mut String) {
+    if schedule_stale && crate::storage::config::schedule_stale_notice_enabled(handoff_dir) {
         msg.push('\n');
         msg.push_str(SCHEDULE_STALE_LINE);
     }
@@ -1684,7 +1685,8 @@ fn append_dangling_dependency_warnings(dangling: &[String], msg: &mut String) {
     for dep in dangling {
         msg.push_str(&format!(
             "\nWarning [{DANGLING_DEPENDENCY_CODE}]: Dependency '{dep}' does not match any \
-             existing task. Check the task ID spelling or create the task first."
+             existing task. Check the task ID spelling or create the task first. If this ID \
+             is later assigned to a different task, the dependency may become circular."
         ));
     }
 }

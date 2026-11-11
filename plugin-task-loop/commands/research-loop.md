@@ -55,6 +55,10 @@ handoff_load_context
     label="Research: <brief>")
 ```
 
+Only this command closes the session (step 6). Sub-agents share this session's
+`agent_id`, so a default (closed) `handoff_save_context` from a sub-agent would
+close it; they record progress with `handoff_update_session` instead.
+
 ### 1. Parse the research request
 
 From the user's input, extract:

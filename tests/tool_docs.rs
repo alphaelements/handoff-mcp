@@ -914,6 +914,82 @@ fn doc_save_auto_layer_respects_explicit_layer_argument() {
     assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"));
 }
 
+/// FR-V0473-012 AC1 (B-5): inference runs only when a document is created.
+/// A layerless existing document (layer cleared on purpose) must not gain a
+/// layer from `append_body`, a metadata-only update or a full body rewrite.
+#[test]
+fn doc_save_auto_layer_does_not_touch_existing_documents() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    // Created with an explicit "" so it is layerless although auto_layer is on.
+    let (doc_id, _) = save_with_doc_type(&dir, "plan", Some(""));
+    assert!(doc_layer(&dir, &doc_id).is_null());
+
+    let appended = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "append_body": "## More\n\nAppended.\n" }),
+    );
+    assert!(!is_error(&appended), "error: {}", payload_text(&appended));
+    assert!(
+        doc_layer(&dir, &doc_id).is_null(),
+        "append_body set a layer"
+    );
+    assert!(
+        !payload(&appended)["warnings"]
+            .to_string()
+            .contains("auto-inferred"),
+        "{}",
+        payload(&appended)["warnings"]
+    );
+
+    let meta = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "tags": ["x"] }),
+    );
+    assert!(!is_error(&meta), "error: {}", payload_text(&meta));
+    assert!(
+        doc_layer(&dir, &doc_id).is_null(),
+        "metadata update set a layer"
+    );
+
+    let rewritten = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "body": "# Auto Layer\n\nRewritten.\n" }),
+    );
+    assert!(!is_error(&rewritten), "error: {}", payload_text(&rewritten));
+    assert!(
+        doc_layer(&dir, &doc_id).is_null(),
+        "body rewrite set a layer"
+    );
+}
+
+/// FR-V0473-012: an already-assigned layer survives an append unchanged, and
+/// FR-V0473-012 AC2: an explicit `layer` on an existing document still sets it.
+#[test]
+fn doc_save_existing_layer_kept_on_append_and_explicit_layer_still_applies() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    let (doc_id, _) = save_with_doc_type(&dir, "plan", Some("requirement"));
+    let appended = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "append_body": "More.\n" }),
+    );
+    assert!(!is_error(&appended), "error: {}", payload_text(&appended));
+    assert_eq!(doc_layer(&dir, &doc_id), json!("requirement"));
+
+    let relayered = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "layer": "basic_spec" }),
+    );
+    assert!(!is_error(&relayered), "error: {}", payload_text(&relayered));
+    assert_eq!(doc_layer(&dir, &doc_id), json!("basic_spec"));
+}
+
 fn save_plain(dir: &std::path::Path, slug: &str, title: &str, extra: Value) -> (String, Value) {
     let mut args = json!({ "slug": slug, "title": title, "body": format!("# {title}\n\nBody.\n") });
     for (k, v) in extra.as_object().expect("extra object") {
@@ -2979,4 +3055,326 @@ fn doc_save_writes_summary_last_even_with_both_layer_sync_and_parent_link_in_one
          written before some other write this same call made (here: the \
          parent doc's children-list update), violating \"derived files last\""
     );
+}
+
+// ---------------------------------------------------------------------
+// doc_list: doc_id / slug exact match, limit, fields (v0.47.3 WS3, FR-V0473-004)
+// ---------------------------------------------------------------------
+
+/// The 21 metadata keys `doc_list` emits per document.
+const DOC_LIST_KEYS: &[&str] = &[
+    "id",
+    "slug",
+    "title",
+    "doc_type",
+    "tags",
+    "scope_paths",
+    "parent_id",
+    "children",
+    "related",
+    "auto_inject",
+    "task_ids",
+    "layer",
+    "trace_profile",
+    "milestone",
+    "has_bom",
+    "line_ending",
+    "sections",
+    "section_count",
+    "created_at",
+    "updated_at",
+    "content_hash",
+];
+
+fn save_doc(dir: &std::path::Path, slug: &str, doc_type: &str, body: &str) -> String {
+    let resp = call(
+        dir,
+        "handoff_doc_save",
+        json!({
+            "slug": slug,
+            "title": format!("Title of {slug}"),
+            "body": body,
+            "doc_type": doc_type,
+        }),
+    );
+    assert!(!is_error(&resp), "doc_save failed: {}", payload_text(&resp));
+    payload(&resp)["doc_id"].as_str().unwrap().to_string()
+}
+
+fn list_docs(dir: &std::path::Path, args: Value) -> Value {
+    let resp = call(dir, "handoff_doc_list", args);
+    assert!(!is_error(&resp), "doc_list failed: {}", payload_text(&resp));
+    payload(&resp)
+}
+
+fn doc_slugs(listed: &Value) -> Vec<String> {
+    listed["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["slug"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn setup_twelve_docs() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, dir) = setup_project();
+    for i in 0..12 {
+        save_doc(
+            &dir,
+            &format!("ws3-doc-{i:02}"),
+            if i % 2 == 0 { "plan" } else { "note" },
+            &format!("# Heading {i}\n\nbody number {i} zebra\n"),
+        );
+    }
+    (tmp, dir)
+}
+
+#[test]
+fn doc_list_slug_exact_match_returns_exactly_one() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let listed = list_docs(&dir, json!({ "slug": "ws3-doc-03" }));
+    assert_eq!(doc_slugs(&listed), vec!["ws3-doc-03"]);
+}
+
+#[test]
+fn doc_list_doc_id_exact_match_returns_exactly_one() {
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-a", "plan", "# A\n");
+    let id_b = save_doc(&dir, "ws3-b", "plan", "# B\n");
+    let listed = list_docs(&dir, json!({ "doc_id": id_b }));
+    let docs = listed["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["id"], json!(id_b));
+    assert_eq!(docs[0]["slug"], "ws3-b");
+}
+
+#[test]
+fn doc_list_slug_match_is_case_sensitive_and_not_trimmed_and_empty_matches_nothing() {
+    let (_tmp, dir) = setup_twelve_docs();
+    for no_match in ["WS3-DOC-03", " ws3-doc-03", "ws3-doc-0", ""] {
+        let listed = list_docs(&dir, json!({ "slug": no_match }));
+        assert!(
+            listed["documents"].as_array().unwrap().is_empty(),
+            "slug {no_match:?} must not match"
+        );
+    }
+}
+
+#[test]
+fn doc_list_doc_id_and_slug_together_both_must_match() {
+    let (_tmp, dir) = setup_project();
+    let id_a = save_doc(&dir, "ws3-a", "plan", "# A\n");
+    save_doc(&dir, "ws3-b", "plan", "# B\n");
+    let both = list_docs(&dir, json!({ "doc_id": id_a, "slug": "ws3-a" }));
+    assert_eq!(doc_slugs(&both), vec!["ws3-a"]);
+    let mismatch = list_docs(&dir, json!({ "doc_id": id_a, "slug": "ws3-b" }));
+    assert!(mismatch["documents"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn doc_list_doc_id_given_a_slug_resolves_it_and_says_so() {
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-a", "plan", "# A\n");
+    save_doc(&dir, "ws3-b", "plan", "# B\n");
+    let listed = list_docs(&dir, json!({ "doc_id": "ws3-b" }));
+    assert_eq!(doc_slugs(&listed), vec!["ws3-b"]);
+    let warnings = listed["warnings"].to_string();
+    assert!(
+        warnings.contains("is a slug") && warnings.contains("slug"),
+        "expected a hint to use `slug`: {warnings}"
+    );
+}
+
+#[test]
+fn doc_list_unknown_doc_id_returns_a_hint_instead_of_silence() {
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-a", "plan", "# A\n");
+    let listed = list_docs(&dir, json!({ "doc_id": "no-such-doc" }));
+    assert!(listed["documents"].as_array().unwrap().is_empty());
+    let warnings = listed["warnings"].to_string();
+    assert!(
+        warnings.contains("no-such-doc") && warnings.contains("slug"),
+        "expected a hint naming the id and the slug argument: {warnings}"
+    );
+}
+
+#[test]
+fn doc_list_doc_id_that_is_a_real_id_adds_no_hint() {
+    let (_tmp, dir) = setup_project();
+    let id = save_doc(&dir, "ws3-a", "plan", "# A\n");
+    let listed = list_docs(&dir, json!({ "doc_id": id }));
+    assert_eq!(doc_slugs(&listed), vec!["ws3-a"]);
+    assert!(listed["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn doc_list_slug_filter_combines_with_doc_type() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let hit = list_docs(&dir, json!({ "slug": "ws3-doc-02", "doc_type": "plan" }));
+    assert_eq!(doc_slugs(&hit), vec!["ws3-doc-02"]);
+    let miss = list_docs(&dir, json!({ "slug": "ws3-doc-02", "doc_type": "note" }));
+    assert!(miss["documents"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn doc_list_limit_returns_the_same_leading_documents() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let full = doc_slugs(&list_docs(&dir, json!({})));
+    assert_eq!(full.len(), 12);
+    let limited = doc_slugs(&list_docs(&dir, json!({ "limit": 5 })));
+    assert_eq!(limited, full[..5].to_vec());
+    let over = list_docs(&dir, json!({ "limit": 100 }));
+    assert_eq!(over["documents"].as_array().unwrap().len(), 12);
+}
+
+#[test]
+fn doc_list_limit_with_include_body_attaches_bodies_to_limit_documents_only() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let listed = list_docs(&dir, json!({ "limit": 5, "include_body": true }));
+    let docs = listed["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 5);
+    assert_eq!(docs.iter().filter(|d| d.get("body").is_some()).count(), 5);
+}
+
+#[test]
+fn doc_list_limit_applies_after_query_ranking() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let ranked = doc_slugs(&list_docs(&dir, json!({ "query": "zebra" })));
+    assert!(ranked.len() >= 2);
+    let top2 = doc_slugs(&list_docs(&dir, json!({ "query": "zebra", "limit": 2 })));
+    assert_eq!(top2, ranked[..2].to_vec());
+}
+
+#[test]
+fn doc_list_limit_must_be_integer_at_least_one() {
+    let (_tmp, dir) = setup_twelve_docs();
+    for bad in [json!(0), json!(-1), json!("3"), json!(1.5)] {
+        let resp = call(&dir, "handoff_doc_list", json!({ "limit": bad }));
+        assert!(is_error(&resp), "limit {bad} should error");
+        assert!(
+            payload_text(&resp).contains("'limit' must be an integer >= 1"),
+            "{}",
+            payload_text(&resp)
+        );
+    }
+}
+
+#[test]
+fn doc_list_fields_projects_metadata_and_deduplicates() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let listed = list_docs(
+        &dir,
+        json!({ "fields": ["slug", "slug", "id"], "limit": 2 }),
+    );
+    for d in listed["documents"].as_array().unwrap() {
+        let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["id", "slug"]);
+    }
+}
+
+#[test]
+fn doc_list_fields_sections_value_is_unchanged_by_projection() {
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-sec", "plan", "# One\n\nx\n\n## Two\n\ny\n");
+    let full = list_docs(&dir, json!({}));
+    let projected = list_docs(&dir, json!({ "fields": ["sections"] }));
+    assert_eq!(
+        full["documents"][0]["sections"],
+        projected["documents"][0]["sections"]
+    );
+}
+
+#[test]
+fn doc_list_fields_unknown_name_errors_and_lists_every_allowed_field() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let resp = call(
+        &dir,
+        "handoff_doc_list",
+        json!({ "fields": ["foo", "bar"] }),
+    );
+    assert!(is_error(&resp));
+    let text = payload_text(&resp);
+    assert!(text.contains("foo") && text.contains("bar"), "{text}");
+    assert!(text.contains("Allowed fields"), "{text}");
+    for key in DOC_LIST_KEYS {
+        assert!(text.contains(key), "missing {key}: {text}");
+    }
+}
+
+#[test]
+fn doc_list_fields_unknown_name_errors_before_reading_documents() {
+    // A corrupt document must not change the error: validation runs first.
+    let (_tmp, dir) = setup_project();
+    save_doc(&dir, "ws3-ok", "plan", "# ok\n");
+    std::fs::write(
+        dir.join(".handoff/docs/_doc.broken.md"),
+        "---\nid: x\n  bad: [\n---\nbody",
+    )
+    .unwrap();
+    let resp = call(&dir, "handoff_doc_list", json!({ "fields": ["nope"] }));
+    assert!(is_error(&resp));
+    assert!(payload_text(&resp).contains("Unknown field(s) in 'fields': nope"));
+}
+
+#[test]
+fn doc_list_fields_rejects_non_string_elements() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let resp = call(&dir, "handoff_doc_list", json!({ "fields": ["id", 3] }));
+    assert!(is_error(&resp));
+}
+
+#[test]
+fn doc_list_fields_empty_array_applies_no_projection() {
+    let (_tmp, dir) = setup_twelve_docs();
+    assert_eq!(
+        list_docs(&dir, json!({})),
+        list_docs(&dir, json!({ "fields": [] }))
+    );
+}
+
+#[test]
+fn doc_list_include_body_is_added_after_projection() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let listed = list_docs(
+        &dir,
+        json!({ "fields": ["slug"], "include_body": true, "limit": 1 }),
+    );
+    let mut keys: Vec<&str> = listed["documents"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["body", "slug"]);
+}
+
+#[test]
+fn doc_list_null_new_arguments_equal_no_arguments_and_keep_the_legacy_shape() {
+    let (_tmp, dir) = setup_twelve_docs();
+    let plain = list_docs(&dir, json!({}));
+    let nulls = list_docs(
+        &dir,
+        json!({ "doc_id": null, "slug": null, "limit": null, "fields": null }),
+    );
+    assert_eq!(plain, nulls);
+    let mut top: Vec<&str> = plain
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top.sort();
+    assert_eq!(top, vec!["documents", "unreadable", "warnings"]);
+    let mut keys: Vec<&str> = plain["documents"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    let mut expected = DOC_LIST_KEYS.to_vec();
+    expected.sort();
+    assert_eq!(keys, expected);
 }

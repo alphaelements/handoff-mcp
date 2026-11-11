@@ -1795,8 +1795,10 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     }
     // t391.1 (REQ-VGAP-007): `[trace] auto_layer = true` infers the layer from
     // `doc_type` — only when the caller passed no `layer` argument at all
-    // (an explicit value, including `""`, always wins).
-    if doc.layer.is_none() && layer_arg.is_none() {
+    // (an explicit value, including `""`, always wins). FR-V0473-012: only at
+    // creation — an existing document's layer (or deliberate absence of one)
+    // is never changed by `append_body`, a metadata update or a body rewrite.
+    if doc_id.is_none() && doc.layer.is_none() && layer_arg.is_none() {
         if let Some(inferred) = trace_config.infer_layer(&doc.doc_type) {
             doc.layer = Some(inferred.to_string());
             warnings.push(format!(
@@ -1808,8 +1810,10 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     }
     // t390.2 (REQ-VGAP-002): only `spec`/`design` documents take part in
     // V-model traceability; `adr`/`guide`/`note` never take a layer.
+    // `[settings] layer_missing_notice = false` opts out of this advisory.
     let layer_missing_warning = (doc.layer.is_none()
-        && LAYERABLE_DOC_TYPES.contains(&doc.doc_type.as_str()))
+        && LAYERABLE_DOC_TYPES.contains(&doc.doc_type.as_str())
+        && crate::storage::config::layer_missing_notice_enabled(handoff))
     .then(|| StructuredWarning {
         severity: "warning".to_string(),
         code: "DIAG-D001".to_string(),
@@ -2058,7 +2062,9 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // REQ-PLA-005: `task_ids` is the plan's schedule input, so a changed set
     // (judged on the post-resolution `doc.task_ids`, which drops ids that
     // could not be linked) means `handoff_auto_schedule` is worth re-running.
-    let schedule_stale = doc.task_ids.iter().cloned().collect::<BTreeSet<_>>() != task_ids_before;
+    // `[settings] schedule_stale_notice = false` opts out of the advisory.
+    let schedule_stale = doc.task_ids.iter().cloned().collect::<BTreeSet<_>>() != task_ids_before
+        && crate::storage::config::schedule_stale_notice_enabled(handoff);
 
     let mut out = json!({
         "doc_id": id,
@@ -2420,11 +2426,59 @@ pub fn handle_doc_get(ctx: &HandlerContext, arguments: &Value) -> Result<String>
     }
 }
 
+/// Every key `doc_metadata_json` emits — the allowed values of
+/// `handoff_doc_list`'s `fields` projection. A unit test pins this list to
+/// the real key set so the two cannot drift apart.
+const DOC_LIST_FIELDS: &[&str] = &[
+    "id",
+    "slug",
+    "title",
+    "doc_type",
+    "tags",
+    "scope_paths",
+    "parent_id",
+    "children",
+    "related",
+    "auto_inject",
+    "task_ids",
+    "layer",
+    "trace_profile",
+    "milestone",
+    "has_bom",
+    "line_ending",
+    "sections",
+    "section_count",
+    "created_at",
+    "updated_at",
+    "content_hash",
+];
+
+/// Reads an optional exact-match string argument: absent or `null` -> `None`;
+/// a non-string value is an error (silently ignoring it would widen the
+/// result to every document).
+fn optional_exact_string<'a>(arguments: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => anyhow::bail!("'{key}' must be a string (got {other})"),
+    }
+}
+
 /// `handoff_doc_list` — list/search documents with optional `doc_type` /
-/// `tags` (AND) / `task_id` filters, BM25 `query` ranking, and optional
-/// reassembled `body` inclusion.
+/// `tags` (AND) / `task_id` filters, exact `doc_id` / `slug` match, BM25
+/// `query` ranking, a `limit` on the ranked result, a `fields` projection of
+/// the metadata, and optional reassembled `body` inclusion.
+///
+/// Order of work (DS-V0473-004): validate `fields`/`limit` (before any
+/// document is read) -> read -> `doc_type`/`tags`/`task_id` filter -> exact
+/// `doc_id`/`slug` -> `query` ranking -> `limit` -> project + `body`.
 pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
+
+    let fields = super::list_args::parse_fields(arguments, DOC_LIST_FIELDS)?;
+    let limit = super::list_args::parse_limit(arguments)?;
+    let exact_doc_id = optional_exact_string(arguments, "doc_id")?;
+    let exact_slug = optional_exact_string(arguments, "slug")?;
 
     let filter = DocFilter {
         doc_type: arguments
@@ -2452,18 +2506,54 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .filter(|s| !s.is_empty());
 
     let (mut docs, unreadable) = read_all_docs_with_unreadable(handoff)?;
+    // `doc_id` is the document id, but callers routinely pass a slug (the
+    // other doc tools take either). When no document has that id and one has
+    // that slug, read it as the slug and say so, rather than answer "nothing".
+    let mut doc_id_notes: Vec<String> = Vec::new();
+    let doc_id_is_slug = exact_doc_id
+        .filter(|id| !docs.iter().any(|d| d.id == *id) && docs.iter().any(|d| d.slug == *id));
+    if let Some(id) = doc_id_is_slug {
+        doc_id_notes.push(format!(
+            "doc_id '{id}' is a slug, not a document id; it was matched as a slug. \
+             Pass it as 'slug' to be exact."
+        ));
+    } else if let Some(id) = exact_doc_id {
+        if !docs.iter().any(|d| d.id == id) {
+            doc_id_notes.push(format!(
+                "no document has doc_id '{id}' (nor a slug of that name). doc_id is the \
+                 document id returned by doc_save/doc_list; pass 'slug' to look a document \
+                 up by its slug."
+            ));
+        }
+    }
     filter.retain(&mut docs);
+    // Exact, case-sensitive, untrimmed; an empty string matches nothing.
+    docs.retain(|d| {
+        exact_doc_id.is_none_or(|id| {
+            if doc_id_is_slug.is_some() {
+                d.slug == id
+            } else {
+                d.id == id
+            }
+        }) && exact_slug.is_none_or(|s| d.slug == s)
+    });
 
-    let ordered_indices: Vec<usize> = if let Some(q) = query {
+    let mut ordered_indices: Vec<usize> = if let Some(q) = query {
         rank_docs_by_query(handoff, &docs, q)?
     } else {
         (0..docs.len()).collect()
     };
+    if let Some(limit) = limit {
+        ordered_indices.truncate(limit);
+    }
 
     let mut out_docs = Vec::with_capacity(ordered_indices.len());
     for idx in ordered_indices {
         let d = &docs[idx];
         let mut entry = doc_metadata_json(d);
+        if let Some(fields) = &fields {
+            entry = super::list_args::project_object(entry, |k| fields.iter().any(|f| f == k));
+        }
         if include_body {
             let body = read_full_body(handoff, d)?.unwrap_or_default();
             entry["body"] = json!(body);
@@ -2475,7 +2565,8 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // warning strings `doc_save`/`trace_report` already surface via
     // `unreadable_doc_warnings`, so a caller sees the count/detail without
     // having to interpret the raw per-doc objects itself.
-    let doc_list_warnings = unreadable_doc_warnings(&unreadable);
+    let mut doc_list_warnings = unreadable_doc_warnings(&unreadable);
+    doc_list_warnings.extend(doc_id_notes);
 
     let unreadable_json: Vec<Value> = unreadable
         .into_iter()
@@ -4096,7 +4187,10 @@ pub(crate) fn write_requirements_summary_with_inputs(
         .context("failed to write _requirements_summary.json")?;
     record_derived_write_for_test(&path, body.len());
     // Derived cache (rebuilt from the documents) — keep it out of `.handoff/`'s git.
-    crate::storage::runs::ensure_gitignore_entry(handoff_dir, "/docs/_requirements_summary.json")?;
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff_dir,
+        crate::storage::gitignore::DOCS_REQUIREMENTS_SUMMARY,
+    )?;
 
     // Record what we just wrote so the next call in this process can skip
     // both the read and any (de)serialization.
@@ -5595,7 +5689,10 @@ fn write_task_ids_rebuild_fingerprint(handoff: &Path, inputs: &DerivedInputs) ->
         .context("Failed to serialize task_ids rebuild fingerprint")?;
     crate::storage::atomic_write(&path, json.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))?;
-    crate::storage::runs::ensure_gitignore_entry(handoff, "/docs/_task_ids_rebuild.json")
+    crate::storage::gitignore::ensure_gitignore_entry(
+        handoff,
+        crate::storage::gitignore::DOCS_TASK_IDS_REBUILD,
+    )
 }
 
 /// t360.7 (wiki/220 §2.5 "全再構築", §4.3 r3): the full, all-tasks-scanning
@@ -12546,6 +12643,29 @@ mod layer_sync_wiring_tests {
              dropping it from the DocSet load this call already performs — got warnings: \
              {warnings:?}"
         );
+    }
+
+    /// `doc_list(fields=...)` validates against `DOC_LIST_FIELDS`; adding a
+    /// key to `doc_metadata_json` without adding it there (or vice versa)
+    /// must fail here.
+    #[test]
+    fn doc_list_fields_allow_list_matches_doc_metadata_json_keys() {
+        let doc = DocMetadata::new(
+            "doc-x".to_string(),
+            "x".to_string(),
+            "X".to_string(),
+            "spec".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        let emitted: BTreeSet<String> = doc_metadata_json(&doc)
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let allowed: BTreeSet<String> = DOC_LIST_FIELDS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(emitted, allowed);
+        assert_eq!(DOC_LIST_FIELDS.len(), allowed.len(), "no duplicates");
     }
 
     /// t377.1 (A-6): `handoff_doc_list`'s per-document `unreadable` array

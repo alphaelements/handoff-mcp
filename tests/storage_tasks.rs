@@ -145,6 +145,89 @@ fn title_to_slug_empty() {
 }
 
 #[test]
+fn title_to_slug_truncates_long_japanese_at_utf8_boundary() {
+    let title = "あ".repeat(100);
+    let slug = title_to_slug(&title);
+    assert!(slug.len() <= TASK_SLUG_MAX_BYTES);
+    assert_eq!(slug, "あ".repeat(40));
+    assert!(String::from_utf8(slug.into_bytes()).is_ok());
+}
+
+#[test]
+fn title_to_slug_truncation_leaves_no_trailing_dash() {
+    // Case 1: the separator is the 41st character, so the 120-byte cut lands
+    // exactly before it. Case 2 (below): the separator is the 40th character
+    // and the cut lands right after it, which is what the trailing-dash trim
+    // must remove.
+    let title = format!("{}-{}", "あ".repeat(40), "い".repeat(10));
+    let slug = title_to_slug(&title);
+    assert_eq!(slug, "あ".repeat(40));
+    let title = format!("{}-{}", "あ".repeat(39), "い".repeat(10));
+    let slug = title_to_slug(&title);
+    assert!(!slug.ends_with('-'));
+    assert!(slug.len() <= TASK_SLUG_MAX_BYTES);
+}
+
+#[test]
+fn title_to_slug_four_byte_chars_stay_on_boundary() {
+    let slug = title_to_slug(&"𠮷".repeat(50));
+    assert_eq!(slug, "𠮷".repeat(30));
+}
+
+#[test]
+fn title_to_slug_short_titles_unchanged() {
+    assert_eq!(title_to_slug("日本語のタイトル"), "日本語のタイトル");
+    let ascii = "a".repeat(120);
+    assert_eq!(title_to_slug(&ascii), ascii);
+    assert_eq!(title_to_slug(&"a".repeat(130)), ascii);
+}
+
+#[test]
+fn long_slug_dir_name_fits_filesystem_limit_and_resolves_by_id() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let title = "長い日本語のタイトル".repeat(10);
+    let dir_name = format!("t12-{}", title_to_slug(&title));
+    assert!(dir_name.len() <= 255);
+    let mut data = make_task("t12", &title);
+    data.title = title.clone();
+    create_task_dir(&tasks_dir, &dir_name, "todo", &data);
+
+    let found = find_task_dir_by_id(&tasks_dir, "t12").unwrap().unwrap();
+    assert_eq!(found.file_name().unwrap().to_str().unwrap(), dir_name);
+    let (read, _) = read_task(&found).unwrap().unwrap();
+    assert_eq!(read.title, title);
+}
+
+#[test]
+fn create_task_dir_all_error_reports_name_byte_length() {
+    let dir = setup();
+    let too_long = dir.path().join("t1-".to_string() + &"a".repeat(300));
+    let err = create_task_dir_all(&too_long, "t1")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("dir name is 303 bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(err.contains("slug is 300 bytes"), "unexpected error: {err}");
+}
+
+#[test]
+fn create_task_dir_all_error_counts_the_slug_after_an_id_containing_a_dash() {
+    let dir = setup();
+    let too_long = dir.path().join("t-vfix.4-".to_string() + &"a".repeat(300));
+    let err = create_task_dir_all(&too_long, "t-vfix.4")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("dir name is 309 bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(err.contains("slug is 300 bytes"), "unexpected error: {err}");
+}
+
+#[test]
 fn find_task_dir_by_id_finds_nested() {
     let dir = setup();
     let tasks_dir = dir.path().join("tasks");
@@ -1466,4 +1549,41 @@ fn validate_dependencies_self_dependency_is_cycle_not_dangling() {
 
     let err = validate_dependencies(&tasks_dir, "t1", &["t1".to_string()]).unwrap_err();
     assert!(err.to_string().contains("Circular dependency"), "{err}");
+}
+
+#[test]
+fn task_summary_by_status_serializes_in_ascending_key_order_every_time() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    for (i, status) in [
+        "todo",
+        "done",
+        "review",
+        "in_progress",
+        "blocked",
+        "skipped",
+        "todo",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("t{}", i + 1);
+        create_task_dir(
+            &tasks_dir,
+            &format!("{id}-x"),
+            status,
+            &make_task(&id, "Task"),
+        );
+    }
+
+    let (_tree, summary) = build_task_index(&tasks_dir, 100).unwrap();
+    let first = serde_json::to_string(&summary.by_status).unwrap();
+    assert_eq!(
+        first,
+        r#"{"blocked":1,"done":1,"in_progress":1,"review":1,"skipped":1,"todo":2}"#
+    );
+    for _ in 0..10 {
+        let (_tree, again) = build_task_index(&tasks_dir, 100).unwrap();
+        assert_eq!(serde_json::to_string(&again.by_status).unwrap(), first);
+    }
 }
