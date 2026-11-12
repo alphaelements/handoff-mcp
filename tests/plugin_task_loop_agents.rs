@@ -171,6 +171,7 @@ const HANDOFF_WRITER_AGENTS: [(&str, &[&str]); 3] = [
             "handoff_update_task",
             "handoff_trace_update",
             "handoff_doc_verify",
+            "handoff_log_time",
         ],
     ),
     (
@@ -332,5 +333,207 @@ fn every_command_in_the_cli_tables_exists_in_the_binary() {
     assert!(
         seen >= 15,
         "expected the CLI tables to be parsed, saw {seen} rows"
+    );
+}
+
+fn project_file(rel: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+        .unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+#[test]
+fn session_closer_has_a_log_time_step_with_the_agreed_rules() {
+    let text = agent_text("session-closer");
+    assert!(
+        text.contains("### 3. Log actual time") || text.contains("Log actual time"),
+        "session-closer: missing the 'Log actual time' procedure step"
+    );
+    for needle in [
+        "handoff_log_time",
+        "### Actual time",
+        "hours_logged",
+        "log_time",
+        "never inflate",
+    ] {
+        assert!(
+            text.to_lowercase().contains(&needle.to_lowercase()),
+            "session-closer: log_time step must mention {needle}"
+        );
+    }
+    // Missing time is not a failure, and bundled tasks have a documented rule.
+    assert!(
+        text.contains("not a failure"),
+        "session-closer: a report without time must be documented as not a failure"
+    );
+    assert!(
+        text.contains("first task"),
+        "session-closer: bundled-task hours rule must be documented"
+    );
+}
+
+#[test]
+fn session_closer_log_time_cli_row_uses_task_log_time() {
+    let rows = cli_table_rows(&agent_text("session-closer"));
+    assert!(
+        rows.iter()
+            .any(|(t, g, a)| t == "handoff_log_time" && g == "task" && a == "log-time"),
+        "session-closer: CLI table needs a `task log-time` row for handoff_log_time"
+    );
+}
+
+#[test]
+fn closer_schema_reports_hours_logged_per_task() {
+    let js = project_file("plugin-task-loop/workflows/session-execute.js");
+    let start = js.find("const CLOSER_SCHEMA").expect("CLOSER_SCHEMA");
+    let end = js[start..]
+        .find("const SPEC_WRITER_SCHEMA")
+        .expect("next schema")
+        + start;
+    let schema = &js[start..end];
+    assert!(
+        schema.contains("hours_logged: { type: 'number' }"),
+        "CLOSER_SCHEMA: hours_logged must be an optional number per task"
+    );
+    let required = schema.find("required: ['task_id', 'status_set']").is_some();
+    assert!(required, "CLOSER_SCHEMA: hours_logged must stay optional");
+    assert!(
+        schema.contains("log_time"),
+        "CLOSER_SCHEMA: ops_failed comment must name the log_time op"
+    );
+    // The closer prompt tells the closer to log the developer's reported time.
+    let prompt = js
+        .find("function buildCloserPrompt")
+        .expect("closer prompt");
+    let prompt_end = js[prompt..].find("function specScopeIsFull").unwrap() + prompt;
+    assert!(
+        js[prompt..prompt_end].contains("handoff_log_time"),
+        "closer prompt must instruct the log_time step"
+    );
+}
+
+#[test]
+fn session_closer_documents_status_set_unchanged() {
+    let text = agent_text("session-closer");
+    assert!(
+        text.contains("`unchanged`"),
+        "session-closer: must document the `unchanged` status_set value"
+    );
+    assert!(
+        !text.contains("status_set: \"\"") && !text.contains("empty `status_set`"),
+        "session-closer: must not suggest an empty status_set"
+    );
+    let js = project_file("plugin-task-loop/workflows/session-execute.js");
+    let start = js.find("const CLOSER_SCHEMA").expect("CLOSER_SCHEMA");
+    let end = js[start..]
+        .find("const SPEC_WRITER_SCHEMA")
+        .expect("next schema")
+        + start;
+    assert!(
+        js[start..end].contains("enum: ['done', 'review', 'in_progress', 'unchanged']"),
+        "CLOSER_SCHEMA: status_set enum must include 'unchanged'"
+    );
+    let prompt = js
+        .find("function buildCloserPrompt")
+        .expect("closer prompt");
+    let prompt_end = js[prompt..].find("function specScopeIsFull").unwrap() + prompt;
+    assert!(
+        js[prompt..prompt_end].contains("unchanged"),
+        "closer prompt must tell the closer about status_set 'unchanged'"
+    );
+}
+
+#[test]
+fn developer_report_format_asks_for_actual_time() {
+    let text = agent_text("session-developer");
+    assert!(
+        text.contains("### Actual time"),
+        "session-developer: Return format needs an `### Actual time` section"
+    );
+}
+
+/// Real binary: the CLI route the closer documents writes `time_log.jsonl`.
+#[test]
+fn cli_task_log_time_writes_the_time_log_on_disk() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_handoff-mcp"))
+            .args(args)
+            .arg("--project-dir")
+            .arg(dir.path())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["init", "--project-name", "p"]).status.success());
+    assert!(
+        run(&["task", "update", "--task", r#"{"id":"t1","title":"x"}"#])
+            .status
+            .success()
+    );
+    let out = run(&["task", "log-time", "--task-id", "t1", "--hours", "0.2"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = fs::read_to_string(dir.path().join(".handoff/time_log.jsonl")).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["task_id"], "t1");
+    assert_eq!(entry["hours"], 0.2);
+}
+
+// ---------------------------------------------------------------------------
+// t448 / D2: the Close stage reads the closer's claims back from disk with a
+// read-only verifier agent; the comparison itself is deterministic JS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_closer_verifier_is_a_read_only_agent_the_workflow_launches() {
+    let text = agent_text("session-closer-verifier");
+    let fm = frontmatter(&text).expect("session-closer-verifier: bad frontmatter");
+    assert_eq!(fm["name"], "session-closer-verifier");
+    assert_eq!(fm["model"], "sonnet");
+    let have: Vec<&str> = fm["tools"].split(',').map(str::trim).collect();
+    for t in ["Read", "Bash", "ToolSearch"] {
+        assert!(have.contains(&t), "tools must include {t}: {have:?}");
+    }
+    // Read-only: no file writers and no blanket handoff MCP grant (which would
+    // include the write tools); only `handoff_get_task`, in both name forms.
+    for forbidden in [
+        "Edit",
+        "Write",
+        "mcp__handoff__*",
+        "mcp__plugin_handoff-mcp_handoff__*",
+    ] {
+        assert!(
+            !have.contains(&forbidden),
+            "{forbidden} must not be granted: {have:?}"
+        );
+    }
+    for t in [
+        "mcp__handoff__handoff_get_task",
+        "mcp__plugin_handoff-mcp_handoff__handoff_get_task",
+    ] {
+        assert!(have.contains(&t), "tools must list {t}: {have:?}");
+    }
+    assert!(
+        text.contains("handoff-mcp task get --task-id"),
+        "must document the CLI fallback for handoff_get_task"
+    );
+    assert!(
+        text.contains("checked_indices") && text.contains("never guess"),
+        "must define the output and the never-guess rule"
+    );
+    let js = project_file("plugin-task-loop/workflows/session-execute.js");
+    assert!(
+        js.contains("agentType: 'handoff-task-loop:session-closer-verifier'"),
+        "workflow must launch the verifier agent type"
+    );
+    assert!(
+        js.contains("compareCloserClaimsWithDisk(claims, observed)"),
+        "the comparison must run in the workflow via the pure function"
+    );
+    assert!(
+        project_file("plugin-task-loop/README.md").contains("session-closer-verifier"),
+        "README.md does not mention session-closer-verifier"
     );
 }
