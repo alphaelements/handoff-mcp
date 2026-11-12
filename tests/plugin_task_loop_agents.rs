@@ -412,6 +412,37 @@ fn closer_schema_reports_hours_logged_per_task() {
 }
 
 #[test]
+fn session_closer_documents_status_set_unchanged() {
+    let text = agent_text("session-closer");
+    assert!(
+        text.contains("`unchanged`"),
+        "session-closer: must document the `unchanged` status_set value"
+    );
+    assert!(
+        !text.contains("status_set: \"\"") && !text.contains("empty `status_set`"),
+        "session-closer: must not suggest an empty status_set"
+    );
+    let js = project_file("plugin-task-loop/workflows/session-execute.js");
+    let start = js.find("const CLOSER_SCHEMA").expect("CLOSER_SCHEMA");
+    let end = js[start..]
+        .find("const SPEC_WRITER_SCHEMA")
+        .expect("next schema")
+        + start;
+    assert!(
+        js[start..end].contains("enum: ['done', 'review', 'in_progress', 'unchanged']"),
+        "CLOSER_SCHEMA: status_set enum must include 'unchanged'"
+    );
+    let prompt = js
+        .find("function buildCloserPrompt")
+        .expect("closer prompt");
+    let prompt_end = js[prompt..].find("function specScopeIsFull").unwrap() + prompt;
+    assert!(
+        js[prompt..prompt_end].contains("unchanged"),
+        "closer prompt must tell the closer about status_set 'unchanged'"
+    );
+}
+
+#[test]
 fn developer_report_format_asks_for_actual_time() {
     let text = agent_text("session-developer");
     assert!(

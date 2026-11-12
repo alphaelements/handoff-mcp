@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The task-loop session closer now logs each task's actual time with `handoff_log_time`, taking the hours from a new `### Actual time` line in the developer report. A report without a time logs nothing (this is not a failure); a failed log call is reported in the closer's `ops_failed`.
 
+### Fixed
+
+- The task-loop session closer no longer returns an empty `status_set` when it has no handoff tool access. It now returns an explicit `unchanged`, and the workflow reports such a task as `closer_failed` so it is closed by hand.
+
 ## [0.47.3] — 2026-11-12
 
 ### Behavior changes

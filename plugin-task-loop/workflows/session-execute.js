@@ -694,7 +694,10 @@ const INTEGRATION_VERDICT_SCHEMA = {
 };
 
 // The closer's structured result. `status_set` is limited to the three states a
-// closer may legitimately leave a task in; it never blocks or cancels a task.
+// closer may legitimately leave a task in (it never blocks or cancels a task),
+// plus 'unchanged': the closer could not process the task (no handoff access, or
+// the status call was never made or failed) and left its status as it found it.
+// 'unchanged' always counts as closer_failed. Never an empty string.
 const CLOSER_SCHEMA = {
   type: 'object',
   properties: {
@@ -705,7 +708,7 @@ const CLOSER_SCHEMA = {
         properties: {
           task_id: { type: 'string' },
           criteria_checked: { type: 'array', items: { type: 'integer' } },
-          status_set: { type: 'string', enum: ['done', 'review', 'in_progress'] },
+          status_set: { type: 'string', enum: ['done', 'review', 'in_progress', 'unchanged'] },
           // Hours logged with handoff_log_time from the developer report's
           // `### Actual time` line. Omitted/0 when the report has no time (not a
           // failure); a failed log_time call goes to ops_failed as op 'log_time'.
@@ -1996,6 +1999,10 @@ function buildCloserPrompt() {
     `   A call you could not attempt (no handoff tool and no working CLI) goes in that task's`,
     `   \`unexecuted_ops\` ({op, reason}). Never skip a call silently and never report a task as`,
     `   closed when one of its calls failed.`,
+    `6. If you could not process a task at all (no handoff tool and no working CLI) or its status`,
+    `   call was never made or failed, set \`status_set\` to \`unchanged\` (never an empty string and`,
+    `   never a guessed status), list the calls in \`unexecuted_ops\` / \`ops_failed\`, and, if you`,
+    `   could not do anything at all, also set the top-level \`error\`.`,
     ``,
     `Do not edit code or re-run tests. Report exactly what you did in the structured result.`,
     ``,
@@ -3322,9 +3329,13 @@ if (sessionPassed && HAS_TEST_STAGE) {
   for (const p of closerResult.tasks_processed) {
     const failed = Array.isArray(p.ops_failed) ? p.ops_failed : [];
     const unexecuted = Array.isArray(p.unexecuted_ops) ? p.unexecuted_ops : [];
-    if (failed.length === 0 && unexecuted.length === 0) continue;
-    closerFailedTasks.push(p.task_id);
+    // 'unchanged' means the closer did not close this task, even if it forgot to
+    // list the ops it could not run.
+    const unchanged = p.status_set === 'unchanged';
+    if (failed.length === 0 && unexecuted.length === 0 && !unchanged) continue;
+    if (!closerFailedTasks.includes(p.task_id)) closerFailedTasks.push(p.task_id);
     const parts = [
+      ...(unchanged ? ['status_set is unchanged: the task was not closed'] : []),
       ...failed.map((o) => `${o.op} failed: ${o.error}`),
       ...unexecuted.map((o) => `${o.op} not executed: ${o.reason}`),
     ];

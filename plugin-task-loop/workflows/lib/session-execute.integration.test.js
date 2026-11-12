@@ -1748,7 +1748,14 @@ test('the closer schema requires tasks_processed and constrains status_set', asy
   assert.deepEqual(schema.required, ['tasks_processed']);
   const item = schema.properties.tasks_processed.items;
   assert.deepEqual(item.required, ['task_id', 'status_set']);
-  assert.deepEqual(item.properties.status_set.enum, ['done', 'review', 'in_progress']);
+  assert.deepEqual(item.properties.status_set.enum, ['done', 'review', 'in_progress', 'unchanged']);
+});
+
+test('the closer schema accepts an explicit unchanged status_set and rejects the empty string', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const allowed = optsFor(r, 'closer').schema.properties.tasks_processed.items.properties.status_set.enum;
+  assert.ok(allowed.includes('unchanged'));
+  assert.ok(!allowed.includes(''));
 });
 
 test('the closer schema exposes the optional roadmap fields plan_updates and schedule_stale', async () => {
@@ -2005,6 +2012,55 @@ test('a closer error with per-task unexecuted_ops still lists the tasks and thei
   assert.deepEqual(r.closer_failed_tasks, ['t1', 't2']);
   assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /check_criterion\[0\]/.test(x)));
   assert.ok(r.warnings.some((x) => /Closer agent failed/.test(x)));
+});
+
+test('a no-access closer returning status_set unchanged is closer_failed with a warning', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: {
+        error: 'no handoff access: ToolSearch returned no handoff tools, CLI not on PATH',
+        tasks_processed: [
+          { task_id: 't1', status_set: 'unchanged', unexecuted_ops: [{ op: 'update_task status', reason: 'no handoff access' }] },
+          { task_id: 't2', status_set: 'unchanged', unexecuted_ops: [{ op: 'update_task status', reason: 'no handoff access' }] },
+        ],
+      },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1', 't2']);
+  assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /t1/.test(x)));
+  assert.ok(r.warnings.some((x) => /Closer agent failed/.test(x)));
+});
+
+test('status_set unchanged without ops_failed or unexecuted_ops is still closer_failed', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [
+          { task_id: 't1', status_set: 'unchanged' },
+          { task_id: 't2', status_set: 'done' },
+        ],
+      },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /t1/.test(x) && /unchanged/.test(x)));
+});
+
+test('status_set unchanged with ops_failed lists the task once', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [
+          { task_id: 't1', status_set: 'unchanged', ops_failed: [{ op: 'update_task status', error: 'boom' }] },
+          { task_id: 't2', status_set: 'done' },
+        ],
+      },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
 });
 
 test('a crashed closer lists every session task in closer_failed_tasks', async () => {

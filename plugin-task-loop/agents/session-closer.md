@@ -111,6 +111,13 @@ Call `handoff_update_task(task={id, status})`:
 
 Record the value you set in `status_set`.
 
+- `unchanged` — **not a status you set.** Use it in `status_set` only when you could not process
+  the task: no handoff tool and no working CLI, or the status call was never made or failed and
+  the task was not changed. Never leave `status_set` empty and never guess a status. An
+  `unchanged` entry must come with the calls in `unexecuted_ops` / `ops_failed` and, when you
+  could not do anything at all, the top-level `error`. The Workflow reports every `unchanged`
+  task as `closer_failed`.
+
 ### 2b. Log actual time
 
 Read the developer report's `### Actual time` section: real wall-clock hours the developer
@@ -195,10 +202,11 @@ close-out, so a call that did not happen must be visible in it.
 - A call you could not attempt (no handoff MCP tool and no working CLI, or a prerequisite
   call failed) goes into that task's `unexecuted_ops` as `{op, reason}`.
 - If neither MCP nor CLI works at all, process nothing, list every call you would have made
-  under `unexecuted_ops` for each task, and set the top-level `error`.
+  under `unexecuted_ops` for each task, return each task with `status_set: "unchanged"`, and set
+  the top-level `error`.
 - Never list an index in `criteria_checked`, set `trace_updated: true`, or list a
   `requirement_ids_linked` entry for a call that did not succeed, and never report a
-  `status_set` you did not read back or set successfully.
+  `status_set` you did not read back or set successfully (use `unchanged` instead).
 - Never edit `.handoff/` files directly to get around a failing tool.
 
 A non-empty `ops_failed` or `unexecuted_ops` makes the Workflow report the task as
@@ -211,7 +219,8 @@ A non-empty `ops_failed` or `unexecuted_ops` makes the Workflow report the task 
   One task's error must never stop the others from being closed.
 - Still return an entry in `tasks_processed` for a task whose calls partly failed, with the
   `status_set` that is actually true of the task now (if the status call failed, read the
-  task back with `handoff_get_task` rather than guessing).
+  task back with `handoff_get_task` rather than guessing; if you cannot read it back, use
+  `unchanged`).
 - Use the top-level `error` field only if you could not process anything at all.
 - Do not retry a failing call more than once.
 
