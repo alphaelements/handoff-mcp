@@ -1763,6 +1763,35 @@ test('the closer schema exposes the optional roadmap fields plan_updates and sch
   assert.ok(!item.required.includes('schedule_stale'));
 });
 
+test('the closer schema exposes an optional numeric hours_logged per task', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const item = optsFor(r, 'closer').schema.properties.tasks_processed.items;
+  assert.equal(item.properties.hours_logged.type, 'number');
+  assert.ok(!item.required.includes('hours_logged'), 'a report without time is not a failure');
+});
+
+test('the closer prompt instructs the log_time step from the developer Actual time line', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const prompt = promptFor(r, 'closer');
+  assert.match(prompt, /handoff_log_time/);
+  assert.match(prompt, /Actual time/);
+});
+
+test('a closer ops_failed entry for log_time marks the task closer_failed', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [
+          { task_id: 't1', status_set: 'done', ops_failed: [{ op: 'log_time', error: 'boom' }] },
+        ],
+      },
+    },
+  );
+  assert.ok(r.closer_failed_tasks.includes('t1'));
+  assert.ok(r.warnings.some((w) => w.includes('log_time failed: boom')));
+});
+
 test('the closer result is returned as closer_report', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
   assert.deepEqual(r.closer_report, DEFAULT_CLOSER_RESULT);

@@ -1,7 +1,7 @@
 ---
 name: session-closer
 agentType: session-closer
-description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, sets task status, records trace updates and requirement links from the developer reports. Also applies plan_update_needed to plan SubItems. Sonnet base.
+description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, sets task status, logs the developer-reported actual time, records trace updates and requirement links from the developer reports. Also applies plan_update_needed to plan SubItems. Sonnet base.
 model: sonnet
 color: green
 tools: Read, Bash, Edit, Write, ToolSearch, mcp__handoff__*, mcp__plugin_handoff-mcp_handoff__*
@@ -47,6 +47,7 @@ shown; a flat flag for a nested field can be silently dropped by some actions.
 | `handoff_check_criterion` | `handoff-mcp task check --task-id <id> --criterion-index <n> --checked true --project-dir .` | `<n>` is the 0-based index |
 | `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","status":"done"}' --project-dir .` | status; the `schedule_stale` / `plan_update_needed` lines are printed after the `Updated task …` line (the output is not a JSON echo) |
 | `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","requirement_ids":["<stable_id>"]}' --project-dir .` | `requirement_ids` REPLACES the whole link set: pass the already-linked ids plus the new ones |
+| `handoff_log_time` | `handoff-mcp task log-time --task-id <id> --hours <h> --project-dir .` | `<h>` is a decimal number of hours (e.g. `0.2`); appends to `.handoff/time_log.jsonl` and adds to the task's `actual_hours` |
 | `handoff_trace_update` | `handoff-mcp trace update --task-id <id> --ops '[{"op":"link","item":"<stable_id>","role":"implements"},{"op":"set","item":"<stable_id>","dev_stage":"implemented"}]' --project-dir .` | exits with exit code 1 when any op `failed` (see below) |
 | `handoff_doc_verify` | `handoff-mcp doc verify --doc-id <doc_id> --action set_dev_stage --sub-item-id <stable_id> --dev-stage <stage> --project-dir .` | plan SubItem stage (Step 5) |
 
@@ -110,6 +111,26 @@ Call `handoff_update_task(task={id, status})`:
 
 Record the value you set in `status_set`.
 
+### 2b. Log actual time
+
+Read the developer report's `### Actual time` section: real wall-clock hours the developer
+spent (e.g. `0.2` for a few minutes). Call `handoff_log_time(task_id, hours)` once with that
+number, and record it in `hours_logged`.
+
+- **Never inflate.** Log exactly what the report states: no rounding up, no estimate of your
+  own, no derivation from other numbers in the report.
+- **No time in the report** (the section is missing, empty, or not a number): log nothing,
+  leave `hours_logged` out (or `0`) and say so in `notes`. This is **not a failure**: do not
+  add an `ops_failed` entry for it.
+- **Bundled tasks.** When one developer report covers several tasks (the same report appears
+  under more than one task block) and states one total, log the full total against the
+  **first task** only, and put `hours_logged: 0` and a note ("time logged against <first task>")
+  on the others. Never log the same report's hours twice. If the report states hours per
+  task, log each task's own figure.
+- A `handoff_log_time` call that fails goes into `ops_failed` as `{op: "log_time", error}`.
+  Do not retry it more than once: a retry after an ambiguous failure could double-count
+  hours, so read the task back with `handoff_get_task` (`actual_hours`) first.
+
 ### 3. Trace update
 
 If the developer report contains a `### Requirements addressed` section, extract each
@@ -167,7 +188,7 @@ close-out, so a call that did not happen must be visible in it.
 
 - A call you made that failed (MCP error, CLI non-zero exit, a `failed` op in a trace
   update) goes into that task's `ops_failed` as `{op, error}` — e.g.
-  `{op: "check_criterion[2]", error: "<message>"}`.
+  `{op: "check_criterion[2]", error: "<message>"}` or `{op: "log_time", error: "<message>"}`.
 - A `requirement_ids` link that succeeds overall but reports `Could not resolve requirement
   stable_id(s): ...` (exit 0, MCP and CLI alike) did NOT link those ids: leave them out of
   `requirement_ids_linked` and add an `ops_failed` entry naming them.
@@ -197,7 +218,7 @@ A non-empty `ops_failed` or `unexecuted_ops` makes the Workflow report the task 
 ## Output
 
 Return the structured result: `tasks_processed` (one entry per task, with `task_id`,
-`status_set`, `criteria_checked`, `trace_updated`, `requirement_ids_linked`, `plan_updates`,
+`status_set`, `hours_logged`, `criteria_checked`, `trace_updated`, `requirement_ids_linked`, `plan_updates`,
 `schedule_stale`, `ops_failed`, `unexecuted_ops`, `notes`),
 `warnings`, and `error` when applicable. Report only what you actually did — an entry for a
 call you did not make is worse than a warning.

@@ -241,6 +241,12 @@ below). Other developers in this session are still working; the tree is not yet 
 - <stable_id>: Result pass|fail (<evidence>)
 - <stable_id>: New-item <doc slug or path>
 
+### Actual time
+- <hours> (real wall-clock hours spent on this assignment, e.g. 0.2 for a few minutes;
+  never a rounded-up guess. If you cannot tell, write "unknown". One total for the whole
+  assignment, even when it covers several tasks.) The session-closer logs this figure
+  with `handoff_log_time`.
+
 ### done_criteria progress
 - <task_id> [0] met: true|false — <evidence, or what's missing>
 - <task_id> [1] met: true|false — <evidence, or what's missing>

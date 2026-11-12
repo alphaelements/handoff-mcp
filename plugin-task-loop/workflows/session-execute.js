@@ -706,6 +706,10 @@ const CLOSER_SCHEMA = {
           task_id: { type: 'string' },
           criteria_checked: { type: 'array', items: { type: 'integer' } },
           status_set: { type: 'string', enum: ['done', 'review', 'in_progress'] },
+          // Hours logged with handoff_log_time from the developer report's
+          // `### Actual time` line. Omitted/0 when the report has no time (not a
+          // failure); a failed log_time call goes to ops_failed as op 'log_time'.
+          hours_logged: { type: 'number' },
           trace_updated: { type: 'boolean' },
           requirement_ids_linked: { type: 'array', items: { type: 'string' } },
           // Plan SubItem dev_stage updates applied from update_task's
@@ -1976,6 +1980,12 @@ function buildCloserPrompt() {
     `   verdict (when shown) is APPROVE, no pending follow-up names this task, and every`,
     `   done_criteria index is checked. Otherwise set status to \`review\` — a task that is not`,
     `   fully verified must not be marked done. Use \`handoff_update_task(task={id, status})\`.`,
+    `2b. Read the \`### Actual time\` line of the developer report and call`,
+    `   \`handoff_log_time(task_id, hours)\` with exactly that number of hours (never round up or`,
+    `   estimate); report it as \`hours_logged\`. If the report has no time, log nothing, omit`,
+    `   \`hours_logged\` and say so in notes (not a failure). When one report covers several tasks,`,
+    `   log its total against the first task only. A failed call goes in \`ops_failed\` as`,
+    `   {op: 'log_time', error}.`,
     `3. If the developer report has a \`### Requirements addressed\` section, extract each`,
     `   stable_id and call \`handoff_trace_update(task_id, ops: [{op: 'link', item: <stable_id>,`,
     `   role: 'implements'}, {op: 'set', item: <stable_id>, dev_stage: 'implemented'}])\`.`,
