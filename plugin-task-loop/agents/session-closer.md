@@ -212,6 +212,11 @@ close-out, so a call that did not happen must be visible in it.
 A non-empty `ops_failed` or `unexecuted_ops` makes the Workflow report the task as
 `closer_failed` and hand it to the manager for manual close-out.
 
+Your claims are also checked: after you finish, the Workflow reads every task back from disk
+(`session-closer-verifier`) and compares the `status_set` and the `criteria_checked` indices you
+reported. A claim that is not on disk makes the task `closer_failed` too, so report only what
+you wrote or read back.
+
 ## Error handling
 
 - If a call fails for one task, record it in that task's `ops_failed`, add a line to

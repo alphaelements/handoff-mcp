@@ -21,6 +21,7 @@ implementation, adversarial testing, and architectural review.
   session-spec-writer (Sonnet — Stage 0: derives missing basic_spec from requirements, scaffolds system_test (full: + detailed_spec/unit_test), self-checks with confidence + checker_result),
   session-spec-reconciler (Sonnet — Stage 3.5: syncs basic_spec/system_test with the implementation, reports contract_ambiguity),
   session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
+  session-closer-verifier (Sonnet, read-only — reads each task back from disk after the closer so the workflow can compare status and checked criteria with the closer's claims),
   requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
   requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check, plus the opt-in ISO 29119 `test_spec` check of scaffolded test specifications; cross-document duplicate/contradiction/omission review),
   requirement-registrar (Sonnet — registers finished requirement docs: trace_scaffold, trace_tasks, lint verification)

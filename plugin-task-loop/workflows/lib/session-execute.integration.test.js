@@ -24,6 +24,17 @@ const DEFAULT_CLOSER_RESULT = {
   tasks_processed: [{ task_id: 't1', status_set: 'done', criteria_checked: [0], trace_updated: false }],
 };
 
+/** A verifier result for a disk that matches every claim of `closerResult`. */
+function honestDisk(closerResult) {
+  return {
+    tasks: (closerResult.tasks_processed || []).map((p) => ({
+      task_id: p.task_id,
+      status: p.status_set === 'unchanged' ? 'todo' : p.status_set,
+      checked_indices: p.criteria_checked || [],
+    })),
+  };
+}
+
 const DEFAULT_RECONCILER_RESULT = {
   reconciled: [],
   contract_ambiguities: [],
@@ -54,6 +65,11 @@ async function runWorkflow(
     closerResult = DEFAULT_CLOSER_RESULT,
     crashCloser = false,
     throwCloser = false,
+    // What the read-only closer-verifier "sees on disk". Default: an honest
+    // disk that matches the closer's claims exactly. `{tasks: [...]}` overrides
+    // it with a result as the verifier would return it; `null` simulates a
+    // crashed verifier.
+    diskState = undefined,
     reconcilerResult = DEFAULT_RECONCILER_RESULT,
     crashReconciler = false,
     specWriterResult = DEFAULT_SPEC_WRITER_RESULT,
@@ -103,6 +119,11 @@ async function runWorkflow(
       if (opts.label === 'closer') {
         if (crashCloser) throw new Error('simulated closer crash');
         return closerResult;
+      }
+      if (opts.label === 'closer-verifier') {
+        if (diskState === null) throw new Error('simulated verifier crash');
+        if (diskState !== undefined) return diskState;
+        return honestDisk(closerResult);
       }
       if (crashDevelopers || crashDevLabels.includes(opts.label)) {
         throw new Error('simulated developer crash');
@@ -176,6 +197,7 @@ async function runWorkflowStaged(argsObj, { onTester, onReview } = {}, { onDev }
       if (opts.label === 'spec-writer') return DEFAULT_SPEC_WRITER_RESULT;
       if (opts.label === 'spec-reconciler') return DEFAULT_RECONCILER_RESULT;
       if (opts.label === 'closer') return DEFAULT_CLOSER_RESULT;
+      if (opts.label === 'closer-verifier') return honestDisk(DEFAULT_CLOSER_RESULT);
       const dv = onDev ? onDev() : 'OK';
       if (dv === 'CRASH') throw new Error('simulated developer crash');
       return 'developer report';
@@ -379,7 +401,7 @@ test('express runs exactly one agent turn: the developer', async () => {
 
 test('standard runs developer then tester — no reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.equal(serialTurns(r), 4);
   assert.equal(r.passed, true);
   assert.equal(r.review_report, null);
@@ -387,21 +409,21 @@ test('standard runs developer then tester — no reviewer', async () => {
 
 test('full runs developer, tester, then reviewer — all sequential', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.equal(serialTurns(r), 5);
   assert.equal(r.passed, true);
 });
 
 test('standard with two devs: both devs in parallel, then one tester', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.equal(serialTurns(r), 4);
   assert.equal(r.passed, true);
 });
 
 test('full with two devs: both devs, then tester, then reviewer', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'full' });
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.equal(serialTurns(r), 5);
   assert.equal(r.passed, true);
 });
@@ -412,7 +434,7 @@ test('full with two devs: both devs, then tester, then reviewer', async () => {
 test('omitting profile yields standard, NOT full', async () => {
   const r = await runWorkflow(baseArgs());
   assert.equal(r.profile, 'standard');
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.ok(!r.calls.includes('reviewer'), 'the reviewer must not run by default');
 });
 
@@ -458,7 +480,7 @@ test('standard: a failing tester retries up to max_rounds, then files a follow-u
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2, 'must exhaust max_rounds');
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.ok(r.pending_followups.length > 0);
 });
 
@@ -502,7 +524,7 @@ test('full: REQUEST_CHANGES triggers rework loop through all 3 stages', async ()
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findings become follow-ups', async () => {
@@ -1036,7 +1058,7 @@ test('full: reviewer and tester findings both reach the developer on rework', as
     },
   );
   assert.equal(r.passed, true);
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('full: rework round includes rework notes in developer prompt', async () => {
@@ -1063,7 +1085,7 @@ test('tester FAIL round 1, PASS round 2, reviewer APPROVE → session passes', a
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 // ============================================================
@@ -1161,7 +1183,7 @@ test('express: stage_telemetry has one entry for each developer', async () => {
 
 test('standard: telemetry records developer + tester with correct metadata', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.equal(r.stage_telemetry.length, 5, 'spec-writer, developer, tester, spec-reconciler, closer');
+  assert.equal(r.stage_telemetry.length, 6, 'spec-writer, developer, tester, spec-reconciler, closer, closer-verifier');
   const [, dev, tester] = r.stage_telemetry;
   assert.equal(dev.stage, 'implement');
   assert.equal(dev.role, 'developer');
@@ -1173,9 +1195,9 @@ test('standard: telemetry records developer + tester with correct metadata', asy
 
 test('full: telemetry records developer + tester + reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.equal(r.stage_telemetry.length, 6);
+  assert.equal(r.stage_telemetry.length, 7);
   const stages = r.stage_telemetry.map((e) => e.stage);
-  assert.deepEqual(stages, ['spec-prep', 'implement', 'test', 'review', 'spec-reconcile', 'close']);
+  assert.deepEqual(stages, ['spec-prep', 'implement', 'test', 'review', 'spec-reconcile', 'close', 'close']);
   const reviewer = r.stage_telemetry[3];
   assert.equal(reviewer.role, 'reviewer');
   assert.equal(reviewer.model, 'opus');
@@ -1185,7 +1207,7 @@ test('full: telemetry records developer + tester + reviewer', async () => {
 test('two devs: telemetry has sequential seq numbers', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
   const seqs = r.stage_telemetry.map((e) => e.seq);
-  assert.deepEqual(seqs, [0, 1, 2, 3, 4, 5]);
+  assert.deepEqual(seqs, [0, 1, 2, 3, 4, 5, 6]);
   assert.equal(r.stage_telemetry[0].label, 'spec-writer');
   assert.equal(r.stage_telemetry[1].label, 'dev:A');
   assert.equal(r.stage_telemetry[2].label, 'dev:B');
@@ -1198,10 +1220,10 @@ test('rework rounds are reflected in telemetry round field', async () => {
     { ...baseArgs(), profile: 'full', max_rounds: 2 },
     { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
   );
-  assert.equal(r.stage_telemetry.length, 9);
+  assert.equal(r.stage_telemetry.length, 10);
   const rounds = r.stage_telemetry.map((e) => e.round);
   // Spec-Prep (Stage 0) precedes the loop, so it carries round 0.
-  assert.deepEqual(rounds, [0, 1, 1, 1, 2, 2, 2, 2, 2]);
+  assert.deepEqual(rounds, [0, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
 });
 
 test('a crashed developer is recorded with crashed: true', async () => {
@@ -1255,6 +1277,7 @@ test('telemetry agentType field matches the launched agent type', async () => {
     'handoff-task-loop:session-reviewer',
     'handoff-task-loop:session-spec-reconciler',
     'handoff-task-loop:session-closer',
+    'handoff-task-loop:session-closer-verifier',
   ]);
 });
 
@@ -1274,7 +1297,7 @@ test('rework only re-launches the developer owning the failed task', async () =>
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
   // Round 1: dev:A, dev:B, tester. Round 2: only dev:A (owns t1), tester.
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('dev:B report is preserved from round 1 when only dev:A is reworked', async () => {
@@ -1303,7 +1326,7 @@ test('a "*" finding still re-launches ALL developers', async () => {
     },
   );
   // "*" applies rework_notes to all tasks, so all developers must be re-launched.
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('no-findings tester FAIL still re-launches all developers (safety net)', async () => {
@@ -1312,7 +1335,7 @@ test('no-findings tester FAIL still re-launches all developers (safety net)', as
     { testerVerdict: 'FAIL', testerFindings: [] },
   );
   // Safety net: a FAIL with no attributed findings applies rework to all tasks.
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('session_log.devs_launched tracks which developers ran each round', async () => {
@@ -1734,12 +1757,119 @@ const devReportWithCriteria = [
 
 test('standard: a closer agent runs last, in the Close phase, with the session-closer agentType', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.equal(r.calls[r.calls.length - 1], 'closer');
+  assert.equal(r.calls[r.calls.length - 2], 'closer');
+  assert.equal(r.calls[r.calls.length - 1], 'closer-verifier', 'the on-disk verifier runs right after the closer');
   const o = optsFor(r, 'closer');
   assert.equal(o.phase, 'Close');
   assert.equal(o.agentType, 'handoff-task-loop:session-closer');
   assert.ok(o.schema, 'closer must be launched with CLOSER_SCHEMA');
   assert.ok(o.effort, 'closer must carry an explicit effort');
+});
+
+// t448 / D2: the closer's self-report is verified against the disk.
+const LYING_CLOSER = {
+  tasks_processed: [{ task_id: 't1', status_set: 'done', criteria_checked: [0, 1] }],
+};
+const twoCriteriaArgs = () => ({
+  ...baseArgs(),
+  tasks: [{ id: 't1', title: 'Task one', done_criteria: ['c0', 'c1'] }],
+  profile: 'standard',
+});
+
+test('the closer-verifier is launched read-only in the Close phase with a structured schema', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const o = optsFor(r, 'closer-verifier');
+  assert.equal(o.phase, 'Close');
+  assert.equal(o.agentType, 'handoff-task-loop:session-closer-verifier');
+  assert.ok(o.model && o.effort, 'verifier must carry an explicit model and effort');
+  assert.deepEqual(o.schema.required, ['tasks']);
+  assert.deepEqual(o.schema.properties.tasks.items.required, ['task_id', 'status', 'checked_indices']);
+  assert.match(promptFor(r, 'closer-verifier'), /t1/, 'the prompt names the task to read back');
+});
+
+test('a lying closer (claims done + criteria [0,1], disk shows todo + [0]) is closer_failed with a mismatch warning', async () => {
+  const r = await runWorkflow(twoCriteriaArgs(), {
+    closerResult: LYING_CLOSER,
+    diskState: { tasks: [{ task_id: 't1', status: 'todo', checked_indices: [0] }] },
+  });
+  assert.equal(r.passed, true, 'a lying closer must not fail the session');
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  const w = r.warnings.filter((x) => /^closer_failed:/.test(x));
+  assert.equal(w.length, 1, 'one closer_failed warning per task');
+  assert.match(w[0], /t1/);
+  assert.match(w[0], /status expected done got todo/);
+  assert.match(w[0], /criterion index 1 claimed checked but unchecked on disk/);
+  assert.doesNotMatch(w[0], /criterion index 0/);
+});
+
+test('an honest closer (disk matches the claims) reports no closer_failed', async () => {
+  const r = await runWorkflow(twoCriteriaArgs(), {
+    closerResult: LYING_CLOSER,
+    diskState: { tasks: [{ task_id: 't1', status: 'done', checked_indices: [0, 1] }] },
+  });
+  assert.deepEqual(r.closer_failed_tasks, []);
+  assert.ok(!r.warnings.some((x) => /closer_failed/.test(x)));
+});
+
+test('a verifier that crashes fails closed: every claimed task is closer_failed and a warning says so', async () => {
+  const r = await runWorkflow(twoCriteriaArgs(), { closerResult: LYING_CLOSER, diskState: null });
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /could not be read back/.test(x) && /t1/.test(x)));
+});
+
+test('a verifier that omits a task fails that task closed, but not the others', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: { tasks_processed: [
+        { task_id: 't1', status_set: 'done', criteria_checked: [0] },
+        { task_id: 't2', status_set: 'done', criteria_checked: [0] },
+      ] },
+      diskState: { tasks: [{ task_id: 't1', status: 'done', checked_indices: [0] }] },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t2']);
+});
+
+test('the verifier reports a per-task read error: that task is closer_failed with the error text', async () => {
+  const r = await runWorkflow(twoCriteriaArgs(), {
+    closerResult: LYING_CLOSER,
+    diskState: { tasks: [{ task_id: 't1', status: '', checked_indices: [], error: 'task not found' }] },
+  });
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.ok(r.warnings.some((x) => /task not found/.test(x)));
+});
+
+test('extra criteria checked on disk beyond the claim are not a failure', async () => {
+  const r = await runWorkflow(twoCriteriaArgs(), {
+    closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'done', criteria_checked: [0] }] },
+    diskState: { tasks: [{ task_id: 't1', status: 'done', checked_indices: [0, 1] }] },
+  });
+  assert.deepEqual(r.closer_failed_tasks, []);
+});
+
+test('an already-failed close-out (unchanged / ops_failed) is not read back again and gets one warning only', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'unchanged' }] } },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.equal(r.warnings.filter((x) => /closer_failed/.test(x)).length, 1);
+  assert.ok(!r.calls.includes('closer-verifier'), 'nothing left to verify');
+});
+
+test('a closer-level error skips the verifier (every task is already closer_failed)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { crashCloser: true });
+  assert.ok(!r.calls.includes('closer-verifier'));
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+});
+
+test('express and a not-passed session never launch the verifier', async () => {
+  const express = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok(!express.calls.includes('closer-verifier'));
+  const notPassed = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { crashDevelopers: true });
+  assert.ok(!notPassed.calls.includes('closer-verifier'));
 });
 
 test('the closer schema requires tasks_processed and constrains status_set', async () => {
@@ -2103,13 +2233,13 @@ const specDriftResult = (over = {}) => ({
 
 test('Stage 3.5: standard runs spec-reconciler between tester and closer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.equal(r.stages_run.reconcile, true);
 });
 
 test('Stage 3.5: full runs spec-reconciler after the reviewer and before the closer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('Stage 3.5: express skips spec-reconcile entirely', async () => {
@@ -2135,7 +2265,7 @@ test('Stage 3.5: a failed test round does not reconcile until the tests pass', a
     { onTester: () => (++n === 1 ? 'FAIL' : 'PASS') },
   );
   assert.equal(r.calls.filter((c) => c === 'spec-reconciler').length, 1, 'reconcile once, after the passing round');
-  assert.deepEqual(r.calls.slice(-2), ['spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls.slice(-3), ['spec-reconciler', 'closer', 'closer-verifier']);
 });
 
 test('Stage 3.5: drift reported against the code change is surfaced in spec_reconcile_report', async () => {
@@ -2362,7 +2492,7 @@ test('Stage 0 + 3.5 (full) E2E: spec-writer scaffolds then reconciler syncs deta
       },
     },
   );
-  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer']);
+  assert.deepEqual(r.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
   assert.equal(r.spec_prep_report.specs_generated[1].layer, 'detailed_spec');
   assert.equal(r.spec_prep_report.scaffolds_created[1].layer, 'unit_test');
   assert.match(promptFor(r, 'spec-writer'), /unit_test/);
@@ -2493,7 +2623,7 @@ test('Stage 0: spec-prep telemetry is recorded as the first stage', async () => 
 test('trace_profile minimal/bugfix skips Stage 0 even under a pipeline that has it', async () => {
   for (const tp of ['minimal', 'bugfix']) {
     const r = await runWorkflow({ ...baseArgs(), profile: 'standard', trace_profile: tp });
-    assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer'], tp);
+    assert.deepEqual(r.calls, ['dev:A', 'tester', 'spec-reconciler', 'closer', 'closer-verifier'], tp);
     assert.equal(r.stages_run.specPrep, false, tp);
     assert.equal(r.spec_prep_report, null, tp);
   }

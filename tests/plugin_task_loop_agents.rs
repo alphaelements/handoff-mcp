@@ -480,3 +480,60 @@ fn cli_task_log_time_writes_the_time_log_on_disk() {
     assert_eq!(entry["task_id"], "t1");
     assert_eq!(entry["hours"], 0.2);
 }
+
+// ---------------------------------------------------------------------------
+// t448 / D2: the Close stage reads the closer's claims back from disk with a
+// read-only verifier agent; the comparison itself is deterministic JS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_closer_verifier_is_a_read_only_agent_the_workflow_launches() {
+    let text = agent_text("session-closer-verifier");
+    let fm = frontmatter(&text).expect("session-closer-verifier: bad frontmatter");
+    assert_eq!(fm["name"], "session-closer-verifier");
+    assert_eq!(fm["model"], "sonnet");
+    let have: Vec<&str> = fm["tools"].split(',').map(str::trim).collect();
+    for t in ["Read", "Bash", "ToolSearch"] {
+        assert!(have.contains(&t), "tools must include {t}: {have:?}");
+    }
+    // Read-only: no file writers and no blanket handoff MCP grant (which would
+    // include the write tools); only `handoff_get_task`, in both name forms.
+    for forbidden in [
+        "Edit",
+        "Write",
+        "mcp__handoff__*",
+        "mcp__plugin_handoff-mcp_handoff__*",
+    ] {
+        assert!(
+            !have.contains(&forbidden),
+            "{forbidden} must not be granted: {have:?}"
+        );
+    }
+    for t in [
+        "mcp__handoff__handoff_get_task",
+        "mcp__plugin_handoff-mcp_handoff__handoff_get_task",
+    ] {
+        assert!(have.contains(&t), "tools must list {t}: {have:?}");
+    }
+    assert!(
+        text.contains("handoff-mcp task get --task-id"),
+        "must document the CLI fallback for handoff_get_task"
+    );
+    assert!(
+        text.contains("checked_indices") && text.contains("never guess"),
+        "must define the output and the never-guess rule"
+    );
+    let js = project_file("plugin-task-loop/workflows/session-execute.js");
+    assert!(
+        js.contains("agentType: 'handoff-task-loop:session-closer-verifier'"),
+        "workflow must launch the verifier agent type"
+    );
+    assert!(
+        js.contains("compareCloserClaimsWithDisk(claims, observed)"),
+        "the comparison must run in the workflow via the pure function"
+    );
+    assert!(
+        project_file("plugin-task-loop/README.md").contains("session-closer-verifier"),
+        "README.md does not mention session-closer-verifier"
+    );
+}

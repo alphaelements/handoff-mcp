@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The task-loop session closer no longer returns an empty `status_set` when it has no handoff tool access. It now returns an explicit `unchanged`, and the workflow reports such a task as `closer_failed` so it is closed by hand.
+- The task-loop workflow no longer trusts the session closer's self-report. After the Close stage a read-only verifier agent reads every claimed task back from disk, and the workflow compares the status and the checked done_criteria with the closer's claims. A closer that claims a status or a checked criterion that is not on disk (or whose claim cannot be read back) is reported as `closer_failed`, with a warning naming what differs.
 
 ## [0.47.3] — 2026-11-12
 

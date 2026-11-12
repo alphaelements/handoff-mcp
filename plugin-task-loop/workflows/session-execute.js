@@ -380,6 +380,10 @@ const REVIEWER_MODEL = reviewer_model || 'opus';
 // The closer only transcribes reports into handoff state — no deep reasoning.
 const CLOSER_MODEL = 'sonnet';
 const CLOSER_EFFORT = 'medium';
+// The closer-verifier only reads tasks back (`handoff_get_task`) and transcribes
+// status + checked criteria; the comparison itself is deterministic JS.
+const CLOSER_VERIFIER_MODEL = 'sonnet';
+const CLOSER_VERIFIER_EFFORT = 'low';
 // The spec-reconciler judges whether a code/spec divergence is intended, which
 // needs more than transcription, but not Opus-grade design reasoning.
 const SPEC_RECONCILER_MODEL = 'sonnet';
@@ -761,6 +765,31 @@ const CLOSER_SCHEMA = {
     error: { type: 'string' },
   },
   required: ['tasks_processed'],
+};
+
+// The closer-verifier's structured result: what is on disk for each task, read
+// back with handoff_get_task. `checked_indices` are the 0-based done_criteria
+// indices whose `checked` is true. A task that could not be read is reported
+// with `error` (and status '' / checked_indices []), never guessed.
+const CLOSER_VERIFIER_SCHEMA = {
+  type: 'object',
+  properties: {
+    tasks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string' },
+          status: { type: 'string' },
+          checked_indices: { type: 'array', items: { type: 'integer' } },
+          error: { type: 'string' },
+        },
+        required: ['task_id', 'status', 'checked_indices'],
+      },
+    },
+    error: { type: 'string' },
+  },
+  required: ['tasks'],
 };
 
 // The spec-writer's structured result (Stage 0). Mirrors the output schema in
@@ -1646,6 +1675,89 @@ function buildWorkGroups(devAssignments, testAssignments) {
 
 // --- END GENERATED: task-graph ---
 
+// Pure comparison of the closer's claims with the state read back from disk.
+// --- BEGIN GENERATED: closer-verify (source: lib/closer-verify.js) ---
+// AUTO-GENERATED — DO NOT EDIT BY HAND.
+// Source: plugin-task-loop/workflows/lib/closer-verify.js
+// Regenerate: ./scripts/sync-workflow-inline.sh
+
+/**
+ * Compare the closer's self-report with the state read back from disk.
+ *
+ * The workflow cannot read a task itself (no MCP access, only agent()), so a
+ * read-only verifier agent returns one observation per task and this pure
+ * function does the comparison deterministically.
+ *
+ * Compared, per claim:
+ *  - `status_set` against the on-disk status (skipped when absent or
+ *    'unchanged': that claim already counts as closer_failed);
+ *  - every index in `criteria_checked` must be checked on disk. Criteria that
+ *    are checked on disk but not claimed are NOT a mismatch.
+ *
+ * A claim with something checkable but no usable observation (missing, an
+ * `error`, or no `status`) is 'unverified' — the check fails closed instead of
+ * passing silently.
+ *
+ * @param {Array<{task_id: string, status_set?: string, criteria_checked?: number[]}>} claims
+ *   the closer's `tasks_processed` entries
+ * @param {Array<{task_id: string, status?: string, checked_indices?: number[], error?: string}>|null} observed
+ *   what the verifier read back from disk
+ * @returns {Array<{task_id: string, kind: 'status'|'criterion'|'unverified', message: string,
+ *   expected?: string, actual?: string, index?: number}>}
+ */
+function compareCloserClaimsWithDisk(claims, observed) {
+  const byTask = new Map();
+  if (Array.isArray(observed)) {
+    for (const o of observed) {
+      if (o && typeof o === 'object' && typeof o.task_id === 'string') byTask.set(o.task_id, o);
+    }
+  }
+  const mismatches = [];
+  for (const claim of Array.isArray(claims) ? claims : []) {
+    const id = claim.task_id;
+    const claimedStatus =
+      typeof claim.status_set === 'string' && claim.status_set !== '' && claim.status_set !== 'unchanged'
+        ? claim.status_set
+        : null;
+    const claimedIndices = Array.isArray(claim.criteria_checked) ? claim.criteria_checked : [];
+    if (claimedStatus === null && claimedIndices.length === 0) continue;
+
+    const o = byTask.get(id);
+    const readable = o && !o.error && typeof o.status === 'string' && o.status !== '';
+    if (!readable) {
+      const why = o && o.error ? `: ${o.error}` : '';
+      mismatches.push({
+        task_id: id,
+        kind: 'unverified',
+        message: `could not be read back from disk${why}`,
+      });
+      continue;
+    }
+    if (claimedStatus !== null && claimedStatus !== o.status) {
+      mismatches.push({
+        task_id: id,
+        kind: 'status',
+        expected: claimedStatus,
+        actual: o.status,
+        message: `status expected ${claimedStatus} got ${o.status}`,
+      });
+    }
+    const checkedOnDisk = new Set(Array.isArray(o.checked_indices) ? o.checked_indices : []);
+    for (const index of claimedIndices) {
+      if (checkedOnDisk.has(index)) continue;
+      mismatches.push({
+        task_id: id,
+        kind: 'criterion',
+        index,
+        message: `criterion index ${index} claimed checked but unchecked on disk`,
+      });
+    }
+  }
+  return mismatches;
+}
+
+// --- END GENERATED: closer-verify ---
+
 // The manager fetched the session context once; every agent reads the same
 // rendered block instead of paying its own handoff_load_context round-trip.
 const INJECTED_CONTEXT = buildInjectedContextSection(sessionContext);
@@ -1935,6 +2047,18 @@ function renderPendingFollowupsForCloser() {
   return pendingFollowups
     .map((f) => `- ${f.task_id || '(session)'} [${f.severity || 'unknown'}] (${f.source}): ${f.problem}`)
     .join('\n');
+}
+
+// Read-only prompt: the verifier reports what is on disk and never judges or fixes.
+function buildCloserVerifierPrompt(taskIds) {
+  return [
+    `You are a session-closer-verifier. Read each task below back from disk and report its status and checked done_criteria. Do not change anything.`,
+    ``,
+    `Tasks to read back: ${taskIds.join(', ')}`,
+    ``,
+    `For every task call handoff_get_task (or the CLI \`handoff-mcp task get --task-id <id> --project-dir .\`) and return, per task: task_id, status, and checked_indices (the 0-based indices of the done_criteria whose "checked" is true). If a task cannot be read, return it with status "", checked_indices [] and an error message.`,
+    `Return only the structured result; error text may be in any language.`,
+  ].join('\n');
 }
 
 function buildCloserPrompt() {
@@ -3281,7 +3405,8 @@ const closerWarnings = [...specPrepWarnings, ...reconcileWarnings];
 // Tasks whose close-out the closer reported as failed or incomplete
 // (ops_failed / unexecuted_ops), tasks missing from its tasks_processed, or
 // every task when the closer itself failed (`error`). Empty when the closer
-// did not run.
+// did not run. Also holds tasks whose claimed status/criteria did not match
+// what the closer-verifier read back from disk.
 const closerFailedTasks = [];
 if (sessionPassed && HAS_TEST_STAGE) {
   phase('Close');
@@ -3349,6 +3474,54 @@ if (sessionPassed && HAS_TEST_STAGE) {
       if (!closerFailedTasks.includes(id)) closerFailedTasks.push(id);
     }
   }
+
+  // The closer's report is a claim, not evidence: read every claimed task back
+  // from disk and compare. Tasks that are already closer_failed (and a
+  // closer-level error, which fails them all) have nothing left to verify.
+  const claims = closerResult.tasks_processed.filter(
+    (p) => TASK_IDS.includes(p.task_id) && !closerFailedTasks.includes(p.task_id),
+  );
+  if (claims.length > 0) {
+    const verifyIds = [...new Set(claims.map((p) => p.task_id))];
+    let verification = null;
+    try {
+      verification = await trackedAgent(
+        buildCloserVerifierPrompt(verifyIds),
+        {
+          label: 'closer-verifier',
+          phase: 'Close',
+          agentType: 'handoff-task-loop:session-closer-verifier',
+          model: CLOSER_VERIFIER_MODEL,
+          effort: CLOSER_VERIFIER_EFFORT,
+          schema: CLOSER_VERIFIER_SCHEMA,
+        },
+        { round: mainRound, stage: 'close', role: 'closer-verifier', task_ids: verifyIds },
+      );
+    } catch (e) {
+      log(`Closer verifier error (non-fatal): ${e}`);
+    }
+    // No usable result is "could not verify", never a silent pass: with
+    // observed = null every claimed task comes back 'unverified'.
+    let observed = null;
+    if (verification === null || verification === undefined || typeof verification !== 'object') {
+      closerWarnings.push('Closer verification failed (the verifier returned no structured result) — claimed close-outs were NOT verified on disk.');
+    } else if (verification.error) {
+      closerWarnings.push(`Closer verification failed (${verification.error}) — claimed close-outs were NOT verified on disk.`);
+    } else {
+      observed = verification.tasks;
+    }
+    const byTask = new Map();
+    for (const m of compareCloserClaimsWithDisk(claims, observed)) {
+      if (!byTask.has(m.task_id)) byTask.set(m.task_id, []);
+      byTask.get(m.task_id).push(m.message);
+    }
+    for (const [id, messages] of byTask) {
+      if (!closerFailedTasks.includes(id)) closerFailedTasks.push(id);
+      closerWarnings.push(
+        `closer_failed: task ${id} close-out does not match the disk (${messages.join('; ')}) — verify and finish it manually.`,
+      );
+    }
+  }
   if (Array.isArray(closerResult.warnings)) {
     closerWarnings.push(...closerResult.warnings);
   }
@@ -3394,7 +3567,8 @@ return {
   // it skipped, per-task errors it reported).
   closer_report: closerResult,
   // Task ids the closer reported as failed/incomplete (ops_failed or
-  // unexecuted_ops non-empty), or every task when the closer failed
+  // unexecuted_ops non-empty), whose claimed status/criteria did not match the
+  // disk (or could not be read back), or every task when the closer failed
   // (`closer_report.error`); the manager closes these by hand.
   closer_failed_tasks: closerFailedTasks,
   warnings: closerWarnings,
