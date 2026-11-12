@@ -2105,6 +2105,27 @@ test('unexecuted_ops also yields closer_failed (the task is not fully closed)', 
   assert.ok(r.warnings.some((x) => /closer_failed/.test(x) && /trace_update/.test(x)));
 });
 
+test('a tasks_processed entry for a task outside the session still surfaces its failure in warnings', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [
+          { task_id: 't1', status_set: 'done' },
+          {
+            task_id: 'tGhost',
+            status_set: 'done',
+            ops_failed: [{ op: 'update_task.status', error: 'unknown task' }],
+          },
+        ],
+      },
+    },
+  );
+  const w = r.warnings.filter((x) => /closer_failed/.test(x) && /tGhost/.test(x));
+  assert.equal(w.length, 1, 'the failure of an unlisted task_id must not be ignored');
+  assert.match(w[0], /update_task\.status failed: unknown task/);
+});
+
 test('a clean closer result reports no closer_failed tasks', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
   assert.deepEqual(r.closer_failed_tasks, []);
