@@ -409,6 +409,9 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
             validate_requirement_gate(&rendered)?;
         }
         validate_trace_scalar_keys(updates.keys().map(String::as_str), &rendered)?;
+        if updates.keys().any(|k| is_session_loop_key(k)) {
+            validate_session_loop(&rendered)?;
+        }
         if updates
             .keys()
             .any(|k| k == "calendar" || k.starts_with("calendar."))
@@ -479,6 +482,30 @@ fn validate_requirement_gate(rendered: &str) -> Result<()> {
         gate.validate().map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(())
+}
+
+/// Top-level `[session_loop]` section (SPEC-ELITE-031) — not the multi-WT
+/// `[worktree.session_loop]`.
+const SESSION_LOOP_SECTION: &str = "session_loop";
+
+/// Does this update key write the `[session_loop]` section, as a whole
+/// (`session_loop`) or one of its keys (`session_loop.profile`)?
+fn is_session_loop_key(key: &str) -> bool {
+    key.strip_prefix(SESSION_LOOP_SECTION)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Rejects (before anything is written) a config text whose `[session_loop]`
+/// is malformed or names a pipeline profile the session-execute workflow
+/// would refuse. Only called when the update writes that section, so a
+/// hand-edited bad value never blocks an unrelated update.
+fn validate_session_loop(rendered: &str) -> Result<()> {
+    let config: Config = toml::from_str(rendered)
+        .map_err(|e| anyhow::anyhow!("invalid [{SESSION_LOOP_SECTION}]: {e}"))?;
+    config
+        .session_loop
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Rejects (before anything is written) an update that sets `trace.profile`,

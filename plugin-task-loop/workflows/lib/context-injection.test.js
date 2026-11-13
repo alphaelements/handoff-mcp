@@ -73,12 +73,24 @@ test('every role reasons at high effort under elite', () => {
   assert.equal(effortForRole('  ELITE ', 'developer'), 'high');
 });
 
-test('the elite effort entry maps every role it names to high, and nothing lower', () => {
+test('the elite effort entry names exactly the four roles, all at high effort', () => {
   const elite = EFFORT_BY_PROFILE_ROLE.elite;
-  for (const role of ['developer', 'integration-tester', 'reviewer', 'repairer', 'closer']) {
-    assert.equal(elite[role], 'high', `elite must name ${role} at high effort`);
+  assert.deepEqual(
+    { ...elite },
+    { developer: 'high', tester: 'high', 'integration-tester': 'high', reviewer: 'high' },
+  );
+});
+
+test('no effort entry names a role effortForRole() would reject', () => {
+  // A key outside ROLES can never be read: effortForRole() throws on the role
+  // before it reaches the table. `repairer` and `closer` once sat in the elite
+  // entry that way, looking configured and doing nothing.
+  for (const p of PROFILES) {
+    assert.deepEqual(Object.keys(EFFORT_BY_PROFILE_ROLE[p]).sort(), [...ROLES].sort(), `${p} entry`);
   }
-  assert.deepEqual([...new Set(Object.values(elite))], ['high']);
+  for (const role of ['repairer', 'closer']) {
+    assert.throws(() => effortForRole('elite', role), /unknown role/);
+  }
 });
 
 test('the elite effort entry is frozen like the others', () => {

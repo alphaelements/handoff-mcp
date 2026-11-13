@@ -229,9 +229,13 @@ When the manager relaunches you with feedback:
 
 ## Return format
 
-One report for the whole assignment. The `### Task:` block appears once per task, in the
-order you processed them. Every section after the task blocks appears once and covers all
-tasks.
+One `## dev result:` block per task, in the order you processed the tasks. Write the template
+below out in full for each task: its own heading, its `### Task:` block with the seven stage
+sections, and its own closing sections. The workflow cuts your report at the `## dev result:`
+headings and hands each block, alone, to the session-closer. So a block must not rely on a
+section of another block, and a task with no block of its own counts as not reported, which
+fails the session. In a block, `### Actual time` is the time spent on that one task: the closer
+logs each block's figure against its task, so the blocks add up to your total.
 
 ```
 ## dev result: <task_id> <task_title>
@@ -311,10 +315,10 @@ tasks.
 - (or "None")
 
 ### Actual time
-- <hours> (real wall-clock hours spent on this assignment, e.g. 0.2 for a few minutes;
-  never a rounded-up guess. If you cannot tell, write "unknown". One total for the whole
-  assignment, even when it covers several tasks.) The session-closer logs this figure
-  with `handoff_log_time`.
+- <hours> (real wall-clock hours spent on this task only, e.g. 0.2 for a few minutes;
+  never a rounded-up guess. If you cannot tell, write "unknown". Not a total: each block
+  carries its own task's time, and the blocks add up to your total for the assignment.)
+  The session-closer logs this figure against this task with `handoff_log_time`.
 
 ### done_criteria progress
 - <task_id> [0] met: true|false — <evidence, or what's missing>

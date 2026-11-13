@@ -1,6 +1,6 @@
 ---
 description: Automated task consumption loop — parallel TDD implementation, testing, and review per session (session manager procedure)
-argument-hint: '[task selector] e.g. t1,t2,t3 | t5- | t5-t9 | goal: condition'
+argument-hint: '[task selector] [profile: name] e.g. t1,t2,t3 | t5- | t5-t9 | goal: condition | t1,t2 profile: elite'
 ---
 
 # Session-based Task Loop (Session Manager)
@@ -69,15 +69,22 @@ Key properties:
 - **Stages are strictly serial.** Testing starts only after ALL developers finish. Review
   starts only after testing passes. This eliminates the old nested-loop complexity.
 
+Under `elite` one `elite-developer` (Fable) delivers all three layers in a single context: it
+implements with TDD, tests its own work adversarially, runs the whole-project suite, and
+reviews and fixes what it finds. No separate developer, tester or reviewer is launched; the
+table above describes `express`, `standard` and `full`.
+
 ## Configuration parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `dev_model` | `sonnet` | Model for developers (per-assignment `model_override` available) |
+| `dev_model` | `sonnet` | Model for developers (per-assignment `model_override` available). Not read under `elite`: the elite-developer's model is `elite_model` |
 | `integration_tester_model` | `sonnet` | Model for the tester |
 | `reviewer_model` | `opus` | Model for reviewer |
+| `elite_model` | `fable` | Model for the elite-developer; read under `elite` only. Omit it unless the user names a model for this run |
 | `MAX_TASKS_PER_SESSION` | `5` | Max tasks per session |
 | `max_rounds` | `3` | Max main-loop rounds (implement → test → review = 1 round) |
+| `profile` | chosen in 2b | Pipeline profile. A per-run `profile: <name>` argument wins over `config.toml` `[session_loop] profile`, which wins over the rules in 2b (`standard` when nothing else matches) |
 | `integration_expected` | `true` | Must the session's work be wired into the system? (see 2c) |
 
 ### Budget configuration
@@ -186,14 +193,53 @@ For each task in the session:
 ### 2b. Choose the pipeline profile
 
 The profile decides how many **serial agent turns** the session costs — the
-dominant term in wall-clock latency. Pick it mechanically from the tasks in the
-session, then let the user override it.
+dominant term in wall-clock latency. Take it from the user when the user chose
+one (for this run, or in `config.toml`); otherwise pick it mechanically from the
+tasks in the session, then let the user override it.
 
 | Profile | Stages | Serial turns | Use when |
 |---|---|---|---|
 | `express` | developer | 1 | Every task is mechanical and self-verifying |
-| `standard` | developer → tester | 2 | **Default.** Ordinary feature or bug work |
-| `full` | developer → tester → reviewer | 3 | Architecture, cross-cutting, or risky change |
+| `standard` | spec-prep → developer → tester → spec-reconcile | 4 | **Default.** Ordinary feature or bug work |
+| `full` | spec-prep → developer → tester → reviewer → spec-reconcile | 5 | Architecture, cross-cutting, or risky change |
+| `elite` | spec-prep → elite-developer (one Fable agent implements, tests, and reviews in a single context) → spec-reconcile | 3 | **Opt-in only.** The user asked for it — never chosen for them |
+
+Spec-Prep (Stage 0) and Spec-Reconcile (Stage 3.5) cost one turn each and run once per
+session; a rework round repeats only the turns between them.
+
+#### Where the profile comes from
+
+Stop at the first source that gives a profile:
+
+1. **Explicit for this run** — the user named one in the `/session-loop`
+   invocation (`profile: <name>`, see Task selector) or in the conversation
+   ("run this one with elite"). It wins over `config.toml` in both directions:
+   `elite` requested over a configured `standard`, and `standard` requested over
+   a configured `elite`. It applies to this run only — never write it back to
+   `config.toml`.
+2. **Configured default** — `handoff_get_config` → `session_loop.profile`, set in
+   `config.toml` as:
+   ```toml
+   [session_loop]
+   profile = "elite"
+   ```
+   When it is set and non-empty, use it as is and skip the mechanical rules:
+   task labels and estimates do not replace a configured profile.
+3. **Mechanical rules** — neither of the above (no `session_loop` key, or an
+   empty `profile`): apply the rules below. They choose `express`, `standard` or
+   `full`, and `standard` when nothing else matches.
+
+`elite` is opt-in only: it comes from source 1 or 2, never from the rules below
+and never from rework escalation. A project that sets nothing behaves exactly as
+before.
+
+The value must be one of `express`, `standard`, `full`, `elite`. On an unknown
+value from either source (`profile = "fast"`), stop and ask the user which
+profile they meant — do not guess or substitute one: the workflow rejects an
+unknown profile, and a silent fallback would drop the verification layers the
+user thought they had asked for.
+
+#### Mechanical rules (source 3)
 
 Apply the first rule that matches, evaluated over **all** tasks in the session:
 
@@ -205,17 +251,23 @@ Apply the first rule that matches, evaluated over **all** tasks in the session:
    (rename, version bump, doc fix, adding a test to an existing suite).
 3. **`standard`** otherwise.
 
-Two rules that override the table:
+Two rules that override the table. They also apply to a configured default
+(source 2), and can only raise a profile, never lower it; a profile the user
+named for this run (source 1) is left as it is:
 
 - **A task labelled `bug` never uses `express`.** A bug fix needs an adversarial
   check that the bug is actually gone, and the developer who wrote the fix is
   the worst person to make that call.
 - **Escalate on rework.** If a session fails and you re-run it, raise the profile
   one level (`express` → `standard` → `full`). Repeating a failed run at the same
-  depth just spends tokens to reach the same conclusion.
+  depth just spends tokens to reach the same conclusion. The ladder ends at
+  `full`: escalation never reaches `elite`, and an `elite` session that is re-run
+  stays `elite`.
 
 **Present the chosen profile to the user together with the session plan in step 2**,
-state which rule selected it, and let the user override it. Record the final
+state where it came from (the user's request, `config.toml`, or which rule
+selected it), and let the user override it. When it is `elite`, say so plainly
+in the plan — the cost warning itself is shown in step 5. Record the final
 choice in the session notes.
 
 ### 2c. Decide `integration_expected`
@@ -318,9 +370,9 @@ the workflow's Stage 0 (Spec-Prep, `session-spec-writer`) has anything to genera
    - Findings present -> set `trace_profile: '<standard|full>'` in the `session-execute` `args`
      (Step 5). This is injected automatically, never asked of the user. `session-execute`
      reads it: the spec-writer is told the tier (`full` also derives `detailed_spec`/`unit_test`).
-     Stage 0 only exists under pipeline `profile` `standard`/`full`: if Step 2b chose `express`
-     while gaps exist, raise it to `standard` and tell the user (otherwise the workflow returns a
-     `warnings` entry saying Stage 0 was not run).
+     Stage 0 only exists under pipeline `profile` `standard`/`full`/`elite`: if Step 2b chose
+     `express` while gaps exist, raise it to `standard` and tell the user (otherwise the workflow
+     returns a `warnings` entry saying Stage 0 was not run).
    - No findings -> still pass `trace_profile` (so the workflow and the spec-writer know the
      project's tier); Stage 0 skips requirements that already have specs, so it is a cheap no-op.
 4. Mention the result in the session plan ("Spec gate: N requirements missing
@@ -388,12 +440,25 @@ Inline scripts bypass agent definitions (session-developer = Sonnet, session-rev
 > **Resuming a Workflow run**: `resumeFromRunId` does NOT auto-inherit `args`.
 > Always pass the same `args` object again explicitly when resuming.
 
+**Elite cost warning (`elite` only).** When the profile resolved in step 2b is
+`elite`, show the user this warning before calling `Workflow()`:
+
+> Elite profile uses the Fable model — costs ~3-5x more than standard. Proceeding with elite profile.
+
+Show it for every session that runs under `elite`, whether `elite` came from
+`config.toml` or from an explicit request. It is information, not a question:
+do not wait for confirmation — the user already approved the session plan, so
+go straight on to the `Workflow()` call. Under `express`, `standard` or `full`
+there is no warning. When the user named another model for this run and you pass
+`elite_model` (see "Under `elite`" below the example), name that model in the
+warning in place of Fable.
+
 ```javascript
 Workflow({
   name: 'handoff-task-loop:session-execute',
   args: {
     session_id: '<id>',
-    profile: 'standard',        // express | standard | full
+    profile: 'standard',        // express | standard | full | elite — as resolved in step 2b
     integration_expected: true,  // see step 2c
     trace_profile: 'standard',   // see step 2f (omit for minimal/bugfix)
     tasks: [
@@ -414,7 +479,8 @@ Workflow({
       { dev_label: 'A', tasks: ['t1+t2'] },
       { dev_label: 'B', tasks: ['t3'] },
     ],
-    dev_model: 'sonnet',
+    dev_model: 'sonnet',        // developers' model; not read under elite
+    // elite_model: 'fable',    // elite only, and only when the user names a model (see below)
     integration_tester_model: 'sonnet',
     reviewer_model: 'opus',
     max_rounds: 3,
@@ -429,6 +495,15 @@ Workflow({
 });
 ```
 
+**Under `elite`** the workflow launches one elite-developer in place of the
+developers, the tester and the reviewer, so `dev_model`, `integration_tester_model`,
+`reviewer_model` and a per-assignment `model_override` are not read: leaving them as
+in the example changes nothing. The elite-developer's model is `elite_model`, which
+the workflow itself defaults to `fable` — leave it out. Pass `elite_model: '<model>'`
+only when the user names a different model for this run, and never copy `dev_model`
+into `elite_model`: an elite session on a cheaper model is not what the user opted
+into. `dev_assignments` is not required under `elite` and `budgets` are not applied.
+
 > **Fetch once, inject many.** Pass `handoff_load_context` result as `context.handoff_context`
 > instead of letting each agent call it again.
 >
@@ -440,18 +515,19 @@ The workflow returns:
 
 | Field | Shape | Notes |
 |---|---|---|
-| `passed` | boolean | `true` = converged or `max_rounds` reached (remainder → `pending_followups`). `false` = developer crashed with no report |
+| `passed` | boolean | `true` = converged or `max_rounds` reached (remainder → `pending_followups`). `false` = developer crashed with no report (under `elite`: the elite-developer crashed, or its report has no `## dev result` block for some task) |
 | `profile` | string | resolved profile |
 | `stages_run` | object | `{ specPrep, implement, test, integrate, review, reconcile }` |
-| `dev_reports` | (string\|null)[] | `null` = developer crashed |
-| `integration_report` | object\|null | `{ verdict, findings[], report }`. `null` under `express` or crash |
-| `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran |
-| `spec_prep_report` | object\|null | Stage 0 (Spec-Prep, `standard`/`full`) result: `{ specs_generated[], scaffolds_created[], low_confidence_items[], checker_result{ verdict, issues[] }, error? }`. Low-confidence items, a failing checker, or a crash are added to `warnings` (never fails the session). `null` under `express` |
-| `spec_reconcile_report` | object\|null | Stage 3.5 (Spec-Reconcile, `standard`/`full`) result: `{ mode: audit\|apply, reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[], error? }`. Each `contract_ambiguity` is also appended to `pending_followups` (source `spec-reconciler`) and each `verification_impact` to `warnings`. `null` under `express` or when `passed: false` |
+| `dev_reports` | (string\|null)[] | One per `dev_assignments` entry; `null` = developer crashed. Under `elite`: one per **task**, in `tasks` order — that task's `## dev result` block cut from the elite-developer's report; `null` = the report has no block for it |
+| `integration_report` | object\|null | `{ verdict, findings[], report }`. `null` under `express` or crash. Under `elite` it is derived from each block's `#### full_suite` (PASS only if every task's suite passed) and also carries `derived_from: 'elite-developer'` and `missing_sections[]` |
+| `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran. Under `elite` it is derived from each block's `#### review`, `#### fix_loop` and `### pendingFollowups`: APPROVE only if nothing is left open, with one finding per open item; same two extra fields |
+| `spec_prep_report` | object\|null | Stage 0 (Spec-Prep, `standard`/`full`/`elite`) result: `{ specs_generated[], scaffolds_created[], low_confidence_items[], checker_result{ verdict, issues[] }, error? }`. Low-confidence items, a failing checker, or a crash are added to `warnings` (never fails the session). `null` under `express` |
+| `spec_reconcile_report` | object\|null | Stage 3.5 (Spec-Reconcile, `standard`/`full`/`elite`) result: `{ mode: audit\|apply, reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[], error? }`. Each `contract_ambiguity` is also appended to `pending_followups` (source `spec-reconciler`) and each `verification_impact` to `warnings`. `null` under `express` or when `passed: false` |
 | `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, hours_logged, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, ops_failed[{ op, error }], unexecuted_ops[{ op, reason }], notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
 | `closer_failed_tasks` | string[] | Task ids whose close-out the closer reported as failed or incomplete (`ops_failed` / `unexecuted_ops` non-empty), session tasks missing from `closer_report.tasks_processed` (the closer reported no error but skipped them), or every session task when the closer itself failed (`closer_report.error`). A reported-failed/incomplete task has a `closer_failed:` entry in `warnings`; a skipped task has a `Closer did not report on task …` entry. A task whose `status_set` is `unchanged` (the closer could not process it) is always included. Also included: a task whose claimed `status_set` or `criteria_checked` the workflow could not confirm on disk — after the closer, a read-only `session-closer-verifier` reads every claimed task back (`handoff_get_task`) and the workflow compares status and checked criteria deterministically; a mismatch (`status expected done got todo`, `criterion index N claimed checked but unchecked on disk`) or a task/verifier that could not be read back (fail closed) gets a `closer_failed:` warning naming what differs. Criteria checked on disk but not claimed are not a mismatch. `time_log` is not verified here. Close these by hand; never trust their `status_set`. Empty when the closer ran clean or did not run |
 | `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
-| `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged |
+| `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged. Under `elite` the `source` is `elite-developer` |
+| `elite_report` | string\|null | `elite` only (absent otherwise): the last elite-developer report as returned, before it was cut into `dev_reports`. Read it when a `dev_reports` entry is `null` |
 | `session_log` | object[] | per-round trace |
 
 > **`passed: true` means less under a shallower profile.** Under `express` it means the
@@ -688,6 +764,7 @@ only when they are not).
 | `t5-` | All todo from t5 onward | `/session-loop t5-` |
 | `t5-t9` | Range (inclusive) | `/session-loop t5-t9` |
 | `goal: <cond>` | Natural language stop condition | `/session-loop goal: ...` |
+| `profile: <name>` | Pipeline profile for this run (step 2b); combines with any selector | `/session-loop t1,t2 profile: elite` |
 | (no args) | All todo tasks | `/session-loop` |
 
 - Tasks with non-`todo` status are skipped (reported to user). A named parent that is
@@ -695,6 +772,8 @@ only when they are not).
   are the work to run, and the parent itself is only reported.
 - Open-ended ranges (`t5-`) include all todo tasks with IDs >= t5.
 - Mixed formats (`t1,t3-t5`) are supported.
+- `profile: <name>` is not a task selector: it selects no tasks and can follow any of the
+  formats above (or stand alone, meaning "all todo tasks, under this profile").
 
 ## Goal (stop condition)
 

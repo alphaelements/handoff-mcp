@@ -15,6 +15,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
+import { eliteBlock, eliteReportFor } from './elite-report-fixture.js';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKFLOW = join(HERE, '..', 'session-execute.js');
 
@@ -74,6 +76,10 @@ async function runWorkflow(
     crashReconciler = false,
     specWriterResult = DEFAULT_SPEC_WRITER_RESULT,
     crashSpecWriter = false,
+    // What the elite-developer returns: `(launch, prompt) => report`, where
+    // `launch` counts its launches from 1. `null` simulates a crash. Default: a
+    // clean, well-formed report with one block per task.
+    eliteReport = undefined,
     onAgentCall,
   } = {},
 ) {
@@ -81,6 +87,7 @@ async function runWorkflow(
   const calls = [];
   const prompts = [];
   const agentOpts = [];
+  let eliteLaunches = 0;
 
   // The real Workflow runtime's agent() returns null on crash/skip (documented).
   // Wrap all calls so bare `await agent()` outside parallel() also gets null.
@@ -124,6 +131,14 @@ async function runWorkflow(
         if (diskState === null) throw new Error('simulated verifier crash');
         if (diskState !== undefined) return diskState;
         return honestDisk(closerResult);
+      }
+      if (opts.label === 'elite-developer') {
+        eliteLaunches += 1;
+        const report = eliteReport
+          ? eliteReport(eliteLaunches, prompt)
+          : eliteReportFor(argsObj.tasks.map((t) => t.id));
+        if (report === null) throw new Error('simulated elite-developer crash');
+        return report;
       }
       if (crashDevelopers || crashDevLabels.includes(opts.label)) {
         throw new Error('simulated developer crash');
@@ -460,45 +475,568 @@ test('an unknown profile throws instead of silently downgrading', async () => {
   );
 });
 
-// `elite` is a registered profile, but this workflow has no single-agent
-// pipeline for it yet. Its stage gates equal `full`, so without a guard a
-// session asked for `elite` would run the ordinary multi-agent pipeline on the
-// ordinary models and report itself as elite — a silent downgrade, the same
-// failure the unknown-profile test above forbids.
-test('elite is rejected before any agent launches: it must not run the multi-agent pipeline under its name', async () => {
-  const launched = [];
+// ============================================================
+// elite — one agent replaces the implement / test / review stages
+// ============================================================
+// `elite` opens the same stage gates as `full`. What differs is who does the
+// work: ONE elite-developer, launched once per round, instead of developers, a
+// tester, and a reviewer. Stage 0, Stage 3.5, and Close stay separate agents.
+
+const ELITE_CALLS = ['spec-writer', 'elite-developer', 'spec-reconciler', 'closer', 'closer-verifier'];
+const MULTI_AGENT_LABELS = ['tester', 'reviewer'];
+
+const threeTasks = () => ({
+  session_id: 's1',
+  tasks: [
+    { id: 't1', title: 'Task one', done_criteria: ['c1'], instructions: 'Build the first thing' },
+    { id: 't2', title: 'Task two', done_criteria: ['c2a', 'c2b'], instructions: 'Build the second thing', spec_path: 'docs/t2.md' },
+    { id: 't3', title: 'Task three', done_criteria: ['c3'], instructions: 'Build the third thing' },
+  ],
+  context: { branch: 'feat/x' },
+});
+
+/** A closer result that closes every given task cleanly. */
+const closerDone = (ids) => ({
+  tasks_processed: ids.map((id) => ({ task_id: id, status_set: 'done', criteria_checked: [0], trace_updated: true })),
+});
+
+/** The prompts the elite-developer received, one per launch. */
+const elitePrompts = (r) => r.prompts.filter((p) => p.label === 'elite-developer').map((p) => p.prompt);
+
+/** A follow-up line that keeps `id` unresolved. */
+const open = (id, problem = `${id} is still broken`) => ({ followups: [`- ${id} / MAJOR / src/${id}.js:1 / ${problem}`] });
+
+test('elite launches exactly one elite-developer on fable, and no developer, tester, or reviewer', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite' });
+
+  assert.equal(r.profile, 'elite');
+  assert.deepEqual(r.calls, ELITE_CALLS);
+  const elite = r.agentOpts.filter((o) => o.label === 'elite-developer');
+  assert.equal(elite.length, 1);
+  assert.equal(elite[0].agentType, 'handoff-task-loop:elite-developer');
+  assert.equal(elite[0].model, 'fable');
+  assert.equal(elite[0].effort, 'high');
+  assert.equal(elite[0].schema, undefined, 'the elite report is markdown, like a developer report');
+  for (const o of r.agentOpts) {
+    assert.notEqual(o.agentType, 'handoff-task-loop:session-developer');
+    assert.notEqual(o.agentType, 'handoff-task-loop:session-integration-tester');
+    assert.notEqual(o.agentType, 'handoff-task-loop:session-reviewer');
+  }
+  assert.equal(r.passed, true);
+  assert.equal(r.rounds, 1);
+});
+
+test('elite is not rejected, however the profile name is written', async () => {
+  for (const profile of ['elite', '  ELITE ', 'Elite']) {
+    const r = await runWorkflow({ ...baseArgs(), profile });
+    assert.equal(r.profile, 'elite');
+    assert.deepEqual(r.calls, ELITE_CALLS);
+  }
+});
+
+test('elite: dev_model never reaches the elite-developer, so its sonnet default cannot defeat the tier', async () => {
+  for (const dev_model of ['sonnet', 'opus', 'haiku']) {
+    const r = await runWorkflow({ ...baseArgs(), profile: 'elite', dev_model });
+    assert.equal(optsFor(r, 'elite-developer').model, 'fable', `dev_model '${dev_model}' must not replace fable`);
+    assert.equal(r.agentOpts.filter((o) => o.model === 'fable').length, 1);
+  }
+});
+
+test('elite: elite_model overrides the fable default for the elite-developer only', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite', elite_model: 'opus', dev_model: 'sonnet' });
+  assert.equal(optsFor(r, 'elite-developer').model, 'opus');
+  assert.equal(optsFor(r, 'elite-developer').agentType, 'handoff-task-loop:elite-developer');
+  assert.equal(optsFor(r, 'closer').model, 'sonnet');
+  assert.ok(!r.agentOpts.some((o) => o.model === 'fable'), 'the override replaces fable, it does not add to it');
+});
+
+test('elite_model is read under elite only: it changes no model of a multi-agent profile', async () => {
+  for (const profile of ['express', 'standard', 'full']) {
+    const r = await runWorkflow({ ...baseArgs(), profile, elite_model: 'fable' });
+    assert.ok(!r.agentOpts.some((o) => o.model === 'fable'), `${profile} must not run anything on fable`);
+    assert.equal(optsFor(r, 'dev:A').model, 'sonnet');
+  }
+});
+
+// The seam between the session-loop skill and this workflow: the manager builds its
+// args from the Step 5 example, so that example is run here as written, with only the
+// profile switched to elite.
+test('the session-loop Step 5 args example, run under elite, launches the elite-developer on fable', async () => {
+  const skill = readFileSync(join(HERE, '..', '..', 'commands', 'session-loop.md'), 'utf8');
+  const step5 = skill.slice(skill.indexOf('\n### 5. Launch Workflow'), skill.indexOf('\n### 6. '));
+  const example = step5.match(/```javascript\n(Workflow\(\{[\s\S]*?\}\);)\n```/);
+  assert.ok(example, 'Step 5 must carry a Workflow({...}) example');
+
+  let call;
+  new Function('Workflow', example[1])((c) => { call = c; });
+  assert.equal(call.name, 'handoff-task-loop:session-execute');
+  const ids = call.args.tasks.map((t) => t.id);
+
+  const r = await runWorkflow({ ...call.args, profile: 'elite' }, { closerResult: closerDone(ids) });
+  assert.equal(r.profile, 'elite');
+  assert.equal(r.passed, true);
+  assert.equal(optsFor(r, 'elite-developer').model, 'fable', 'the example must not put the elite-developer on another model');
+  assert.equal(optsFor(r, 'closer').model, 'sonnet');
+
+  const standard = await runWorkflow(call.args, { closerResult: closerDone(ids) });
+  assert.equal(standard.profile, 'standard', 'precondition: the example itself is a standard run');
+  assert.ok(!standard.agentOpts.some((o) => o.model === 'fable'));
+});
+
+test('elite needs session_id and tasks only: no dev_assignments, no test_assignments', async () => {
+  const args = threeTasks();
+  assert.equal(args.dev_assignments, undefined);
+  assert.equal(args.test_assignments, undefined);
+  const r = await runWorkflow({ ...args, profile: 'elite' }, { closerResult: closerDone(['t1', 't2', 't3']) });
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.calls, ELITE_CALLS);
+
+  let agentCalls = 0;
+  const count = { onAgentCall: () => { agentCalls += 1; } };
   await assert.rejects(
-    () =>
-      runWorkflow(
-        { ...baseArgs(), profile: 'elite' },
-        { onAgentCall: (_prompt, opts) => launched.push(opts.label) },
-      ),
+    () => runWorkflow({ session_id: 's1', profile: 'elite', context: { branch: 'b' } }, count),
     (err) => {
-      assert.match(err.message, /^session-execute: /);
-      assert.match(err.message, /profile "elite"/);
-      assert.match(err.message, /single-agent/);
-      assert.match(err.message, /express, standard, full/, 'the error must name the profiles that do run');
-      assert.doesNotMatch(err.message, /full, elite/, 'elite must not be offered as an alternative to itself');
+      assert.match(err.message, /missing required args: tasks\./);
+      assert.doesNotMatch(err.message, /dev_assignments \(\[/, 'elite must not ask for an arg it does not read');
       return true;
     },
   );
-  assert.deepEqual(launched, [], 'no agent may be launched for a profile the workflow cannot run');
+  await assert.rejects(() => runWorkflow({ profile: 'elite' }, count), /missing required args: session_id, tasks\./);
+  assert.equal(agentCalls, 0, 'no agent may launch on invalid args');
 });
 
-test('elite is rejected however the name is written, and before the args are validated', async () => {
-  await assert.rejects(() => runWorkflow({ ...baseArgs(), profile: '  ELITE ' }), /profile "elite"/);
-  // The profile decides which pipeline runs at all, so its error comes first:
-  // "missing required args" would send the manager to fix args for a run that
-  // cannot start.
-  await assert.rejects(() => runWorkflow({ profile: 'elite' }), /profile "elite"/);
-});
-
-test('rejecting elite leaves the multi-agent profiles launching as before', async () => {
+test('the multi-agent profiles still require dev_assignments and never launch the elite-developer', async () => {
   for (const profile of ['express', 'standard', 'full']) {
     const r = await runWorkflow({ ...baseArgs(), profile });
     assert.equal(r.profile, profile);
     assert.ok(r.calls.includes('dev:A'), `${profile} must still launch the developer`);
+    assert.ok(!r.calls.includes('elite-developer'), `${profile} must not launch the elite-developer`);
+    assert.ok(!r.agentOpts.some((o) => o.model === 'fable'), `${profile} must not run anything on fable`);
+    assert.equal(optsFor(r, 'dev:A').agentType, 'handoff-task-loop:session-developer');
+    assert.equal(optsFor(r, 'dev:A').model, 'sonnet');
+    assert.ok(!('elite_report' in r), `${profile} returns no elite-only key`);
+
+    await assert.rejects(
+      () => runWorkflow({ ...threeTasks(), profile }),
+      /missing required args: dev_assignments\./,
+    );
   }
+  const full = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.deepEqual(full.calls, ['spec-writer', 'dev:A', 'tester', 'reviewer', 'spec-reconciler', 'closer', 'closer-verifier']);
+});
+
+// --- the prompt (buildElitePrompt) ---
+test('elite: one prompt carries every task in the given order, with its criteria, spec, and instructions', async () => {
+  const r = await runWorkflow({ ...threeTasks(), profile: 'elite' }, { closerResult: closerDone(['t1', 't2', 't3']) });
+  const [prompt] = elitePrompts(r);
+
+  assert.equal(elitePrompts(r).length, 1);
+  const at = (needle) => prompt.indexOf(needle);
+  assert.ok(at('### Task: t1 — Task one') >= 0);
+  assert.ok(at('### Task: t1 — Task one') < at('### Task: t2 — Task two'));
+  assert.ok(at('### Task: t2 — Task two') < at('### Task: t3 — Task three'));
+  assert.ok(prompt.includes('**done_criteria**: ["c1"]'));
+  assert.ok(prompt.includes('**done_criteria**: ["c2a","c2b"]'));
+  assert.ok(prompt.includes('**instructions**: Build the first thing'));
+  assert.ok(prompt.includes('**instructions**: Build the third thing'));
+  assert.ok(prompt.includes('**spec**: docs/t2.md'));
+  assert.ok(prompt.includes('**spec**: none'));
+  assert.match(prompt, /- Session: s1/);
+  assert.match(prompt, /- Branch: feat\/x/);
+  assert.ok(!prompt.includes('REWORK'), 'the first launch has nothing to rework');
+});
+
+test('elite: the prompt orders sequential processing and one "## dev result" block per task', async () => {
+  const r = await runWorkflow({ ...threeTasks(), profile: 'elite' }, { closerResult: closerDone(['t1', 't2', 't3']) });
+  const [prompt] = elitePrompts(r);
+  assert.match(prompt, /sequentially/);
+  assert.match(prompt, /never in parallel/);
+  assert.match(prompt, /all seven stages[^.]*before starting the next/i);
+  assert.match(prompt, /one `## dev result: <task_id> <task_title>` block per task/);
+});
+
+test('elite: max_rounds reaches the prompt, 3 when unspecified', async () => {
+  const dflt = await runWorkflow({ ...baseArgs(), profile: 'elite' });
+  assert.match(elitePrompts(dflt)[0], /^- max_rounds: 3\b/m);
+  assert.match(elitePrompts(dflt)[0], /^- Round: 1\/3 \(initial\)$/m);
+
+  const five = await runWorkflow({ ...baseArgs(), profile: 'elite', max_rounds: 5 });
+  assert.match(elitePrompts(five)[0], /^- max_rounds: 5\b/m);
+  assert.doesNotMatch(elitePrompts(five)[0], /^- max_rounds: 3\b/m);
+
+  await assert.rejects(() => runWorkflow({ ...baseArgs(), profile: 'elite', max_rounds: 0 }), /max_rounds must be a positive integer/);
+});
+
+test('elite: requirements tracking, session context, wiring expectation, and spec-prep output reach the prompt', async () => {
+  const args = threeTasks();
+  args.tasks[1].instructions = 'Build the second thing\nrequirements_tracking: true\ncategory: FR-X-002';
+  args.tasks[1].requirement_ids = ['FR-X-002-1'];
+  args.context = { branch: 'feat/x', prev_session_summary: 'Session 1 registered the profile.', design_decisions: 'One agent per workflow.' };
+  const r = await runWorkflow(
+    { ...args, profile: 'elite' },
+    {
+      closerResult: closerDone(['t1', 't2', 't3']),
+      specWriterResult: {
+        ...DEFAULT_SPEC_WRITER_RESULT,
+        specs_generated: [{ stable_id: 'SPEC-X-1', layer: 'basic_spec', refines: 'FR-X-002-1', confidence: 'high' }],
+      },
+    },
+  );
+  const [prompt] = elitePrompts(r);
+
+  assert.ok(prompt.includes('requirements_tracking: true\ncategory: FR-X-002'), 'instructions are passed whole');
+  assert.match(prompt, /## Requirements tracking/);
+  assert.match(prompt, /- t2 — pre-linked: \["FR-X-002-1"\]/);
+  assert.doesNotMatch(prompt, /- t1 — pre-linked/, 'only tasks that track requirements are listed');
+  assert.ok(prompt.includes('Session 1 registered the profile.'));
+  assert.ok(prompt.includes('One agent per workflow.'));
+  assert.match(prompt, /integration_expected = true/);
+  assert.match(prompt, /SPEC-X-1 \(basic_spec, refines FR-X-002-1, high\)/);
+  assert.match(prompt, /## Response language\nRespond in English\./);
+  assert.match(prompt, /Do not call `handoff_load_context`/);
+
+  const plain = await runWorkflow({ ...baseArgs(), profile: 'elite', integration_expected: false });
+  assert.doesNotMatch(elitePrompts(plain)[0], /## Requirements tracking/);
+  assert.match(elitePrompts(plain)[0], /integration_expected = false/);
+});
+
+test('elite: dev_assignments are not used to split the work, but their extra_context is not lost', async () => {
+  const r = await runWorkflow(
+    {
+      ...threeTasks(),
+      profile: 'elite',
+      dev_assignments: [
+        { dev_label: 'A', tasks: ['t1', 't2'], extra_context: 'Mind the cache layer.', model_override: 'haiku' },
+        { dev_label: 'B', tasks: ['t3'] },
+      ],
+    },
+    { closerResult: closerDone(['t1', 't2', 't3']) },
+  );
+  assert.deepEqual(r.calls, ELITE_CALLS, 'two assignments must not become two agents');
+  assert.equal(optsFor(r, 'elite-developer').model, 'fable', 'a per-developer model_override does not apply');
+  assert.match(elitePrompts(r)[0], /Mind the cache layer\./);
+  assert.match(elitePrompts(r)[0], /t1, t2/);
+});
+
+test('elite: per-role budgets are reported as not applied instead of being silently dropped', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite', budgets: { developer: { max_turns: 10 } } });
+  assert.ok(r.warnings.some((w) => /budgets/.test(w) && /elite/.test(w)), JSON.stringify(r.warnings));
+  assert.doesNotMatch(elitePrompts(r)[0], /max_turns|Budget/i);
+
+  const none = await runWorkflow({ ...baseArgs(), profile: 'elite' });
+  assert.ok(!none.warnings.some((w) => /budgets/.test(w)));
+});
+
+// --- the round loop ---
+test('elite: a clean first report ends the loop after one launch', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite', max_rounds: 3 });
+  assert.equal(r.calls.filter((c) => c === 'elite-developer').length, 1);
+  assert.equal(r.rounds, 1);
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.pending_followups, []);
+});
+
+test('elite: unresolved findings relaunch up to max_rounds, then become follow-ups instead of a failure', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'elite', max_rounds: 2 },
+    {
+      eliteReport: () => eliteReportFor(['t1', 't2'], { t2: { status: 'needs_more_work', ...open('t2', 'off-by-one at the boundary') } }),
+      closerResult: { tasks_processed: [
+        { task_id: 't1', status_set: 'done', criteria_checked: [0] },
+        { task_id: 't2', status_set: 'review', criteria_checked: [0] },
+      ] },
+    },
+  );
+  assert.equal(r.calls.filter((c) => c === 'elite-developer').length, 2, 'max_rounds bounds the launches');
+  assert.equal(r.rounds, 2);
+  assert.equal(r.passed, true, 'running out of rounds files follow-ups, it does not fail the session');
+  assert.deepEqual(r.pending_followups, [
+    {
+      source: 'elite-developer',
+      crashed: false,
+      task_id: 't2',
+      severity: 'MAJOR',
+      location: 'src/t2.js:1',
+      problem: 'off-by-one at the boundary',
+    },
+  ]);
+  assert.equal(r.review_report.verdict, 'REQUEST_CHANGES');
+  // The closer and the reconciler are told, so the task is not closed as done.
+  assert.match(promptFor(r, 'closer'), /- t2 \[MAJOR\] \(elite-developer\): off-by-one at the boundary/);
+  assert.match(promptFor(r, 'closer'), /- Review verdict: REQUEST_CHANGES/);
+  assert.match(promptFor(r, 'spec-reconciler'), /mode: audit/);
+});
+
+test('elite: the relaunch prompt carries the rework notes of the unresolved task only', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'elite', max_rounds: 3 },
+    {
+      eliteReport: (launch) =>
+        launch === 1
+          ? eliteReportFor(['t1', 't2'], { t2: open('t2', 'off-by-one at the boundary') })
+          : eliteReportFor(['t1', 't2']),
+      closerResult: closerDone(['t1', 't2']),
+    },
+  );
+  const [first, second] = elitePrompts(r);
+  assert.equal(elitePrompts(r).length, 2, 'the loop stops as soon as nothing is open');
+  assert.equal(r.rounds, 2);
+  assert.deepEqual(r.pending_followups, []);
+  assert.equal(r.review_report.verdict, 'APPROVE');
+  assert.ok(!first.includes('off-by-one'));
+
+  assert.match(second, /^- Round: 2\/3 \(rework\)$/m);
+  const t1 = second.slice(second.indexOf('### Task: t1 — '), second.indexOf('### Task: t2 — '));
+  const t2 = second.slice(second.indexOf('### Task: t2 — '), second.indexOf('## Report format'));
+  assert.match(t2, /\*\*REWORK \(elite round 2\)\*\*/);
+  assert.match(t2, /\[Unresolved after elite round 1\]/);
+  assert.match(t2, /\[MAJOR\] src\/t2\.js:1 — off-by-one at the boundary/);
+  assert.ok(!t1.includes('REWORK'), 't1 had nothing open');
+  assert.ok(!t1.includes('off-by-one'));
+});
+
+test('elite: a failing full_suite is not a pass; it reworks, then is filed as a follow-up', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'elite', max_rounds: 2 },
+    {
+      eliteReport: () =>
+        eliteReportFor(['t1'], {
+          t1: { status: 'needs_more_work', fullSuite: ['- status: fail', '- passed: 9', '- failed: 2', '- skipped: 0'] },
+        }),
+      closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'review', criteria_checked: [0] }] },
+    },
+  );
+  assert.equal(r.integration_report.verdict, 'FAIL');
+  assert.equal(r.rounds, 2);
+  assert.equal(r.pending_followups.length, 1);
+  assert.equal(r.pending_followups[0].severity, 'BLOCKER');
+  assert.match(r.pending_followups[0].problem, /full_suite did not pass for t1/);
+  assert.match(elitePrompts(r)[1], /full_suite did not pass for t1/);
+  assert.match(promptFor(r, 'closer'), /- Integration verdict: FAIL/);
+});
+
+test('elite: a later round keeps the earlier block of a task that had nothing to rework', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'elite', max_rounds: 2 },
+    {
+      eliteReport: (launch) =>
+        launch === 1
+          ? eliteReportFor(['t1', 't2'], { t1: { title: 'from round one' }, t2: open('t2') })
+          : eliteBlock('t2', { title: 'from round two' }),
+      closerResult: closerDone(['t1', 't2']),
+    },
+  );
+  assert.equal(r.passed, true);
+  assert.match(r.dev_reports[0], /^## dev result: t1 from round one/);
+  assert.match(r.dev_reports[1], /^## dev result: t2 from round two/);
+  assert.deepEqual(r.pending_followups, []);
+});
+
+test('elite: a reworked task missing from the relaunch report is not carried over from the earlier round', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'elite', max_rounds: 2 },
+    {
+      eliteReport: (launch) =>
+        launch === 1 ? eliteReportFor(['t1', 't2'], { t2: open('t2') }) : eliteBlock('t1'),
+    },
+  );
+  assert.equal(r.passed, false);
+  assert.equal(r.dev_reports[1], null, 'a stale block with open findings must not stand in for the rework');
+  assert.ok(!r.calls.includes('closer'));
+});
+
+// --- the output mapping ---
+test('elite: one report with three blocks becomes three dev_reports, in task order', async () => {
+  const r = await runWorkflow(
+    { ...threeTasks(), profile: 'elite' },
+    {
+      eliteReport: () => `Summary first.\n\n${eliteReportFor(['t3', 't1', 't2'])}`,
+      closerResult: closerDone(['t1', 't2', 't3']),
+    },
+  );
+  assert.equal(r.dev_reports.length, 3);
+  for (const [i, id] of ['t1', 't2', 't3'].entries()) {
+    assert.equal(typeof r.dev_reports[i], 'string');
+    assert.ok(r.dev_reports[i].startsWith(`## dev result: ${id} `), `dev_reports[${i}] must be ${id}`);
+    assert.ok(r.dev_reports[i].includes('### done_criteria progress'));
+    assert.ok(r.dev_reports[i].includes('### Requirements addressed'));
+    assert.ok(r.dev_reports[i].includes('### Discovered issues'));
+  }
+  assert.deepEqual(r.task_ids, ['t1', 't2', 't3']);
+  assert.match(r.elite_report, /^Summary first\./, 'the unsplit report stays available');
+});
+
+test('elite: the result has every key a standard result has, with reports the pipeline can read', async () => {
+  const standard = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const elite = await runWorkflow({ ...baseArgs(), profile: 'elite' });
+
+  const harnessKeys = ['calls', 'prompts', 'agentOpts'];
+  const keys = (r) => Object.keys(r).filter((k) => !harnessKeys.includes(k)).sort();
+  assert.deepEqual(keys(elite).filter((k) => k !== 'elite_report'), keys(standard), 'elite adds no key but the optional elite_report');
+  for (const key of ['dev_reports', 'integration_report', 'review_report', 'pending_followups', 'closer_report']) {
+    assert.ok(key in elite, key);
+  }
+
+  assert.equal(elite.integration_report.verdict, 'PASS');
+  assert.equal(elite.review_report.verdict, 'APPROVE');
+  assert.deepEqual(elite.integration_report.findings, []);
+  assert.deepEqual(elite.review_report.findings, []);
+  assert.match(elite.integration_report.report, /#### full_suite/);
+  assert.match(elite.review_report.report, /#### review/);
+  assert.deepEqual(elite.test_reports, []);
+  assert.deepEqual(elite.stages_run, {
+    specPrep: true, implement: true, test: true, integrate: true, review: true, reconcile: true,
+  });
+});
+
+test('elite: every launch is recorded in the telemetry, the gate ledger, and the session log', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'elite', max_rounds: 2 },
+    { eliteReport: (launch) => eliteReportFor(['t1'], launch === 1 ? { t1: open('t1') } : {}) },
+  );
+  const launches = r.stage_telemetry.filter((e) => e.label === 'elite-developer');
+  assert.deepEqual(launches.map((e) => [e.round, e.stage, e.role, e.model, e.agentType]), [
+    [1, 'elite', 'elite-developer', 'fable', 'handoff-task-loop:elite-developer'],
+    [2, 'elite', 'elite-developer', 'fable', 'handoff-task-loop:elite-developer'],
+  ]);
+  assert.deepEqual(r.gate_ledger.map((e) => [e.round, e.stage, e.role, e.verdict]), [
+    [1, 'test', 'elite-developer', 'PASS'],
+    [1, 'review', 'elite-developer', 'REQUEST_CHANGES'],
+    [2, 'test', 'elite-developer', 'PASS'],
+    [2, 'review', 'elite-developer', 'APPROVE'],
+  ]);
+  assert.equal(r.gate_stats.rounds_run, 2);
+  const logged = r.session_log.filter((e) => e.phase === 'elite');
+  assert.deepEqual(logged.map((e) => [e.round, e.integration_verdict, e.review_verdict]), [
+    [1, 'PASS', 'REQUEST_CHANGES'],
+    [2, 'PASS', 'APPROVE'],
+  ]);
+});
+
+// --- fail-closed ---
+test('elite: a task with no "## dev result" block is not treated as done, and the session does not pass', async () => {
+  const r = await runWorkflow(
+    { ...threeTasks(), profile: 'elite' },
+    { eliteReport: () => eliteReportFor(['t1', 't3']) },
+  );
+  assert.equal(r.passed, false);
+  assert.equal(r.dev_reports.length, 3);
+  assert.equal(r.dev_reports[1], null);
+  assert.ok(r.dev_reports[0].startsWith('## dev result: t1 '));
+  assert.deepEqual(r.integration_report.missing_sections, ['t2: dev result']);
+  assert.deepEqual(r.calls, ['spec-writer', 'elite-developer'], 'nothing is reconciled or closed for an unreported task');
+  assert.equal(r.closer_report, null);
+  assert.equal(r.rounds, 1, 'a missing report is a failure, like a crashed developer — not a rework round');
+});
+
+test('elite: a report that bundles every task under one heading does not pass as three reports', async () => {
+  const r = await runWorkflow(
+    { ...threeTasks(), profile: 'elite' },
+    { eliteReport: () => eliteBlock('t1').replace('## dev result: t1 ', '## dev result: t1, t2, t3 ') },
+  );
+  assert.equal(r.passed, false);
+  assert.deepEqual(r.dev_reports.map((d) => d === null), [false, true, true]);
+});
+
+test('elite: a crashed elite-developer fails the session; nothing is derived, reconciled, or closed', async () => {
+  const r = await runWorkflow({ ...twoTasks(), profile: 'elite' }, { eliteReport: () => null });
+  assert.equal(r.passed, false);
+  assert.deepEqual(r.calls, ['spec-writer', 'elite-developer']);
+  assert.deepEqual(r.dev_reports, [null, null]);
+  assert.equal(r.integration_report, null);
+  assert.equal(r.review_report, null);
+  assert.equal(r.elite_report, null);
+  assert.equal(r.stages_run.review, false, 'no review ran inside an agent that never reported');
+  assert.equal(r.stage_telemetry.find((e) => e.label === 'elite-developer').crashed, true);
+});
+
+test('elite: a report with a section missing completes without throwing and names what is missing', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'elite', max_rounds: 1 },
+    {
+      eliteReport: () => eliteReportFor(['t1'], { t1: { fullSuite: null, review: null } }),
+      closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'review', criteria_checked: [0] }] },
+    },
+  );
+  assert.equal(r.passed, true, 'out of rounds: filed as follow-ups');
+  assert.equal(r.integration_report.verdict, 'FAIL');
+  assert.equal(r.review_report.verdict, 'REQUEST_CHANGES');
+  assert.deepEqual(r.integration_report.missing_sections, ['t1: full_suite']);
+  assert.deepEqual(r.review_report.missing_sections, ['t1: review']);
+  assert.deepEqual(r.pending_followups.map((f) => [f.task_id, f.severity]), [['t1', 'BLOCKER'], ['t1', 'BLOCKER']]);
+});
+
+// --- the stages around the elite-developer ---
+test('elite: spec-prep runs before the elite-developer and spec-reconcile after it, under their usual gates', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite', trace_profile: 'standard' });
+  assert.ok(r.calls.indexOf('spec-writer') < r.calls.indexOf('elite-developer'));
+  assert.ok(r.calls.indexOf('elite-developer') < r.calls.indexOf('spec-reconciler'));
+  assert.ok(r.calls.indexOf('spec-reconciler') < r.calls.indexOf('closer'));
+  assert.equal(optsFor(r, 'spec-writer').agentType, 'handoff-task-loop:session-spec-writer');
+  assert.equal(optsFor(r, 'spec-reconciler').agentType, 'handoff-task-loop:session-spec-reconciler');
+  assert.match(promptFor(r, 'spec-reconciler'), /mode: apply/);
+  assert.match(promptFor(r, 'spec-reconciler'), /## dev result: t1 /, 'the reconciler reads the elite report as the developer report');
+
+  const minimal = await runWorkflow({ ...baseArgs(), profile: 'elite', trace_profile: 'minimal' });
+  assert.deepEqual(minimal.calls, ['elite-developer', 'spec-reconciler', 'closer', 'closer-verifier']);
+  assert.equal(minimal.stages_run.specPrep, false);
+});
+
+test('elite: the closer and its verifier are separate sonnet agents, never fable, even with elite_model set', async () => {
+  for (const elite_model of [undefined, 'opus']) {
+    const r = await runWorkflow({ ...baseArgs(), profile: 'elite', elite_model });
+    const closer = optsFor(r, 'closer');
+    const verifier = optsFor(r, 'closer-verifier');
+    assert.equal(closer.agentType, 'handoff-task-loop:session-closer');
+    assert.equal(closer.model, 'sonnet');
+    assert.equal(verifier.agentType, 'handoff-task-loop:session-closer-verifier');
+    assert.equal(verifier.model, 'sonnet');
+    assert.equal(r.agentOpts.filter((o) => o.model === 'fable' || o.model === elite_model).length, 1, 'only the elite-developer runs on the elite model');
+    assert.deepEqual(r.closer_report, DEFAULT_CLOSER_RESULT);
+    assert.deepEqual(r.closer_failed_tasks, []);
+  }
+});
+
+test('elite: the closer receives each task\'s own block and the derived verdicts', async () => {
+  const r = await runWorkflow({ ...threeTasks(), profile: 'elite' }, { closerResult: closerDone(['t1', 't2', 't3']) });
+  const prompt = promptFor(r, 'closer');
+  assert.match(prompt, /- Integration verdict: PASS/);
+  assert.match(prompt, /- Review verdict: APPROVE/);
+  assert.match(prompt, /- Pending follow-ups \(unresolved findings\):\nNone/);
+  for (const id of ['t1', 't2', 't3']) {
+    const start = prompt.indexOf(`### Task: ${id} — Task`);
+    const section = prompt.slice(start, prompt.indexOf('\n---\n', start) > 0 ? prompt.indexOf('\n---\n', start) : undefined);
+    assert.ok(section.includes(`## dev result: ${id} `), `${id} gets its own block`);
+    assert.ok(section.includes(`- ${id} [0] met: true`), `${id} done_criteria progress`);
+    assert.ok(section.includes('### Actual time'));
+    assert.ok(section.includes(`- FR-${id}: Implemented`));
+    assert.ok(!section.includes('ERROR: No report returned'));
+    for (const other of ['t1', 't2', 't3'].filter((o) => o !== id)) {
+      assert.ok(!section.includes(`## dev result: ${other} `), `${id} must not be handed the block of ${other}`);
+    }
+  }
+});
+
+test('elite: a failing closer is reported exactly as under standard', async () => {
+  const failing = {
+    closerResult: {
+      tasks_processed: [
+        { task_id: 't1', status_set: 'unchanged', criteria_checked: [], ops_failed: [{ op: 'update_task', error: 'disk full' }] },
+      ],
+    },
+  };
+  const elite = await runWorkflow({ ...baseArgs(), profile: 'elite' }, failing);
+  const standard = await runWorkflow({ ...baseArgs(), profile: 'standard' }, failing);
+  assert.equal(elite.passed, true);
+  assert.deepEqual(elite.closer_failed_tasks, ['t1']);
+  assert.deepEqual(elite.closer_failed_tasks, standard.closer_failed_tasks);
+  assert.deepEqual(elite.warnings, standard.warnings);
+  assert.ok(elite.warnings.some((w) => /closer_failed: task t1/.test(w)));
+
+  const crashed = await runWorkflow({ ...baseArgs(), profile: 'elite' }, { crashCloser: true });
+  assert.equal(crashed.passed, true);
+  assert.deepEqual(crashed.closer_failed_tasks, ['t1']);
+  assert.ok(crashed.warnings.some((w) => /Closer agent failed/.test(w)));
 });
 
 // ============================================================

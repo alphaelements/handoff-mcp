@@ -120,6 +120,65 @@ pub struct Config {
     /// before this section existed parsing and re-serializing unchanged.
     #[serde(default, skip_serializing_if = "TestConfig::is_empty")]
     pub test: TestConfig,
+    /// Session-loop settings: `[session_loop] profile` (SPEC-ELITE-031), the
+    /// project's default pipeline profile. Not the multi-WT
+    /// `[worktree.session_loop]` section, which is a different thing.
+    /// `serde(default)` + `skip_serializing_if` keep every config.toml written
+    /// before this section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "SessionLoopConfig::is_empty")]
+    pub session_loop: SessionLoopConfig,
+}
+
+/// Pipeline profiles `[session_loop] profile` accepts, cheapest first. This
+/// restates `PROFILES` in `plugin-task-loop/workflows/lib/profile.js` — the
+/// source of truth, since the workflow's `resolveProfile` is what finally
+/// accepts or rejects the value; `tests/storage_config.rs` fails if the two
+/// drift apart.
+pub const SESSION_LOOP_PROFILES: &[&str] = &["express", "standard", "full", "elite"];
+
+/// `[session_loop]` section (SPEC-ELITE-031). handoff-mcp only stores and
+/// validates the value: the session-loop skill reads it through
+/// `handoff_get_config` and passes the resolved profile to the
+/// session-execute workflow, which never reads config.toml itself.
+///
+/// The section has to be known here even though `handoff_get_config` serves
+/// the raw TOML: every write that re-serializes [`Config`] drops a section
+/// `Config` does not model, which would silently undo a persistent
+/// `profile = "elite"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLoopConfig {
+    /// Default pipeline profile (see [`SESSION_LOOP_PROFILES`]). Unset — or
+    /// empty, which is what a `null` update writes — means "no configured
+    /// profile": the skill chooses one from the session's tasks, and never
+    /// chooses `elite` on its own.
+    ///
+    /// Lenient on parse (a hand-edited bad value must not make the whole
+    /// `config.toml` unreadable) and strict in [`Self::validate`], which the
+    /// config write path calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+impl SessionLoopConfig {
+    pub fn is_empty(&self) -> bool {
+        self.profile.is_none()
+    }
+
+    /// Rejects a `profile` the session-execute workflow would refuse.
+    ///
+    /// Only the canonical lowercase names pass, although `resolveProfile`
+    /// itself trims and lowercases: the stored value is what the skill hands
+    /// on, so it is kept in one spelling.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.profile.as_deref() {
+            None | Some("") => Ok(()),
+            Some(profile) if SESSION_LOOP_PROFILES.contains(&profile) => Ok(()),
+            Some(profile) => Err(format!(
+                "invalid session_loop.profile '{profile}': expected one of {}",
+                SESSION_LOOP_PROFILES.join("/")
+            )),
+        }
+    }
 }
 
 /// `[gui]` section (REQ-GUI-CFG-001). handoff-mcp only stores and exposes
@@ -1137,6 +1196,7 @@ impl Config {
             trace: TraceConfig::default(),
             gui: GuiConfig::default(),
             test: TestConfig::default(),
+            session_loop: SessionLoopConfig::default(),
         }
     }
 }

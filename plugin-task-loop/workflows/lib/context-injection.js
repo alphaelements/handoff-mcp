@@ -47,10 +47,14 @@ const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'revie
  * entries are unreachable, not meaningful.
  *
  * `elite` is high in every role: it is the profile that spends more to get
- * the highest quality, so nothing under it reasons at reduced depth. Its entry is
- * total over ROLES like the others, and also names `repairer` and `closer`, the
- * two further roles the elite spec (SPEC-ELITE-003) lists. Neither is in ROLES,
- * so effortForRole() rejects them: no lookup reads those two keys yet.
+ * the highest quality, so nothing under it reasons at reduced depth. Its one
+ * agent is launched at the `developer` effort; the other three entries keep the
+ * table total over ROLES, as under `express`.
+ *
+ * Every entry names exactly the roles in ROLES. A key outside ROLES could never
+ * be read (effortForRole() rejects the role first), so it would only look like
+ * configuration. The closer's effort is a constant of the workflow, not a
+ * per-profile choice.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
   express: Object.freeze({
@@ -76,8 +80,6 @@ const EFFORT_BY_PROFILE_ROLE = Object.freeze({
     tester: 'high',
     'integration-tester': 'high',
     reviewer: 'high',
-    repairer: 'high',
-    closer: 'high',
   }),
 });
 

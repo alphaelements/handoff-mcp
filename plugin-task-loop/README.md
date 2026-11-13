@@ -22,7 +22,7 @@ implementation, adversarial testing, and architectural review.
   session-spec-reconciler (Sonnet — Stage 3.5: syncs basic_spec/system_test with the implementation, reports contract_ambiguity),
   session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
   session-closer-verifier (Sonnet, read-only — reads each task back from disk after the closer so the workflow can compare status and checked criteria with the closer's claims),
-  elite-developer (Fable — the single agent of the `elite` profile: implements with TDD, tests its own work adversarially, runs the full suite, reviews and fixes in one context, and reports seven stages per task; reads handoff state and never writes it. `session-execute` does not launch it yet and rejects `profile: 'elite'` until it does),
+  elite-developer (Fable — the single agent of the `elite` profile: implements with TDD, tests its own work adversarially, runs the full suite, reviews and fixes in one context, and reports seven stages per task; reads handoff state and never writes it. `session-execute` launches exactly one per round under `profile: 'elite'`, in place of the developers, the tester, and the reviewer),
   requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
   requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check, plus the opt-in ISO 29119 `test_spec` check of scaffolded test specifications; cross-document duplicate/contradiction/omission review),
   requirement-registrar (Sonnet — registers finished requirement docs: trace_scaffold, trace_tasks, lint verification)
@@ -78,6 +78,9 @@ Session Manager (main agent, /loop /session-loop)
  |    |   still completes (passed: true), and whatever is unresolved is returned
  |    |   as `pending_followups` for the manager to file as backlog tasks.
  |    |
+ |    |   Under `elite`, Stages 1-3 are ONE elite-developer (Fable) per round,
+ |    |   with the same rework and no-escalation rules (see Profiles).
+ |    |
  |-- Processes results, marks tasks done, files pending_followups as tasks,
  |   commits
  +-- Hands off to next session
@@ -121,6 +124,16 @@ dominant term in wall-clock latency:
 | `express` | developer | 1 |
 | `standard` *(default)* | spec-prep → developer → tester → spec-reconcile | 4 |
 | `full` | spec-prep → developer → tester → reviewer → spec-reconcile | 5 |
+| `elite` *(opt-in)* | spec-prep → elite-developer → spec-reconcile | 3 |
+
+Under `elite` one `elite-developer` (Fable) does the work of the developers, the tester, and the
+reviewer for every task, in a single context, and returns one report with a
+`## dev result: <task_id>` block per task. The workflow cuts that report into one developer report
+per task and reads the suite and review verdicts from it, so Spec-Reconcile and the closer run as
+they do under `full`, as separate Sonnet agents. If the report leaves findings open, the agent is
+launched again with them, up to `max_rounds` launches; what is still open then is returned as
+`pending_followups`. A task with no block of its own fails the session, like a developer that
+never reported. `dev_assignments` is not required under `elite`, and `budgets` are not applied.
 
 The integration tester handles both per-task adversarial checks and whole-project
 suite / E2E / wiring in a single agent invocation, so `test` and `integrate` share
@@ -131,6 +144,21 @@ wiring to check, and the developer owns the whole-project suite there.
 Developers run format, lint, and type check under **every** profile, plus the tests in their
 own scope. `express` drops the adversarial layers, not the gates. `/session-loop` picks a
 profile from task estimates and labels and confirms it with you. See its step 2b for the rules.
+
+You can choose the profile yourself instead. For one run, name it in the invocation
+(`/session-loop t1,t2 profile: elite`). As the project default, set it in `.handoff/config.toml`
+(or with `handoff_update_config(updates: {"session_loop.profile": "elite"})`, which rejects an
+unknown profile name):
+
+```toml
+[session_loop]
+profile = "elite"
+```
+
+A profile named for one run wins over the configured one, and the configured one wins over the
+rules. With neither set, nothing changes: the rules choose `express`, `standard` or `full`.
+`elite` is never chosen for you — it runs only when you ask for it, and `/session-loop` shows a
+cost warning (it uses the Fable model) before each session that runs under it.
 
 `integration_expected` (default `true`) controls the wiring verdict. Set it to `false` when a
 session deliberately builds a foundation to be wired later — the whole suite and E2E still run
@@ -323,13 +351,14 @@ Model selection and loop behavior are tuned per session through the workflow's
 
 | `args` field               | Default    | Description                                            |
 | -------------------------- | ---------- | ------------------------------------------------------ |
-| `profile`                  | `standard` | Pipeline depth: `express` / `standard` / `full`         |
+| `profile`                  | `standard` | Pipeline depth: `express` / `standard` / `full` / `elite` (see Profiles for how `/session-loop` chooses it) |
 | `integration_expected`     | `true`     | Must the session's work be wired into the system?       |
-| `dev_model`                | `sonnet`   | Model for developers                                    |
+| `dev_model`                | `sonnet`   | Model for developers (not used under `elite`)           |
+| `elite_model`              | `fable`    | Model for the elite-developer (`elite` only; omit unless the user names a model) |
 | `tester_model`             | `sonnet`   | Model for testers (unused under `express`)              |
 | `integration_tester_model` | `sonnet`   | Model for the integration tester (unused under `express`) |
 | `reviewer_model`           | `opus`     | Model for the reviewer (only runs under `full`)         |
-| `max_rounds`               | `3`        | Max implement/test rounds (`express` always runs 1)     |
+| `max_rounds`               | `3`        | Max implement/test rounds (`express` always runs 1; under `elite`: max elite-developer launches, and the limit of its own fix loop) |
 | `max_review_rounds`        | `2`        | Max rework rounds after the verify stage fails          |
 
 Both round budgets must be positive integers when given; `0`, a negative value,

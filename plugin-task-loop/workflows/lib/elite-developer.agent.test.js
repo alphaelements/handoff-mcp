@@ -334,11 +334,41 @@ test('the sections the closer transcribes match session-developer exactly', () =
     '### done_criteria progress',
     '### Requirements addressed',
     '### Discovered issues',
-    '### Actual time',
   ]) {
     assert.ok(dev.has(heading), `precondition: session-developer has ${heading}`);
     assert.equal(elite.get(heading), dev.get(heading), `${heading} must match session-developer verbatim`);
   }
+});
+
+// `### Actual time` is the one closing section that cannot be copied from
+// session-developer: a developer writes one report for its whole assignment, the
+// elite-developer one block per task, and the closer logs each block's figure against
+// that block's task. A total repeated in every block would be logged once per task.
+test('Actual time in the elite report is per task, where session-developer reports one total', () => {
+  const flat = (text) => text.replace(/\s+/g, ' ');
+  const elite = flat(h3Sections(returnFormat(parse(ELITE).body)).get('### Actual time'));
+  const dev = flat(h3Sections(returnFormat(parse(DEVELOPER).body)).get('### Actual time'));
+
+  assert.match(dev, /One total for the whole assignment/, 'precondition: session-developer reports one total');
+  assert.doesNotMatch(elite, /One total|whole assignment|spent on this assignment/);
+  assert.match(elite, /spent on this task only/);
+  assert.match(elite, /blocks (add up|sum) to (the|your) total/);
+  assert.match(elite, /not (a|the) total|never the total/i);
+
+  // What the closer needs from the line is unchanged: a plain hours figure, the
+  // "unknown" escape, no rounding up, and the tool that logs it.
+  for (const kept of [/- <hours> \(real wall-clock hours/, /never a rounded-up guess/, /write "unknown"/, /`handoff_log_time`/]) {
+    assert.match(dev, kept, `precondition: session-developer has ${kept}`);
+    assert.match(elite, kept);
+  }
+});
+
+test('the template, the prose above it, and the workflow preamble agree that Actual time is per task', () => {
+  const intro = section(parse(ELITE).body, 'Return format').split('```')[0].replace(/\s+/g, ' ');
+  assert.match(intro, /`### Actual time` is the time spent on that one task/);
+
+  const workflow = readFileSync(join(HERE, '..', 'session-execute.js'), 'utf8');
+  assert.match(workflow, /\\`### Actual time\\` in a block is the time spent on that one/);
 });
 
 test('the three shared sections follow the task blocks, in the order the spec gives', () => {
