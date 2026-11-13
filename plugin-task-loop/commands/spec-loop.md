@@ -1,6 +1,6 @@
 ---
 description: Specification workflow (between brainstorm-loop and requirement-loop) — imports the brainstorm report, then produces architecture diagrams, GUI mockups, use cases and a PDF requirements specification for approval. Triggers - spec-loop, 要求仕様, specification, 仕様策定, spec phase.
-argument-hint: '[report_doc_id | resume | scope: <text>]'
+argument-hint: '[report_doc_id | resume | scope: <text>] [profile: <name>]'
 ---
 
 # Spec Loop (Specification Coordinator)
@@ -23,7 +23,8 @@ Triggers: `spec-loop`, `要求仕様`, `specification`, `仕様策定`, `spec ph
 Same role as the coordinators in `brainstorm-loop.md` and `requirement-loop.md`: Opus, dialogue and
 orchestration, all state changes through `handoff_*` MCP tools. Diagram and mockup generation
 follows `Skill(handoff-task-loop:spec-execute)`, which says how to brief the Sonnet agents
-`spec-architect`, `spec-gui-designer` and `spec-usecase-analyst`; the approval gates are always
+`spec-architect`, `spec-gui-designer` and `spec-usecase-analyst` (or, under the opt-in `elite`
+pipeline profile, how to launch the one `elite-spec-author`); the approval gates are always
 yours, with the user.
 
 The user may not be a developer. Propose, do not interrogate: show a diagram or a mock and let
@@ -43,7 +44,7 @@ Phase 4  Specification   integrate + handoff_doc_save + PDF export              
 | Phase | Executor | Why |
 |---|---|---|
 | 0, and every gate | coordinator (you) with the user | needs the user's judgment; no agent can answer for them |
-| 1, 2, 3 generation | `spec-architect`, `spec-gui-designer`, `spec-usecase-analyst` (Sonnet), guided by `spec-execute` | well-defined generation from settled scope |
+| 1, 2, 3 generation | `spec-architect`, `spec-gui-designer`, `spec-usecase-analyst` (Sonnet), guided by `spec-execute`. Under `elite`: one `elite-spec-author` (Fable) through the `spec-execute` Workflow | well-defined generation from settled scope |
 | 4 | you | integrates, saves, exports and runs the final gate |
 
 ## Configuration parameters
@@ -53,6 +54,8 @@ Phase 4  Specification   integrate + handoff_doc_save + PDF export              
 | `coordinator_model` | `opus` | Model for this coordinator |
 | `generator_model` | `sonnet` | Model for the spec-architect, spec-gui-designer and spec-usecase-analyst agents |
 | `reviewer_model` | `opus` | Model for any review-only agent (none is required) |
+| `profile` | `standard` | Pipeline profile. `elite` (opt-in) replaces the three generation agents with one `elite-spec-author`; see "Pipeline profile" below |
+| `elite_model` | `fable` | Model of the `elite-spec-author`; read under `elite` only. Omit it unless the user names a model for this run |
 | `response_language` | the user's language | Prose of the specification and the dialogue |
 
 ## Argument parsing
@@ -63,6 +66,35 @@ Phase 4  Specification   integrate + handoff_doc_save + PDF export              
 | `<report_doc_id>` | Use this brainstorm report | `/spec-loop doc-20261027-...` |
 | `scope: <text>` | No report: start in manual mode with this scope | `/spec-loop scope: a CLI that exports tasks` |
 | `resume` | Continue a suspended spec-loop | `/spec-loop resume` |
+| `profile: <name>` | Pipeline profile for this run; combines with any of the above | `/spec-loop profile: elite` |
+
+## Pipeline profile (`elite` is opt-in)
+
+The pipeline profile decides who generates in Phases 1-3. Decide it once, at the start of
+Phase 0. Stop at the first source that gives a value:
+
+1. **Explicit for this run** — the user named a profile in the invocation (`profile: elite`) or
+   in the conversation ("write this spec with elite"). It wins over `config.toml` in both
+   directions and applies to this run only: never write it back.
+2. **Configured default** — `handoff_get_config` -> `session_loop.profile`, the same key
+   `/session-loop` reads:
+   ```toml
+   [session_loop]
+   profile = "elite"
+   ```
+3. **Neither** — `standard`.
+
+| Pipeline profile | Phases 1-3 generation |
+|---|---|
+| `standard` (default), `express`, `full` | `spec-architect`, `spec-gui-designer`, `spec-usecase-analyst`, one phase at a time, exactly as before. spec-loop has one multi-agent flow, so the three values run it identically and nothing changes for a project that sets no profile |
+| `elite` | one `elite-spec-author` (Fable) produces all three areas and a draft specification in a single context; see "Under the `elite` profile" |
+
+`elite` is opt-in only: it comes from source 1 or 2 and is never chosen for the user because the
+scope looks large. On an unknown value from either source (`profile = "fast"`), stop and ask the
+user which profile they meant; do not guess or substitute one.
+
+State the resolved profile, and where it came from, when you present the Phase 0 summary, and
+record it in the session note (`profile=<name>`) so a resumed flow keeps it.
 
 ## Suspend and resume
 
@@ -156,6 +188,44 @@ main scenario, alternative scenarios, exceptions; add a Mermaid `sequenceDiagram
 flows that involve several components. Present the list and point out gaps and overlaps yourself
 (scope items without a use case, two use cases that say the same). Gate (*Approve* / *Fix gaps or
 duplicates* / *Suspend*).
+
+### Under the `elite` profile
+
+When the pipeline profile is `elite`, Phases 1-3 are generated by **exactly one** agent, the
+`elite-spec-author`, instead of the three phase agents. Phase 0, every user gate and Phase 4 are
+unchanged: all the gates stay, and no phase output reaches the specification without the user's
+approval.
+
+1. Run **Phase 0** as written, including the scope gate and the decision whether Phase 2 applies.
+2. **Elite cost warning.** Before calling `Workflow()`, show the user:
+
+   > Elite profile uses the Fable model — costs ~3-5x more than standard. Proceeding with elite profile.
+
+   It is information, not a question: do not wait for confirmation. Show it before every launch
+   under `elite`, whether `elite` came from `config.toml` or from an explicit request. When you
+   pass `elite_model`, name that model in place of Fable.
+3. **Launch the workflow** with the approved Phase 0 result. Build the args as
+   `Skill(handoff-task-loop:spec-execute)` section 7 says. Never write an inline script.
+
+   ```javascript
+   Workflow({
+     name: 'handoff-task-loop:spec-execute',
+     args: { profile: 'elite', topic: '<topic>', scope_items: [/* approved scope */], /* ...section 7 */ },
+   });
+   ```
+
+4. **Read the result** as section 7 says. Only a `done` result is presented. `needs_input`,
+   `blocked` and `failed` go back to the user; never fill the gap yourself.
+5. **Run the gates in phase order on that one result**: the Phase 1 gate on the architecture, the
+   Phase 2 gate on the mocks and transitions (or record "Phase 2 skipped: no GUI"), the Phase 3
+   gate on the use cases, each with `AskUserQuestion` and the checks, intermediate documents and
+   options described for that phase above. A change request at a gate launches the workflow again
+   with the user's words verbatim and the already-approved areas kept (section 7).
+6. **Phase 4** runs as written below. You assemble, save, export and hold the final gate.
+
+Do not brief `spec-architect`, `spec-gui-designer` or `spec-usecase-analyst` in an elite run, not
+even to patch one area: a single-area patch by another agent breaks the agreement between the
+areas that the single context exists to give.
 
 ### Phase 4: Specification document, PDF and final approval
 

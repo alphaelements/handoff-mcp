@@ -31,22 +31,32 @@ implementation, adversarial testing, and architectural review.
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
 
 ### Research loop
-- **Agents** — research-investigator (Sonnet), research-verifier (Sonnet), research-drafter (Sonnet), research-director (Opus)
-- **Workflow** — `research-execute` (investigate -> verify -> gate -> draft -> review)
+- **Agents** — research-investigator (Sonnet), research-verifier (Sonnet), research-drafter (Sonnet), research-director (Opus),
+  elite-researcher (Fable — the single agent of the `elite` profile: investigates every facet, tries to refute its own findings, drafts the document, and judges both gates in one context; a finding its verification refuted stays out of the draft. `research-execute` launches exactly one under `profile: 'elite'`, in place of the investigators, verifiers, drafter and director)
+- **Workflow** — `research-execute` (investigate -> verify -> gate -> draft -> review; under `profile: 'elite'` one elite-researcher runs the whole cycle and its report is mapped onto the same result shape)
 - **Command** — `/research-loop` (research coordinator)
 
 ### Brainstorm research
-- **Agents** — brainstorm-regulatory-director (Opus — derives the legal/regulatory scope from the deliverable's characteristics, assigns investigators, integrates and verifies their results), brainstorm-regulatory-investigator (Sonnet — researches one regulatory area on the web), brainstorm-adversarial-reviewer (Opus — reviews all technical and regulatory results together and rates risks BLOCKER/MAJOR/MINOR with mitigations)
+- **Agents** — brainstorm-regulatory-director (Opus — derives the legal/regulatory scope from the deliverable's characteristics, assigns investigators, integrates and verifies their results), brainstorm-regulatory-investigator (Sonnet — researches one regulatory area on the web), brainstorm-adversarial-reviewer (Opus — reviews all technical and regulatory results together and rates risks BLOCKER/MAJOR/MINOR with mitigations),
+  elite-investigator (Fable — the single agent of the `elite` profile: covers the technical investigation and the regulatory research in one context and attacks its own findings with a risk-rated self-review; reads handoff state and never writes it. `brainstorm-execute` launches exactly one under `profile: 'elite'`, in place of the technical investigators, the regulatory director and its investigators; the adversarial reviewer still runs as its own agent)
 - Technical research reuses research-investigator and research-verifier
-- **Workflow** — `brainstorm-execute` (Stream A: parallel technical investigation; Stream B: regulatory director -> parallel investigators -> integration; then adversarial review of both). Launched through the `brainstorm-execute` skill, never as an inline script
+- **Workflow** — `brainstorm-execute` (Stream A: parallel technical investigation; Stream B: regulatory director -> parallel investigators -> integration; then adversarial review of both; under `profile: 'elite'` one elite-investigator covers both streams and its report is mapped onto the same result shape). Launched through the `brainstorm-execute` skill, never as an inline script
 - **Skill** — `brainstorm-execute` (how the coordinator builds the workflow args, reads the result and files findings into report sections 6.1-6.4)
 - **Command** — `/brainstorm-loop` (brainstorm coordinator; Phases 0-1 and 3-4 dialogue with proposal-style facilitation and a hidden coverage tracker, Phase 2 research, delegate mode; recommends `/spec-loop` next (optional) and hands the finalized report to `/requirement-loop` either way)
 
 ### Requirement loop
-- **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet), test-spec-worker (Sonnet — completes the `(TBD)` preconditions / steps / environment of scaffold-generated ISO 29119 test items; marks guesses `(要確認)`; never changes `method` or `priority`)
-- **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links)
+- **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet), test-spec-worker (Sonnet — completes the `(TBD)` preconditions / steps / environment of scaffold-generated ISO 29119 test items; marks guesses `(要確認)`; never changes `method` or `priority`),
+  elite-requirement-author (Fable — the single agent of the `elite` profile: decomposes every scope, checks each document against ISO/IEC/IEEE 29148, reviews them across documents, fixes what it finds within `max_rounds`, and registers them in one context. `requirement-execute` launches exactly one under `profile: 'elite'`, in place of the workers, checkers, reviewer, registrar and test-spec-worker)
+- **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links; under `profile: 'elite'` one elite-requirement-author runs all four stages and its report is mapped onto the same result shape)
 - **Command** — `/requirement-loop` (requirements coordinator; Phase 0 imports the approved `/spec-loop` specification when one exists, else the brainstorm report or manual input; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
 - **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered
+
+### Spec loop
+- **Agents** — spec-architect (Sonnet — Phase 1: Mermaid `flowchart` / `C4Context` architecture), spec-gui-designer (Sonnet — Phase 2: one HTML mock per screen and a `stateDiagram-v2` of the transitions), spec-usecase-analyst (Sonnet — Phase 3: use cases with `sequenceDiagram`),
+  elite-spec-author (Fable — the single agent of the `elite` profile: designs the architecture, the GUI mocks with their transition diagram and the use cases in one context and drafts the six-section specification; read-only towards handoff, writes only the mocks. `spec-execute` launches exactly one, in place of the three phase agents)
+- **Skill** — `spec-execute` (how the coordinator briefs the phase agents, validates Mermaid, assembles, saves and exports the specification; section 7 covers the elite run)
+- **Workflow** — `spec-execute` (elite only: one elite-spec-author generates all three areas and the draft, and the result is checked before the coordinator's gates; the other profiles generate phase by phase through the skill and have no workflow run)
+- **Command** — `/spec-loop` (specification coordinator between `/brainstorm-loop` and `/requirement-loop`; Phase 0 import and scope gate, Phases 1-3 generation with a user gate each, Phase 4 document, PDF and final approval)
 
 ### GUI verification
 - **Skill** — `gui-vrt` (mock -> golden -> verify pipeline; modes `capture-golden`, `verify`, `compare`, `ai-compare`; `verify` runs on the MCP chain `doc_req_list` -> `trace_test_run` -> `trace_record`, recording pass/fail with golden / `vrt-actual` / `vrt-diff` evidence and `VrtEvidence` numbers)
@@ -379,6 +389,8 @@ The manager caps a session at 5 tasks.
 | `DIRECTOR_MODEL`           | `opus`   | Model for director (gate + review)        |
 | `MAX_INVESTIGATION_ROUNDS` | `2`      | Max investigation/re-investigation rounds |
 | `MAX_REVISION_ROUNDS`      | `2`      | Max draft revision rounds                 |
+| `PROFILE`                  | `standard` | `elite` = one elite-researcher runs the whole cycle; every other profile runs the multi-agent pipeline |
+| `ELITE_MODEL`              | `fable`  | Model for the elite-researcher (`elite` only; omit unless the user names a model) |
 
 ## Safety
 

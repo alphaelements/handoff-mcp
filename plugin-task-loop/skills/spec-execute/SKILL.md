@@ -35,6 +35,8 @@ When the user says one of them after a brainstorm, start `/spec-loop` Phase 0.
 - Regeneration after a user correction passes the user's words verbatim in `feedback` and the
   previous output, and regenerates the whole artifact of that phase (a diagram is cheap to redraw
   and a patched one drifts).
+- Under the `elite` pipeline profile one `elite-spec-author` replaces these three agents. The
+  checks, documents and gates of sections 2-5 still apply; section 7 says what changes.
 
 ## 2. Phase 1 — architecture
 
@@ -372,6 +374,122 @@ mmdc -i diagram.mmd -o diagram.svg      # binary from HANDOFF_MMDC_BIN when set
 
 Third-party tools (`mmdc`, headless Chrome, Typst) are checked once at the start of Phase 0 using
 `agents/_spec-loop-tool-check.md`; re-run the check when the user says they installed something.
+
+## 7. Elite profile: single-agent generation
+
+Use this section only when the pipeline profile resolved in `commands/spec-loop.md` is `elite`.
+Under every other profile sections 1-6 apply as written and nothing here is used.
+
+Under `elite` the three generation agents are replaced by **one** `elite-spec-author` (Fable),
+launched by the `spec-execute` Workflow. It designs the architecture, the mocks with their
+transition diagram and the use cases in one context, then drafts the specification. Phase 0 and
+every user gate stay yours, and so do all handoff writes: the agent is read-only.
+
+What differs from section 1: the author builds all three areas before the user has seen any of
+them. "Approved inputs only" therefore holds for what goes **into** the run (the approved Phase 0
+result, plus areas approved at earlier gates) but not between the areas inside one run. The gates
+below put the order back: the user approves the areas one at a time, in phase order, and a change
+at a gate regenerates everything that was built on the changed area.
+
+### Launch
+
+Show the cost warning first (`commands/spec-loop.md`), then launch. **Always use
+`name: 'handoff-task-loop:spec-execute'`; never write an inline script**, which would bypass the
+agent definition and its model.
+
+```javascript
+Workflow({
+  name: 'handoff-task-loop:spec-execute',
+  args: {
+    profile: 'elite',
+    topic: '<specification topic>',
+    scope_items: [{ id: 'BS-SCOPE-001', title: '<title>', priority: 'P1', hints: ['BS-HINT-001: <hint>'] }],
+    constraints: ['<technology / platform / budget constraint>'],
+    screens: [{ id: 'login', name: 'Login', purpose: '<purpose>', elements: ['<element>'], linked: ['BS-SCOPE-001'] }],
+    screen_flow: ['login -> dashboard: signed in'],
+    ux_policy: ['<policy line>'],
+    output_dir: '.handoff/exports/spec-<topic-slug>/mocks',
+    response_language: '<user language>',
+    // elite_model: '<model>',   // only when the user names a model for this run
+  },
+});
+```
+
+| arg | required | meaning |
+|---|---|---|
+| `profile` | yes | `'elite'`. The workflow refuses every other profile, and an omitted one: those generate phase by phase with the three agents (sections 2-4) |
+| `topic` | yes | what the specification is about; becomes its title |
+| `scope_items` | yes | the **approved** in-scope items of Phase 0: `id` (`BS-SCOPE-NNN` or `(added in spec-loop)`), `title`, `priority`, `hints`. Out-of-scope items are not passed |
+| `constraints` | no | technology, platform, budget and settled decisions (a string or a list) |
+| `screens` | no | the approved screens: `id` (unique; names the mock file), `name`, `purpose`, `elements`, `linked`. Omit or pass `[]` when the skip decision of section 3 says Phase 2 is skipped |
+| `screen_flow` | no | the transitions from the brainstorm report |
+| `ux_policy` | no | the design policy (a string or a list) |
+| `output_dir` | with `screens` | where the HTML mocks are written, as in section 3 |
+| `feedback` | re-run | the user's correction at a gate, **verbatim** |
+| `previous_output` | re-run | the result the feedback is about (pass the previous run's `architecture` / `gui` / `use_cases` / `draft_spec`) |
+| `approved` | re-run | areas the user already approved, kept as they are: `{ architecture, gui, use_cases }`, each the approved `report` text |
+| `response_language` | no | the user's language (default `English`) |
+| `elite_model` | no | model of the `elite-spec-author` (default `fable`). Pass it only when the user names one |
+
+`resumeFromRunId` does not inherit `args`: pass the same object again when resuming a run.
+
+### Read the result
+
+| key | meaning |
+|---|---|
+| `profile` | `'elite'` |
+| `topic` | the topic you passed |
+| `status` | `done` = every area arrived and passed the workflow's checks. `needs_input` / `blocked` = the author stopped to ask. `failed` = no usable report, or a report that claimed done with an area missing or malformed |
+| `architecture` | `{ report, diagrams_validated, unplaced_scope_items[] }`, or `null`. `report` has the `spec-architect` output format |
+| `gui` | `{ status: 'done', report, diagrams_validated, mock_files[], added_screens[] }` with `report` in the `spec-gui-designer` format; `{ status: 'skipped', skip_reason }` without screens; or `null` |
+| `use_cases` | `{ report, diagrams_validated, use_case_ids[], not_expressible[] }`, or `null`. `report` has the `spec-usecase-analyst` format |
+| `draft_spec` | the six-section specification draft (layout of section 5), or `null` |
+| `open_questions` | the author's questions for the user |
+| `problems` | why `status` is `failed`, one line per failed check; empty otherwise |
+| `warnings` | what you must carry to the user: unvalidated diagrams, unplaced scope items, added screens (proposals), scope items no use case realizes or the draft does not mention |
+| `elite_report` | the author's report as returned, for diagnosis; `null` when it crashed |
+
+Only `status: 'done'` is output you may present.
+
+- `needs_input` / `blocked`: put `open_questions` to the user (`AskUserQuestion`), then launch the
+  workflow again with the answer in `feedback`. The areas the result does carry are unapproved
+  drafts; do not present them as the phase result.
+- `failed`: tell the user what `problems` says and let them choose to re-run or stop. A re-run
+  is a new launch; the workflow never retries by itself.
+- Never fill the gap yourself and present it as the agent's result, and never hand-write a
+  missing area to get past a `failed` run.
+- Relay every line of `warnings`, whatever the status.
+
+### Gates on an elite result
+
+The result holds all three areas, but the user still approves them one at a time. Run the gates
+in phase order, each with `AskUserQuestion` and the options of its section:
+
+1. **Phase 1 gate** — check `architecture.report` against the content rules of section 2, save
+   the intermediate document as section 2 step 4 says, present, gate. *Change it*: launch the
+   workflow again with the user's words verbatim in `feedback` and the last result in
+   `previous_output`. Nothing is approved yet, so every area is regenerated.
+2. **Phase 2 gate** — when `gui.status` is `skipped`, record "Phase 2 skipped: no GUI" as section
+   3 says and go on. Otherwise run the section 3 checks on `gui.report` and the files in
+   `gui.mock_files` (review checklist, cross-check, PNG for the PDF), save the intermediate
+   document, present, gate. *Change it*: launch again with `approved: { architecture }`, the
+   feedback and `previous_output`; the mocks, the transitions and the use cases are regenerated.
+3. **Phase 3 gate** — run the coverage check of section 4 on `use_cases.report`, present, gate. On
+   Approve create the specification document exactly as section 4 says. *Fix gaps or duplicates*:
+   launch again with `approved: { architecture, gui }` (leave `gui` out when Phase 2 was skipped).
+4. **Phase 4** — section 5 applies unchanged: you run the preflight, assemble, save, export and
+   hold the final gate. Assemble from the areas the user approved; `draft_spec` of the last run
+   is the starting text, not a substitute for the preflight. *Revise* at the final gate routes to
+   the owning phase as section 5 says, which here means launching again with the areas upstream
+   of that phase in `approved`.
+
+`approved` carries the `report` text exactly as the user approved it; the author returns it
+unchanged and builds the rest on it. Every launch is a new workflow run with one
+`elite-spec-author` per run; nothing else generates, and sections 2-4 are not mixed in to patch
+a single area with a Sonnet agent.
+
+Suspend and resume work as in `commands/spec-loop.md`. Add `profile=elite` to the session note so
+a resumed flow regenerates with the same profile.
 
 ## Rules
 

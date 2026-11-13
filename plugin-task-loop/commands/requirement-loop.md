@@ -53,6 +53,8 @@ without an explicit "approved" answer.
 | `coordinator_model` | `opus` | Model for this coordinator |
 | `worker_model` | `sonnet` | Set by the `requirement-worker` agent definition |
 | `reviewer_model` | `opus` | Set by the workflow (`requirement-reviewer`) |
+| `profile` | `standard` | Pipeline profile of the Phase 3-4 Workflow run. `elite` (opt-in) replaces every agent of the run with one `elite-requirement-author`; see "Pipeline profile" below |
+| `elite_model` | `fable` | Model of the `elite-requirement-author`; read under `elite` only. Omit it unless the user names a model for this run |
 | `max_rounds` | `2` | Max DRAFT/CHECK/REVIEW gate-loop rounds. Prefer `[trace.requirement_gate]` in config |
 | `checker_types` | `['iso29148','nfr','completeness']` | Checks each `requirement-checker` runs |
 | `skip_register` | `false` | `true` = skip the registrar stage (register only after the approval gates) |
@@ -70,6 +72,40 @@ skip_checks = []
 
 Read it with `handoff_get_config` and pass it through to the workflow **verbatim**
 (see Phase 3). Never translate or pre-filter it yourself.
+
+### Pipeline profile (`elite` is opt-in)
+
+The **pipeline profile** decides which agents the Phase 3-4 Workflow run launches. It is not
+the trace profile of Phase 0 (`[trace] profile`: `minimal` / `standard` / `full` / ...), which
+decides the V-model layers; the two are set and read separately.
+
+| Pipeline profile | Phase 3-4 run |
+|---|---|
+| `standard` (default), `express`, `full` | the multi-agent pipeline: workers, checkers, reviewer, registrar, test-spec-worker. This workflow has one such pipeline, so the three values run it identically |
+| `elite` | one `elite-requirement-author` (Fable) drafts, checks, reviews, fixes and registers every scope in a single context |
+
+Decide it once, before Phase 3. Stop at the first source that gives a value:
+
+1. **Explicit for this run** — the user named a profile in the `/requirement-loop` invocation
+   (`profile: elite`) or in the conversation ("author these with elite"). It wins over
+   `config.toml` in both directions, and applies to this run only: never write it back.
+2. **Configured default** — `handoff_get_config` -> `session_loop.profile`, the same key
+   `/session-loop` reads:
+   ```toml
+   [session_loop]
+   profile = "elite"
+   ```
+3. **Neither** — `standard`.
+
+`elite` is opt-in only: it comes from source 1 or 2 and is never chosen for the user because
+the scopes look large or the requirements look hard. A project that sets nothing behaves
+exactly as before.
+
+On an unknown value from either source (`profile = "fast"`), stop and ask the user which
+profile they meant. Do not guess or substitute one: the workflow rejects an unknown profile.
+
+Record the resolved profile in `reqflow_state` notes with where it came from, and state it
+when you present the Phase 3 plan. A resumed flow re-reads it the same way.
 
 ## Suspend and resume
 
@@ -429,10 +465,22 @@ Save `reqflow_state` (`nfr_doc_id`, `completed_phases: [0,1,2]`, `current_phase:
 
    > **Resuming a run**: `resumeFromRunId` does NOT auto-inherit `args`. Pass the same `args` again.
 
+   **Elite cost warning (`elite` only).** When the pipeline profile resolved above is `elite`,
+   show the user this warning before calling `Workflow()`:
+
+   > Elite profile uses the Fable model — costs ~3-5x more than standard. Proceeding with elite profile.
+
+   Show it for every run under `elite`, whether `elite` came from `config.toml` or from an
+   explicit request. It is information, not a question: do not wait for confirmation. Under any
+   other profile there is no warning. When you pass `elite_model`, name that model in the
+   warning in place of Fable.
+
    ```javascript
    Workflow({
      name: 'handoff-task-loop:requirement-execute',
      args: {
+       profile: '<pipeline profile>',        // as resolved under "Pipeline profile"; omit or 'standard' = the multi-agent pipeline
+       // elite_model: '<model>',            // elite only, and only when the user names a model for this run
        parent_task_id: '<parent task id>',
        scopes: [
          {
@@ -508,6 +556,8 @@ Save `reqflow_state` (`nfr_doc_id`, `completed_phases: [0,1,2]`, `current_phase:
    | `test_spec_check_reports[{round, doc_id, report}]` | ISO 29119 check of each scaffolded test-specification document: `report` is `{findings[], verdict}`, `null` = the checker crashed; `[]` when nothing was scaffolded |
    | `pending_followups[]` | unresolved BLOCKER/MAJOR findings, including `source: 'workflow'` crashes |
    | `requirement_log[]` | per-round trace |
+   | `profile` | `elite` only (absent otherwise): `'elite'` |
+   | `elite_report` | `elite` only (absent otherwise): the `elite-requirement-author` report as returned, before it was unpacked into the fields above; `null` = the agent crashed |
 
    > **A `null` report is a failure, never a pass.** A missing worker/checker/reviewer result
    > is a crashed agent, not an absence of defects.
@@ -621,6 +671,39 @@ A failure in steps 2-3 never un-registers anything: it leaves `registered: true`
 `pending_followups` (`source: 'workflow'` for a crashed agent or leftover `(TBD)` placeholders,
 `source: 'test_spec_checker'` for checker BLOCKER/MAJOR findings, each carrying its `doc_id`).
 Present them at Gate #4 with the other follow-ups and file them as `[req-followup]` tasks.
+
+#### Under the `elite` profile
+
+With `profile: 'elite'` the run launches **exactly one** agent, the `elite-requirement-author`,
+in place of the workers, checkers, reviewer, registrar and test-spec-worker. It receives every
+scope and runs the same stages in one context: decompose, check (`checker_types`), review across
+documents, and register (scaffold, tasks, test specifications and their ISO/IEC/IEEE 29119 check).
+The result has the same fields, so Gates #3 and #4 and Phase 5 read it as described above. What
+differs:
+
+- **`max_rounds` bounds the agent's own quality loop**, not a number of launches. The agent is
+  not relaunched: findings still open after `max_rounds` rounds come back in `pending_followups`
+  and nothing is registered. `rounds` is the number of rounds the agent reports.
+- **`worker_reports`, `checker_reports`, `review_report`** are unpacked from the one report and
+  show the **final** state: one entry per scope with `round` = `rounds`, listing only the findings
+  still open. Findings the agent fixed along the way are in `elite_report.resolved`, so Gate #3
+  has no separate first-round view; present the final documents and the fixed list instead.
+- **`skip_register` and `stop_after`** select the stages the agent runs, exactly as they cut the
+  multi-agent pipeline, and the approval gates before registration hold. If the agent registers
+  anyway, the result says `registered: true` with a BLOCKER entry in `pending_followups`:
+  review or cancel those tasks through the `reqflow` parent task.
+- **The gate is recomputed, not taken on trust.** No second agent reads the author's verdicts, so
+  the workflow overrides a `PASS` that stands next to an open finding at or above `fail_on`, and
+  a missing document, self-check or review verdict fails the run (`source: 'workflow'`).
+- **`pending_followups[].source`** still names the stage a finding came from (`checker`,
+  `reviewer`, `test_spec_checker`, `workflow`); under `elite` those stages were all run by the
+  one author.
+- **`profile: 'elite'` and `elite_report`** are present only on an elite result.
+
+"Send a scope back" and "Run another targeted round" start a new run for the named scopes, as
+under the other profiles; keep the same pipeline profile unless the user changes it. Step 5 of
+Phase 3 applies unchanged: independently verify the trees and lint counts yourself. Under
+`elite` this is the only check made by anyone other than the author.
 
 ---
 
