@@ -65,10 +65,13 @@ export const meta = {
 //   stream_b: { status, scope, investigations[], failed_areas[], deferred_areas[], synthesis },
 //   review,                           // null when the reviewer failed or there was nothing to review
 //   warnings: string[],
-//   research_log: [{ stream, step, status }],
+//   research_log: [{ stream, step, status, profile }],  // profile = the resolved profile, on every entry
 //
 //   // elite only (absent under every other profile):
 //   profile: 'elite',
+//   model,                            // the model the elite-investigator ran on
+//   token_usage,                      // the usage metadata it returned with its result, as it gave
+//                                     //   it; null when it returned none
 //   elite_self_review,                // the elite-investigator's own risk-rated self-review
 //                                     //   { risks[], showstoppers[], unexamined[], ... }, or null when
 //                                     //   it returned none. A self-assessment: `review` above is the
@@ -154,6 +157,11 @@ const ELITE_AGENT_LABEL = 'elite-investigator';
 const ELITE_AGENT_TYPE = 'handoff-task-loop:elite-investigator';
 const ELITE_DEFAULT_MODEL = 'fable';
 const ELITE_MODEL = elite_model || ELITE_DEFAULT_MODEL;
+// What the one elite-investigator consolidates, in the order it is asked for
+// them. The workflow cannot watch them run inside one launch: it names them
+// before the launch and logs how each ended after it.
+const ELITE_STAGES = ['stream_a', 'stream_b', 'self_review'];
+const ELITE_STAGE_NOT_REPORTED = 'not reported';
 const MAX_REG_INVESTIGATORS = max_regulatory_investigators || 6;
 
 const DEFAULT_TECH_INVESTIGATIONS = [
@@ -852,6 +860,23 @@ function mapEliteStreamB(raw) {
   };
 }
 
+// --- BEGIN COPY: elite-usage (source: lib/elite-report.js) ---
+// lib/elite-report.js is mirrored into session-execute.js only, so this helper is
+// copied here by hand. lib/elite-observability.test.js evaluates this block and
+// fails when it disagrees with the lib on any input.
+/**
+ * The usage metadata an agent returned with its result, or null when it returned
+ * none. It is passed on for the coordinator to display and is never computed
+ * with: a non-negative number, or an object, as the agent gave it.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+// --- END COPY: elite-usage ---
+
 async function runEliteInvestigation() {
   const raw = await agent(buildEliteInvestigatorPrompt(), {
     label: ELITE_AGENT_LABEL,
@@ -875,7 +900,7 @@ async function runEliteInvestigation() {
       warnings.push(`The ${ELITE_AGENT_LABEL} returned no usable adversarial self-review.`);
     }
   }
-  return { streamA, streamB, selfReview };
+  return { streamA, streamB, selfReview, tokenUsage: eliteTokenUsage(raw) };
 }
 
 // ============================================================
@@ -960,12 +985,21 @@ let streamB;
 // Elite only: the elite-investigator's self-review, handed to the reviewer and
 // returned next to the reviewer's own `review`.
 let eliteSelfReview = null;
+// Elite only: the usage metadata the elite-investigator returned, if any.
+let eliteUsage = null;
 if (SINGLE_AGENT_MODE) {
   log(
     `Brainstorm ${brainstorm_id}: one ${ELITE_AGENT_LABEL} covers Stream A (${TECH_FACETS.length} facets) and ` +
       `Stream B${skip_regulatory ? ' (skipped)' : ''} | profile ${PROFILE}...`,
   );
-  ({ streamA, streamB, selfReview: eliteSelfReview } = await runEliteInvestigation());
+  log(`--- Elite stages | ${ELITE_STAGES.join(' -> ')} ---`);
+  ({ streamA, streamB, selfReview: eliteSelfReview, tokenUsage: eliteUsage } = await runEliteInvestigation());
+  const eliteOutcomes = {
+    stream_a: streamA.status,
+    stream_b: streamB.status,
+    self_review: eliteSelfReview ? 'reported' : ELITE_STAGE_NOT_REPORTED,
+  };
+  for (const stage of ELITE_STAGES) log(`Elite | ${stage}: ${eliteOutcomes[stage]}`);
 } else {
   log(`Brainstorm ${brainstorm_id}: Stream A (${TECH_FACETS.length} investigators) and Stream B run in parallel...`);
 
@@ -1015,7 +1049,11 @@ return {
   stream_b: streamB,
   review,
   warnings,
-  research_log: researchLog,
+  // Every entry names the profile it was logged under, so the log identifies an
+  // elite run on its own.
+  research_log: researchLog.map((entry) => ({ ...entry, profile: PROFILE })),
   // Elite only, so a result from any other profile keeps exactly the keys above.
-  ...(SINGLE_AGENT_MODE ? { profile: PROFILE, elite_self_review: eliteSelfReview } : {}),
+  ...(SINGLE_AGENT_MODE
+    ? { profile: PROFILE, elite_self_review: eliteSelfReview, model: ELITE_MODEL, token_usage: eliteUsage }
+    : {}),
 };

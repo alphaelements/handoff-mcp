@@ -51,6 +51,36 @@ const ELITE_FINDING_SEVERITIES = Object.freeze(['BLOCKER', 'MAJOR', 'MINOR', 'NI
  */
 const ELITE_DEFAULT_SEVERITY = 'MAJOR';
 
+/**
+ * The seven stages the elite-developer runs for each task, in order: the
+ * `#### <stage>` sections of its report (agents/elite-developer.md).
+ */
+const ELITE_STAGES = Object.freeze([
+  'spec_check',
+  'implementation',
+  'adversarial_test',
+  'full_suite',
+  'review',
+  'fix_loop',
+  'spec_reconcile',
+]);
+
+/**
+ * The `- status:` values each stage may report. `fix_loop` has no status line:
+ * it reports counts, which eliteStageStatus() reads instead.
+ */
+const ELITE_STAGE_STATUSES = Object.freeze({
+  spec_check: Object.freeze(['pass', 'warn']),
+  implementation: Object.freeze(['pass', 'fail']),
+  adversarial_test: Object.freeze(['pass', 'findings']),
+  full_suite: Object.freeze(['pass', 'fail']),
+  review: Object.freeze(['approve', 'request_changes']),
+  spec_reconcile: Object.freeze(['pass', 'updated']),
+});
+
+/** How a stage with no readable result is shown in the progress log. */
+const ELITE_STAGE_NOT_REPORTED = 'not reported';
+
 /** Index of the task a `## dev result:` heading names, or -1. Whole-id match: t1 is not t12. */
 function eliteBlockOwner(headingRest, taskIds) {
   let best = -1;
@@ -230,18 +260,18 @@ function parseEliteTaskBlock(block, taskId, taskIds) {
     status: statusLine ? eliteEnumValue(statusLine[1], ['done', 'needs_more_work', 'blocked']) : null,
     full_suite: {
       text: fullSuite,
-      status: eliteEnumValue(eliteFieldValue(fullSuite, 'status'), ['pass', 'fail']),
+      status: eliteEnumValue(eliteFieldValue(fullSuite, 'status'), ELITE_STAGE_STATUSES.full_suite),
       passed: eliteIntValue(eliteFieldValue(fullSuite, 'passed')),
       failed: eliteIntValue(eliteFieldValue(fullSuite, 'failed')),
       skipped: eliteIntValue(eliteFieldValue(fullSuite, 'skipped')),
     },
     review: {
       text: review,
-      status: eliteEnumValue(eliteFieldValue(review, 'status'), ['approve', 'request_changes']),
+      status: eliteEnumValue(eliteFieldValue(review, 'status'), ELITE_STAGE_STATUSES.review),
     },
     adversarial_test: {
       text: adversarial,
-      status: eliteEnumValue(eliteFieldValue(adversarial, 'status'), ['pass', 'findings']),
+      status: eliteEnumValue(eliteFieldValue(adversarial, 'status'), ELITE_STAGE_STATUSES.adversarial_test),
     },
     fix_loop: {
       text: fixLoop,
@@ -455,12 +485,137 @@ function extractEliteReworkNotes(integrationReport, reviewReport, taskIds, round
   return notes;
 }
 
+// ------------------------------------------------------------
+// Observability: what the one agent says about its own stages
+// ------------------------------------------------------------
+// The workflow launches the elite-developer once per round and cannot see a
+// stage begin or end. What it can show is read from the report afterwards. As
+// with the verdicts above, nothing is guessed: a stage the report does not
+// answer for is null, and the caller shows it as not reported.
+
+/**
+ * The result one stage of one task block reports, or null when the block has no
+ * readable answer for it. `fix_loop` reports how far it went, since it has no
+ * status of its own.
+ */
+function eliteStageStatus(block, stage) {
+  if (typeof block !== 'string') return null;
+  const section = eliteStageSection(block, stage);
+  if (section === null) return null;
+  if (stage === 'fix_loop') {
+    const iterations = eliteIntValue(eliteFieldValue(section, 'iterations'));
+    if (iterations === null || iterations < 0) return null;
+    return `${iterations} iteration(s), ${eliteListField(section, 'unresolved').length} unresolved`;
+  }
+  return eliteEnumValue(eliteFieldValue(section, 'status'), ELITE_STAGE_STATUSES[stage] || []);
+}
+
+/**
+ * `{ task_id, stage, status }` for every task and every stage, in task order,
+ * then stage order (`blocks[i]` belongs to `taskIds[i]`; see splitEliteReport).
+ * `status` is null for a stage that was not reported, and a task without a block
+ * still has its seven entries.
+ */
+function eliteStageProgress(blocks, taskIds) {
+  const ids = Array.isArray(taskIds) ? taskIds : [];
+  const progress = [];
+  ids.forEach((id, i) => {
+    const block = Array.isArray(blocks) ? blocks[i] : null;
+    for (const stage of ELITE_STAGES) progress.push({ task_id: id, stage, status: eliteStageStatus(block, stage) });
+  });
+  return progress;
+}
+
+/**
+ * The `- elapsed_ms:` a stage section reports, as a whole number of
+ * milliseconds, or null. Only a plain non-negative number counts, with `ms` as
+ * the one unit allowed after it and no other word following: `90s` or `1.5 min`
+ * read as milliseconds would be wrong by orders of magnitude, so they are not
+ * read at all. A remark in brackets after the number is fine.
+ */
+function eliteStageElapsedMs(block, stage) {
+  if (typeof block !== 'string') return null;
+  const raw = eliteFieldValue(eliteStageSection(block, stage), 'elapsed_ms');
+  if (raw === null) return null;
+  const m = raw.match(/^(\d+(?:\.\d+)?)(?:[ \t]*ms)?(?![ \t]*[\w.])/i);
+  return m ? Math.round(Number(m[1])) : null;
+}
+
+/**
+ * Wall-clock milliseconds per stage, summed over the given task blocks. Every
+ * stage of ELITE_STAGES is a key. A stage no block gives a time for is null,
+ * which means "not measured" and is not the same as 0.
+ *
+ * Pass the blocks as each launch returned them, not the per-task list the
+ * session keeps: a block carried over from an earlier round would be counted
+ * again.
+ */
+function eliteStageTimings(blocks) {
+  const timings = {};
+  for (const stage of ELITE_STAGES) {
+    let total = null;
+    for (const block of Array.isArray(blocks) ? blocks : []) {
+      const ms = eliteStageElapsedMs(block, stage);
+      if (ms !== null) total = (total === null ? 0 : total) + ms;
+    }
+    timings[stage] = total;
+  }
+  return timings;
+}
+
+/**
+ * The usage metadata an agent returned with its result, or null when it
+ * returned none. It is passed on for the manager to display and is never
+ * computed with: a non-negative number, or an object, as the agent gave it.
+ *
+ * Copied by hand into the four workflow scripts this file is not mirrored into
+ * (COPY: elite-usage); lib/elite-observability.test.js compares each copy with
+ * this function.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+
+/**
+ * The usage of a session that launched the agent more than once. A single
+ * reported usage is returned as it is. Several are totalled: numbers are added,
+ * objects are added field by field, and a field that is not a number is left
+ * out, since it has no total. Usages that cannot be added to each other (a
+ * number and an object) give null: an unknown total is reported as unknown, not
+ * as the last launch's share of it.
+ */
+function sumEliteTokenUsage(usages) {
+  const reported = (Array.isArray(usages) ? usages : []).filter((u) => u !== null && u !== undefined);
+  if (reported.length === 0) return null;
+  if (reported.length === 1) return reported[0];
+  if (reported.every((u) => typeof u === 'number')) return reported.reduce((sum, u) => sum + u, 0);
+  if (!reported.every((u) => typeof u === 'object')) return null;
+
+  const total = {};
+  for (const usage of reported) {
+    for (const [field, value] of Object.entries(usage)) {
+      if (typeof value === 'number' && Number.isFinite(value)) total[field] = (total[field] || 0) + value;
+    }
+  }
+  return total;
+}
+
 // --- END INLINE: elite-report ---
 
 export {
   ELITE_REPORT_SOURCE,
   ELITE_FINDING_SEVERITIES,
   ELITE_DEFAULT_SEVERITY,
+  ELITE_STAGES,
+  ELITE_STAGE_STATUSES,
+  ELITE_STAGE_NOT_REPORTED,
+  eliteStageProgress,
+  eliteStageTimings,
+  eliteTokenUsage,
+  sumEliteTokenUsage,
   splitEliteReport,
   parseEliteTaskBlock,
   deriveEliteVerdicts,

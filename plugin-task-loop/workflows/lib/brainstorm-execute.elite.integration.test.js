@@ -345,7 +345,7 @@ test('SPEC-ELITE-045 AC1 + AC5: elite keeps every standard result key and adds o
   for (const key of STANDARD_RESULT_KEYS) assert.ok(key in elite, `elite result.${key}`);
   assert.deepEqual(
     keys(elite).filter((k) => !STANDARD_RESULT_KEYS.includes(k)),
-    ['elite_self_review', 'profile'],
+    ['elite_self_review', 'model', 'profile', 'token_usage'],
   );
   assert.equal(elite.profile, 'elite');
   assert.equal(elite.brainstorm_id, 'bs-1');
@@ -445,17 +445,19 @@ test('SPEC-ELITE-045 AC4: unusable investigator output fails closed without thro
 
 test('research_log records the elite investigation, the derived streams, and the review', async () => {
   const r = await run(eliteArgs());
+  // Every entry also names the profile it was logged under (SPEC-ELITE-093).
+  const profile = 'elite';
   assert.deepEqual(r.research_log, [
-    { stream: 'elite', step: 'investigate', status: 'complete' },
-    { stream: 'A', step: 'investigate', status: 'complete' },
-    { stream: 'B', step: 'scope', status: 'complete' },
-    { stream: 'B', step: 'investigate', status: 'complete' },
-    { stream: 'B', step: 'synthesis', status: 'complete' },
-    { stream: 'review', step: 'review', status: 'complete' },
+    { stream: 'elite', step: 'investigate', status: 'complete', profile },
+    { stream: 'A', step: 'investigate', status: 'complete', profile },
+    { stream: 'B', step: 'scope', status: 'complete', profile },
+    { stream: 'B', step: 'investigate', status: 'complete', profile },
+    { stream: 'B', step: 'synthesis', status: 'complete', profile },
+    { stream: 'review', step: 'review', status: 'complete', profile },
   ]);
   const crashed = await run(eliteArgs(), { elite: () => { throw new Error('x'); } });
-  assert.deepEqual(crashed.research_log[0], { stream: 'elite', step: 'investigate', status: 'failed' });
-  assert.deepEqual(crashed.research_log.at(-1), { stream: 'review', step: 'review', status: 'skipped' });
+  assert.deepEqual(crashed.research_log[0], { stream: 'elite', step: 'investigate', status: 'failed', profile });
+  assert.deepEqual(crashed.research_log.at(-1), { stream: 'review', step: 'review', status: 'skipped', profile });
 });
 
 // ---------------- fail closed: partial investigator output ----------------

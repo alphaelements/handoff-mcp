@@ -528,7 +528,10 @@ The workflow returns:
 | `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
 | `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged. Under `elite` the `source` is `elite-developer` |
 | `elite_report` | string\|null | `elite` only (absent otherwise): the last elite-developer report as returned, before it was cut into `dev_reports`. Read it when a `dev_reports` entry is `null` |
-| `session_log` | object[] | per-round trace |
+| `model` | string | `elite` only (absent otherwise): the model the elite-developer ran on (`elite_model`, default `fable`). Name it when you report what the session cost |
+| `token_usage` | number\|object\|null | `elite` only (absent otherwise): the usage metadata the elite-developer launches returned, totalled over the rounds. `null` = no launch returned any, which is not "zero tokens". Report it as it is; the workflow does not convert it into a cost |
+| `stage_timings` | object | `elite` only (absent otherwise): wall-clock milliseconds per internal stage `{ spec_check, implementation, adversarial_test, full_suite, review, fix_loop, spec_reconcile }`, as the elite-developer stated them in its report (`- elapsed_ms:`), summed over tasks and rounds. All seven keys are always present; `null` = the agent did not time that stage. `timing.elapsed_ms` is the whole run, measured by the workflow |
+| `session_log` | object[] | per-round trace. Every entry carries `profile`, the resolved profile, so an entry of an elite session reads `profile: 'elite'` |
 
 > **`passed: true` means less under a shallower profile.** Under `express` it means the
 > developer's own gates passed — no independent verification ran. Read `stages_run`.

@@ -872,7 +872,10 @@ test('elite: the result has every key a standard result has, with reports the pi
 
   const harnessKeys = ['calls', 'prompts', 'agentOpts'];
   const keys = (r) => Object.keys(r).filter((k) => !harnessKeys.includes(k)).sort();
-  assert.deepEqual(keys(elite).filter((k) => k !== 'elite_report'), keys(standard), 'elite adds no key but the optional elite_report');
+  // Optional, elite-only: the unsplit report, and what the launch cost (SPEC-ELITE-095 / 096).
+  const eliteOnlyKeys = ['elite_report', 'model', 'token_usage', 'stage_timings'];
+  assert.deepEqual(keys(elite).filter((k) => !eliteOnlyKeys.includes(k)), keys(standard), 'elite adds no key but the optional elite-only ones');
+  assert.deepEqual(keys(elite).filter((k) => !keys(standard).includes(k)), [...eliteOnlyKeys].sort());
   for (const key of ['dev_reports', 'integration_report', 'review_report', 'pending_followups', 'closer_report']) {
     assert.ok(key in elite, key);
   }

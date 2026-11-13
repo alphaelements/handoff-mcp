@@ -92,10 +92,13 @@ export const meta = {
 //   verification_reports[],           // one per verifier assignment; under elite one per FACET
 //   gate_report, draft_report, review_report,
 //   review_escalation,                // null unless the document was approved with caveats
-//   research_log[],
+//   research_log[],                   // every entry carries `profile`, the resolved profile
 //
 //   // elite only (absent under every other profile):
 //   profile: 'elite',
+//   model,                            // the model the elite-researcher ran on
+//   token_usage,                      // the usage metadata it returned with its result, as it gave
+//                                     //   it; null when it returned none
 //   warnings: string[],               // every degradation the mapping of the single report found
 // }
 
@@ -212,6 +215,10 @@ const ELITE_AGENT_LABEL = 'elite-researcher';
 const ELITE_AGENT_TYPE = 'handoff-task-loop:elite-researcher';
 const ELITE_DEFAULT_MODEL = 'fable';
 const ELITE_MODEL = elite_model || ELITE_DEFAULT_MODEL;
+// The five phases the one elite-researcher consolidates, in order. The workflow
+// cannot watch them run inside one launch: it names them before the launch and
+// logs how each ended after it.
+const ELITE_STAGES = ['investigate', 'verify', 'gate', 'draft', 'review'];
 const MAX_INV_ROUNDS = max_investigation_rounds || 2;
 const MAX_REV_ROUNDS = max_revision_rounds || 2;
 
@@ -895,10 +902,30 @@ function reportedRounds(name, value, floor, limit, unit, eliteWarnings) {
   return value;
 }
 
+// --- BEGIN COPY: elite-usage (source: lib/elite-report.js) ---
+// lib/elite-report.js is mirrored into session-execute.js only, so this helper is
+// copied here by hand. lib/elite-observability.test.js evaluates this block and
+// fails when it disagrees with the lib on any input.
+/**
+ * The usage metadata an agent returned with its result, or null when it returned
+ * none. It is passed on for the coordinator to display and is never computed
+ * with: a non-negative number, or an object, as the agent gave it.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+// --- END COPY: elite-usage ---
+
 const eliteWarnings = [];
+// The usage metadata the elite-researcher returned, if any.
+let eliteUsage = null;
 if (SINGLE_AGENT_MODE) {
   phase('Elite');
   log(`--- Elite | ${research_topic} | profile ${PROFILE} | ${plural(facets.length, 'facet')} ---`);
+  log(`--- Elite stages | ${ELITE_STAGES.join(' -> ')} ---`);
 
   const eliteResult = await agent(buildEliteResearcherPrompt(), {
     label: ELITE_AGENT_LABEL,
@@ -908,6 +935,7 @@ if (SINGLE_AGENT_MODE) {
     schema: ELITE_RESEARCH_SCHEMA,
   });
   const usableResult = eliteResult !== null && typeof eliteResult === 'object' && !Array.isArray(eliteResult);
+  eliteUsage = eliteTokenUsage(eliteResult);
 
   if (!usableResult) {
     // Nothing was reported, so no round is known to have completed.
@@ -1001,6 +1029,18 @@ if (SINGLE_AGENT_MODE) {
         `${eliteWarnings.length > 0 ? ` (${plural(eliteWarnings.length, 'warning')})` : ''}.`,
     );
   }
+
+  // How each consolidated phase ended, as the workflow decided it, not as the
+  // agent claimed it: a PASS that was overridden above reads "not passed" here.
+  const coveredFacets = (reports) => `${reports.filter((r) => r !== null).length}/${facets.length} facet(s)`;
+  const eliteOutcomes = {
+    investigate: coveredFacets(investigationResults),
+    verify: coveredFacets(verificationResults),
+    gate: gatePassed ? 'passed' : 'not passed',
+    draft: draftResult ? 'reported' : 'not reported',
+    review: documentApproved ? 'approved' : 'not approved',
+  };
+  for (const stage of ELITE_STAGES) log(`Elite | ${stage}: ${eliteOutcomes[stage]}`);
 }
 
 // ============================================================
@@ -1021,7 +1061,11 @@ return {
   draft_report: draftResult,
   review_report: reviewResult,
   review_escalation: reviewEscalation,
-  research_log: researchLog,
+  // Every entry names the profile it was logged under, so the log identifies an
+  // elite run on its own.
+  research_log: researchLog.map((entry) => ({ ...entry, profile: PROFILE })),
   // Elite only, so a result from any other profile keeps exactly the keys above.
-  ...(SINGLE_AGENT_MODE ? { profile: PROFILE, warnings: eliteWarnings } : {}),
+  ...(SINGLE_AGENT_MODE
+    ? { profile: PROFILE, warnings: eliteWarnings, model: ELITE_MODEL, token_usage: eliteUsage }
+    : {}),
 };

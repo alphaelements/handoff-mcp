@@ -648,6 +648,32 @@ function buildTestSpecWorkerPrompt(scaffoldDocIds, sourceDocIds, projectDir) {
 // coordinator places before registration hold under elite too.
 const ELITE_RUNS_CHECK = STOP_AFTER !== 'elicit';
 const ELITE_RUNS_REVIEW = STOP_AFTER === 'review' || STOP_AFTER === 'register';
+// The same list by name, for the progress log. The workflow cannot watch the
+// stages run inside one launch: it names them before the launch and logs how
+// each ended after it.
+const ELITE_STAGES = [
+  'draft',
+  ...(ELITE_RUNS_CHECK ? ['check'] : []),
+  ...(ELITE_RUNS_REVIEW ? ['review'] : []),
+  ...(RUN_REGISTER ? ['register'] : []),
+];
+
+// --- BEGIN COPY: elite-usage (source: lib/elite-report.js) ---
+// lib/elite-report.js is mirrored into session-execute.js only, so this helper is
+// copied here by hand. lib/elite-observability.test.js evaluates this block and
+// fails when it disagrees with the lib on any input.
+/**
+ * The usage metadata an agent returned with its result, or null when it returned
+ * none. It is passed on for the coordinator to display and is never computed
+ * with: a non-negative number, or an object, as the agent gave it.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+// --- END COPY: elite-usage ---
 
 function buildEliteAuthorPrompt() {
   const stages = [
@@ -796,6 +822,7 @@ const eliteFollowups = []; // BLOCKER follow-ups the workflow raises about the e
 if (SINGLE_AGENT_MODE) {
   phase(ELITE_PHASE);
   log(`--- Elite | ${scopes.length} scope(s) | one ${ELITE_AGENT_LABEL} (${ELITE_MODEL}) | quality loop <= ${MAX_ROUNDS} round(s) ---`);
+  log(`--- Elite stages | ${ELITE_STAGES.join(' -> ')} ---`);
 
   const result = await agent(buildEliteAuthorPrompt(), {
     label: ELITE_AGENT_LABEL,
@@ -847,6 +874,7 @@ if (SINGLE_AGENT_MODE) {
   const incomplete = scopes.filter((s) => state.get(s.id).unresolved.length > 0);
 
   // ---------- gate ----------
+  let gateVerdict = null; // the verdict the gate below settles on; null when the review stage does not run
   if (!ELITE_RUNS_REVIEW) {
     stoppedEarly = true;
     requirementLog.push({ round, phase: STOP_AFTER, stopped: true });
@@ -883,6 +911,7 @@ if (SINGLE_AGENT_MODE) {
       }
     }
     passed = verdict === 'PASS';
+    gateVerdict = verdict;
 
     const overBudget = round > MAX_ROUNDS;
     if (overBudget) log(`The ${ELITE_AGENT_LABEL} reports ${round} round(s), over the limit of ${MAX_ROUNDS}.`);
@@ -916,6 +945,17 @@ if (SINGLE_AGENT_MODE) {
       `the tasks and verification items it created rest on unapproved requirements and need review`;
   }
   if (registered || (passed && RUN_REGISTER)) requirementLog.push({ round, phase: 'register', registered });
+
+  // How each stage ended, as the workflow decided it, not as the author claimed
+  // it: a PASS the backstop above overrode reads REDO here.
+  const scopesWith = (key) => `${scopes.filter((s) => state.get(s.id)[key]).length}/${scopes.length}`;
+  const eliteOutcomes = {
+    draft: `${scopesWith('draft')} document(s)`,
+    check: `${scopesWith('check')} self-check(s)`,
+    review: gateVerdict,
+    register: registered ? 'registered' : 'not registered',
+  };
+  for (const stage of ELITE_STAGES) log(`Elite | ${stage}: ${eliteOutcomes[stage]}`);
 
   if (registrationViolation) {
     eliteFollowups.push(registrationViolation);
@@ -1283,9 +1323,14 @@ return {
   test_spec_report: testSpecReport,
   test_spec_check_reports: testSpecCheckReports,
   pending_followups: pendingFollowups,
-  requirement_log: requirementLog,
-  // elite only (both keys are absent under the other profiles): the profile that
-  // ran, and the author's report as it was returned, before it was unpacked into
-  // the stage reports above.
-  ...(SINGLE_AGENT_MODE ? { profile: PROFILE, elite_report: eliteReport } : {}),
+  // Every entry names the profile it was logged under, so the log identifies an
+  // elite run on its own.
+  requirement_log: requirementLog.map((entry) => ({ ...entry, profile: PROFILE })),
+  // elite only (these keys are absent under the other profiles): the profile that
+  // ran, the author's report as it was returned, before it was unpacked into the
+  // stage reports above, the model the author ran on, and the usage metadata it
+  // returned with its report (null when it returned none).
+  ...(SINGLE_AGENT_MODE
+    ? { profile: PROFILE, elite_report: eliteReport, model: ELITE_MODEL, token_usage: eliteTokenUsage(eliteReport) }
+    : {}),
 };

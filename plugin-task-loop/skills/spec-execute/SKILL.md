@@ -448,6 +448,8 @@ Workflow({
 | `problems` | why `status` is `failed`, one line per failed check; empty otherwise |
 | `warnings` | what you must carry to the user: unvalidated diagrams, unplaced scope items, added screens (proposals), scope items no use case realizes or the draft does not mention |
 | `elite_report` | the author's report as returned, for diagnosis; `null` when it crashed |
+| `model` | the model the elite-spec-author ran on (`elite_model`, default `fable`) |
+| `token_usage` | the usage metadata the author returned with its report, as it gave it; `null` when it returned none (not "zero tokens") |
 
 Only `status: 'done'` is output you may present.
 

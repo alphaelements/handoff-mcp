@@ -401,7 +401,7 @@ test('approved artifacts are passed as "keep as is" and named in the input', asy
 
 const RESULT_KEYS = [
   'profile', 'topic', 'status', 'architecture', 'gui', 'use_cases', 'draft_spec',
-  'open_questions', 'problems', 'warnings', 'elite_report',
+  'open_questions', 'problems', 'warnings', 'elite_report', 'model', 'token_usage',
 ];
 
 test('happy path: all three areas and the draft are returned under status done', async () => {

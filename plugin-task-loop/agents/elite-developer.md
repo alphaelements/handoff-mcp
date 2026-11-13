@@ -247,15 +247,18 @@ logs each block's figure against its task, so the blocks add up to your total.
 
 #### spec_check
 - status: pass|warn
+- elapsed_ms: <milliseconds; optional>
 - notes: <ambiguities, the reading you chose and why; "None" if none>
 
 #### implementation
 - status: pass|fail
+- elapsed_ms: <milliseconds; optional>
 - files_changed: [<path:line-range — what/why>, ...]
 - tests_added: [<file:test_name — what it verifies>, ...]
 
 #### adversarial_test
 - status: pass|findings
+- elapsed_ms: <milliseconds; optional>
 - findings:
   - severity: BLOCKER|MAJOR|MINOR
     description: <what the suite failed to guarantee, and how you showed it>
@@ -264,6 +267,7 @@ logs each block's figure against its task, so the blocks add up to your total.
 
 #### full_suite
 - status: pass|fail
+- elapsed_ms: <milliseconds; optional>
 - passed: N
 - failed: N
 - skipped: N
@@ -271,17 +275,20 @@ logs each block's figure against its task, so the blocks add up to your total.
 
 #### review
 - status: approve|request_changes
+- elapsed_ms: <milliseconds; optional>
 - findings:
   - severity: BLOCKER|MAJOR|MINOR
     description: <the problem and where it is>
 
 #### fix_loop
 - iterations: N
+- elapsed_ms: <milliseconds; optional>
 - resolved: [<finding — how it was fixed, and the test that now guards it>, ...]
 - unresolved: [<finding — why it is still open>, ...]
 
 #### spec_reconcile
 - status: pass|updated
+- elapsed_ms: <milliseconds; optional>
 - changes: [<spec or document — what changed, or "UNRESOLVED: <discrepancy>">, ...]
 
 ### Plan
@@ -360,3 +367,9 @@ How to fill the stage fields:
   the affected criteria `met: false`.
 - **Every `unresolved` entry is repeated under `### pendingFollowups`.** That section is how
   open work reaches the manager's backlog.
+- **`elapsed_ms` is optional.** It is the wall-clock time the stage took in this launch, in
+  milliseconds, for this task. Write it only when you measured it (for example with
+  `date +%s%3N` at the start and the end of the stage), as the number alone, and leave the
+  line out otherwise: an estimate is worse than no figure. The workflow adds the figures up
+  per stage and reports them to the manager as `stage_timings`. It reads no verdict from
+  them.

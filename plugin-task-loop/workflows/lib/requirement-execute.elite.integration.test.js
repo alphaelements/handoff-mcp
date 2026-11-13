@@ -460,7 +460,7 @@ test('an unusable round count falls back to 1: a returned document proves one ro
 
 test('elite returns every key the multi-agent run returns, plus the elite markers', async () => {
   const r = await run(eliteArgs());
-  assert.deepEqual(resultKeys(r), [...STANDARD_RESULT_KEYS, 'profile', 'elite_report']);
+  assert.deepEqual(resultKeys(r), [...STANDARD_RESULT_KEYS, 'profile', 'elite_report', 'model', 'token_usage']);
   assert.equal(r.profile, 'elite');
   assert.deepEqual(r.elite_report, okElite());
 });
@@ -495,11 +495,13 @@ test('happy path: both scopes drafted, self-checked, reviewed and registered', a
 
 test('requirement_log records the elite round, the registration and the test-specification steps', async () => {
   const r = await run(eliteArgs(), okElite({ resolved: ['RQ-A-001: added a measurable threshold'] }));
+  // Every entry also names the profile it was logged under (SPEC-ELITE-093).
+  const profile = 'elite';
   assert.deepEqual(r.requirement_log, [
-    { round: 1, phase: 'elite', verdict: 'PASS', findings: 0, resolved: 1, over_budget: false },
-    { round: 1, phase: 'register', registered: true },
-    { round: 1, phase: 'test_spec', completed: true },
-    { round: 1, phase: 'test_spec_check', checked: 2, total: 2 },
+    { round: 1, phase: 'elite', verdict: 'PASS', findings: 0, resolved: 1, over_budget: false, profile },
+    { round: 1, phase: 'register', registered: true, profile },
+    { round: 1, phase: 'test_spec', completed: true, profile },
+    { round: 1, phase: 'test_spec_check', checked: 2, total: 2, profile },
   ]);
 });
 
@@ -654,7 +656,7 @@ test('a converged run the author did not register is approved but not registered
   assert.equal(r.passed, true);
   assert.equal(r.registered, false);
   assert.equal(r.registrar_report, null);
-  assert.deepEqual(r.requirement_log.filter((e) => e.phase === 'register'), [{ round: 1, phase: 'register', registered: false }]);
+  assert.deepEqual(r.requirement_log.filter((e) => e.phase === 'register'), [{ round: 1, phase: 'register', registered: false, profile: 'elite' }]);
   assert.ok(r.logs.some((l) => /NOT registered/.test(l)));
 });
 
@@ -727,7 +729,7 @@ test('stop_after=elicit: decomposition only, and a missing check or review is no
   assert.deepEqual(r.checker_reports, []);
   assert.equal(r.review_report, null);
   assert.deepEqual(r.pending_followups, []);
-  assert.deepEqual(r.requirement_log, [{ round: 1, phase: 'elicit', stopped: true }]);
+  assert.deepEqual(r.requirement_log, [{ round: 1, phase: 'elicit', stopped: true, profile: 'elite' }]);
 });
 
 test('stop_after=elicit still reports a scope that got no document', async () => {
@@ -748,7 +750,7 @@ test('stop_after=check: decomposition and one self-check, no review and no regis
   assert.equal(r.checker_reports.length, 2);
   assert.equal(r.review_report, null);
   assert.deepEqual(r.pending_followups.map((f) => [f.source, f.severity]), [['checker', 'MAJOR']]);
-  assert.deepEqual(r.requirement_log, [{ round: 1, phase: 'check', stopped: true }]);
+  assert.deepEqual(r.requirement_log, [{ round: 1, phase: 'check', stopped: true, profile: 'elite' }]);
 });
 
 test('stop_after=review: the whole quality loop runs and passes, registration does not', async () => {
@@ -796,7 +798,7 @@ test('leftover (TBD) placeholders and open test-specification findings become fo
   assert.ok(msgs.some((m) => /2 \(TBD\) placeholder\(s\) remain/.test(m)));
   assert.ok(msgs.includes('(TBD) left in steps'));
   assert.ok(msgs.some((m) => /doc-system-test/.test(m) && /unverified/.test(m)));
-  assert.deepEqual(r.requirement_log.at(-1), { round: 1, phase: 'test_spec_check', checked: 1, total: 2 });
+  assert.deepEqual(r.requirement_log.at(-1), { round: 1, phase: 'test_spec_check', checked: 1, total: 2, profile: 'elite' });
 });
 
 test('no scaffolded documents: the test-specification step is skipped entirely', async () => {

@@ -178,8 +178,10 @@ All fields are always present.
 | `review` | `{verdict, risks[{severity, axis, description, evidence, mitigation, decision_needed_from_user?}], showstoppers[], unexamined[], cross_stream_conflicts?, conditions?}` or `null` |
 | `review.verdict` | `PROCEED`, `PROCEED_WITH_CONDITIONS`, or `RECONSIDER` |
 | `warnings[]` | every degradation, in plain words |
-| `research_log[]` | `{stream, step, status}` trail (under `elite`, a `stream: 'elite'` entry for the single launch precedes the A and B entries derived from its report) |
+| `research_log[]` | `{stream, step, status, profile}` trail; `profile` is the resolved profile on every entry (under `elite`, a `stream: 'elite'` entry for the single launch precedes the A and B entries derived from its report) |
 | `profile` | `elite` only (absent otherwise): `'elite'` |
+| `model` | `elite` only (absent otherwise): the model the elite-investigator ran on (`elite_model`, default `fable`) |
+| `token_usage` | `elite` only (absent otherwise): the usage metadata the elite-investigator returned with its result, as it gave it; `null` when it returned none (not "zero tokens") |
 | `elite_self_review` | `elite` only (absent otherwise): the elite-investigator's own `{risks[], showstoppers[], unexamined[], cross_stream_conflicts?}`, or `null` when it returned none. A self-assessment, not a review: `review` is the independent reviewer's and wins where the two disagree |
 
 Under `elite` the stream fields are derived from the one report: `stream_a.failed_facets[]` and

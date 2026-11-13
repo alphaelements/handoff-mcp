@@ -2052,6 +2052,9 @@ function buildElitePrompt(taskList, context, maxRounds, currentRound = 1) {
     `- The verdicts are read from each block: the \`#### full_suite\` status, the \`#### review\` status,`,
     `  \`fix_loop\` unresolved, and \`### pendingFollowups\`. Anything left open relaunches an elite-developer with`,
     `  those findings while rounds remain, and is filed as a follow-up task after the last round.`,
+    `- Stage times are read from \`- elapsed_ms: <milliseconds>\` under a stage section and reported to the manager`,
+    `  as \`stage_timings\`. Write the line only for a stage you timed, with the measured number alone; leave it out`,
+    `  otherwise. An estimate is worse than no figure.`,
     isRework
       ? `- This round's blocks replace the previous round's. For a task with a REWORK note, write the complete` +
         `\n  block again: every stage and every done_criteria line, not only what changed.`
@@ -3366,6 +3369,36 @@ const ELITE_FINDING_SEVERITIES = Object.freeze(['BLOCKER', 'MAJOR', 'MINOR', 'NI
  */
 const ELITE_DEFAULT_SEVERITY = 'MAJOR';
 
+/**
+ * The seven stages the elite-developer runs for each task, in order: the
+ * `#### <stage>` sections of its report (agents/elite-developer.md).
+ */
+const ELITE_STAGES = Object.freeze([
+  'spec_check',
+  'implementation',
+  'adversarial_test',
+  'full_suite',
+  'review',
+  'fix_loop',
+  'spec_reconcile',
+]);
+
+/**
+ * The `- status:` values each stage may report. `fix_loop` has no status line:
+ * it reports counts, which eliteStageStatus() reads instead.
+ */
+const ELITE_STAGE_STATUSES = Object.freeze({
+  spec_check: Object.freeze(['pass', 'warn']),
+  implementation: Object.freeze(['pass', 'fail']),
+  adversarial_test: Object.freeze(['pass', 'findings']),
+  full_suite: Object.freeze(['pass', 'fail']),
+  review: Object.freeze(['approve', 'request_changes']),
+  spec_reconcile: Object.freeze(['pass', 'updated']),
+});
+
+/** How a stage with no readable result is shown in the progress log. */
+const ELITE_STAGE_NOT_REPORTED = 'not reported';
+
 /** Index of the task a `## dev result:` heading names, or -1. Whole-id match: t1 is not t12. */
 function eliteBlockOwner(headingRest, taskIds) {
   let best = -1;
@@ -3545,18 +3578,18 @@ function parseEliteTaskBlock(block, taskId, taskIds) {
     status: statusLine ? eliteEnumValue(statusLine[1], ['done', 'needs_more_work', 'blocked']) : null,
     full_suite: {
       text: fullSuite,
-      status: eliteEnumValue(eliteFieldValue(fullSuite, 'status'), ['pass', 'fail']),
+      status: eliteEnumValue(eliteFieldValue(fullSuite, 'status'), ELITE_STAGE_STATUSES.full_suite),
       passed: eliteIntValue(eliteFieldValue(fullSuite, 'passed')),
       failed: eliteIntValue(eliteFieldValue(fullSuite, 'failed')),
       skipped: eliteIntValue(eliteFieldValue(fullSuite, 'skipped')),
     },
     review: {
       text: review,
-      status: eliteEnumValue(eliteFieldValue(review, 'status'), ['approve', 'request_changes']),
+      status: eliteEnumValue(eliteFieldValue(review, 'status'), ELITE_STAGE_STATUSES.review),
     },
     adversarial_test: {
       text: adversarial,
-      status: eliteEnumValue(eliteFieldValue(adversarial, 'status'), ['pass', 'findings']),
+      status: eliteEnumValue(eliteFieldValue(adversarial, 'status'), ELITE_STAGE_STATUSES.adversarial_test),
     },
     fix_loop: {
       text: fixLoop,
@@ -3770,6 +3803,124 @@ function extractEliteReworkNotes(integrationReport, reviewReport, taskIds, round
   return notes;
 }
 
+// ------------------------------------------------------------
+// Observability: what the one agent says about its own stages
+// ------------------------------------------------------------
+// The workflow launches the elite-developer once per round and cannot see a
+// stage begin or end. What it can show is read from the report afterwards. As
+// with the verdicts above, nothing is guessed: a stage the report does not
+// answer for is null, and the caller shows it as not reported.
+
+/**
+ * The result one stage of one task block reports, or null when the block has no
+ * readable answer for it. `fix_loop` reports how far it went, since it has no
+ * status of its own.
+ */
+function eliteStageStatus(block, stage) {
+  if (typeof block !== 'string') return null;
+  const section = eliteStageSection(block, stage);
+  if (section === null) return null;
+  if (stage === 'fix_loop') {
+    const iterations = eliteIntValue(eliteFieldValue(section, 'iterations'));
+    if (iterations === null || iterations < 0) return null;
+    return `${iterations} iteration(s), ${eliteListField(section, 'unresolved').length} unresolved`;
+  }
+  return eliteEnumValue(eliteFieldValue(section, 'status'), ELITE_STAGE_STATUSES[stage] || []);
+}
+
+/**
+ * `{ task_id, stage, status }` for every task and every stage, in task order,
+ * then stage order (`blocks[i]` belongs to `taskIds[i]`; see splitEliteReport).
+ * `status` is null for a stage that was not reported, and a task without a block
+ * still has its seven entries.
+ */
+function eliteStageProgress(blocks, taskIds) {
+  const ids = Array.isArray(taskIds) ? taskIds : [];
+  const progress = [];
+  ids.forEach((id, i) => {
+    const block = Array.isArray(blocks) ? blocks[i] : null;
+    for (const stage of ELITE_STAGES) progress.push({ task_id: id, stage, status: eliteStageStatus(block, stage) });
+  });
+  return progress;
+}
+
+/**
+ * The `- elapsed_ms:` a stage section reports, as a whole number of
+ * milliseconds, or null. Only a plain non-negative number counts, with `ms` as
+ * the one unit allowed after it and no other word following: `90s` or `1.5 min`
+ * read as milliseconds would be wrong by orders of magnitude, so they are not
+ * read at all. A remark in brackets after the number is fine.
+ */
+function eliteStageElapsedMs(block, stage) {
+  if (typeof block !== 'string') return null;
+  const raw = eliteFieldValue(eliteStageSection(block, stage), 'elapsed_ms');
+  if (raw === null) return null;
+  const m = raw.match(/^(\d+(?:\.\d+)?)(?:[ \t]*ms)?(?![ \t]*[\w.])/i);
+  return m ? Math.round(Number(m[1])) : null;
+}
+
+/**
+ * Wall-clock milliseconds per stage, summed over the given task blocks. Every
+ * stage of ELITE_STAGES is a key. A stage no block gives a time for is null,
+ * which means "not measured" and is not the same as 0.
+ *
+ * Pass the blocks as each launch returned them, not the per-task list the
+ * session keeps: a block carried over from an earlier round would be counted
+ * again.
+ */
+function eliteStageTimings(blocks) {
+  const timings = {};
+  for (const stage of ELITE_STAGES) {
+    let total = null;
+    for (const block of Array.isArray(blocks) ? blocks : []) {
+      const ms = eliteStageElapsedMs(block, stage);
+      if (ms !== null) total = (total === null ? 0 : total) + ms;
+    }
+    timings[stage] = total;
+  }
+  return timings;
+}
+
+/**
+ * The usage metadata an agent returned with its result, or null when it
+ * returned none. It is passed on for the manager to display and is never
+ * computed with: a non-negative number, or an object, as the agent gave it.
+ *
+ * Copied by hand into the four workflow scripts this file is not mirrored into
+ * (COPY: elite-usage); lib/elite-observability.test.js compares each copy with
+ * this function.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+
+/**
+ * The usage of a session that launched the agent more than once. A single
+ * reported usage is returned as it is. Several are totalled: numbers are added,
+ * objects are added field by field, and a field that is not a number is left
+ * out, since it has no total. Usages that cannot be added to each other (a
+ * number and an object) give null: an unknown total is reported as unknown, not
+ * as the last launch's share of it.
+ */
+function sumEliteTokenUsage(usages) {
+  const reported = (Array.isArray(usages) ? usages : []).filter((u) => u !== null && u !== undefined);
+  if (reported.length === 0) return null;
+  if (reported.length === 1) return reported[0];
+  if (reported.every((u) => typeof u === 'number')) return reported.reduce((sum, u) => sum + u, 0);
+  if (!reported.every((u) => typeof u === 'object')) return null;
+
+  const total = {};
+  for (const usage of reported) {
+    for (const [field, value] of Object.entries(usage)) {
+      if (typeof value === 'number' && Number.isFinite(value)) total[field] = (total[field] || 0) + value;
+    }
+  }
+  return total;
+}
+
 // --- END GENERATED: elite-report ---
 
 const TASK_IDS = tasks.map((t) => t.id);
@@ -3872,6 +4023,11 @@ const EFFECTIVE_MAX_ROUNDS = HAS_TEST_STAGE || HAS_REVIEW_STAGE ? MAX_ROUNDS : 1
 // number, passed in its prompt.
 let eliteResult = null;
 const eliteWarnings = [];
+// Observability of the launches (elite only; see the return value): the task
+// blocks each launch wrote, for `stage_timings`, and the usage metadata each
+// launch returned, for `token_usage`.
+const eliteTimedBlocks = [];
+const eliteTokenUsages = [];
 if (SINGLE_AGENT_MODE && RESOLVED_BUDGETS) {
   eliteWarnings.push(
     `budgets were not applied: they are per-role limits for the developer, the integration tester, and the reviewer, ` +
@@ -3885,6 +4041,10 @@ while (SINGLE_AGENT_MODE && mainRound < MAX_ROUNDS && !sessionPassed) {
 
   phase('Elite');
   log(`--- Round ${mainRound}/${MAX_ROUNDS} | Elite | Session ${session_id} | profile ${PROFILE} | ${tasks.length} tasks ---`);
+  // The stages run inside one launch, where the workflow cannot watch them
+  // begin. Naming them here is what the progress display has to go on until the
+  // agent returns; how each one ended is logged from its report below.
+  log(`--- Round ${mainRound}/${MAX_ROUNDS} | Elite stages | profile ${PROFILE} | ${tasks.length} tasks | ${ELITE_STAGES.join(' -> ')} ---`);
 
   eliteResult = await trackedAgent(
     buildElitePrompt(tasks, sessionContext, MAX_ROUNDS, mainRound),
@@ -3899,13 +4059,18 @@ while (SINGLE_AGENT_MODE && mainRound < MAX_ROUNDS && !sessionPassed) {
   );
   const eliteAgentSeq = stageTelemetry.length - 1;
   const eliteText = reportText(eliteResult);
+  eliteTokenUsages.push(eliteTokenUsage(eliteResult));
 
   // One slot per task. A task the previous round left with nothing open keeps
   // its earlier block when this report does not mention it; a reworked task
   // does not, or its stale block would stand in for the rework. A crashed
   // launch reported nothing, so it keeps nothing.
   const previousBlocks = devResults;
-  devResults = splitEliteReport(eliteText, TASK_IDS).map((block, i) => {
+  const reportedBlocks = splitEliteReport(eliteText, TASK_IDS);
+  // Stage times are per launch: only what this launch wrote is counted, so a
+  // block carried over below is not counted a second time.
+  eliteTimedBlocks.push(...reportedBlocks.filter((block) => block !== null));
+  devResults = reportedBlocks.map((block, i) => {
     if (block !== null) return block;
     const carriedOver = eliteText && mainRound > 1 && !reworkedTaskIds.includes(TASK_IDS[i]);
     return carriedOver && typeof previousBlocks[i] === 'string' ? previousBlocks[i] : null;
@@ -3917,6 +4082,11 @@ while (SINGLE_AGENT_MODE && mainRound < MAX_ROUNDS && !sessionPassed) {
     sessionLog.push({ round: mainRound, phase: 'elite', summary: 'AGENT_ERROR' });
     log(`The ${ELITE_AGENT_LABEL} returned no report — round FAILED (fail-closed). Cannot proceed.`);
     break;
+  }
+
+  // How each stage ended, per task: what stands for the task after this round.
+  for (const { task_id, stage, status } of eliteStageProgress(devResults, TASK_IDS)) {
+    log(`Elite round ${mainRound} | ${task_id} | ${stage}: ${status === null ? ELITE_STAGE_NOT_REPORTED : status}`);
   }
 
   const derived = deriveEliteVerdicts(devResults, TASK_IDS);
@@ -4391,11 +4561,27 @@ return {
   // when the session converged normally. The manager files one follow-up task
   // per entry instead of failing the session — see session-loop.md.
   pending_followups: pendingFollowups,
-  // elite only (the key is absent under the other profiles): the last
-  // elite-developer report as it was returned, before it was cut into
-  // `dev_reports`. null when that launch crashed.
-  ...(SINGLE_AGENT_MODE ? { elite_report: reportText(eliteResult) } : {}),
-  session_log: sessionLog,
+  // elite only (these keys are absent under the other profiles).
+  //   elite_report  — the last elite-developer report as it was returned, before
+  //                   it was cut into `dev_reports`. null when that launch crashed.
+  //   model         — the model the elite-developer ran on.
+  //   token_usage   — the usage metadata its launches returned, totalled over the
+  //                   rounds; null when they returned none. Passed on for the
+  //                   manager to display, never converted into a cost here.
+  //   stage_timings — wall-clock ms per stage, as the reports state them
+  //                   (`- elapsed_ms:`), summed over tasks and rounds. Always the
+  //                   seven stages; null = the agent did not time that stage.
+  ...(SINGLE_AGENT_MODE
+    ? {
+        elite_report: reportText(eliteResult),
+        model: ELITE_MODEL,
+        token_usage: sumEliteTokenUsage(eliteTokenUsages),
+        stage_timings: eliteStageTimings(eliteTimedBlocks),
+      }
+    : {}),
+  // Every entry names the profile it was logged under, so a log read on its own
+  // (a report, an excerpt) still says which pipeline produced it.
+  session_log: sessionLog.map((entry) => ({ ...entry, profile: PROFILE })),
   stage_telemetry: stageTelemetry,
   gate_ledger: gateLedger.entries(),
   gate_stats: gateLedger.stats(),

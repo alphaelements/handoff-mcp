@@ -555,8 +555,10 @@ Save `reqflow_state` (`nfr_doc_id`, `completed_phases: [0,1,2]`, `current_phase:
    | `test_spec_report` | `{items_completed, items_flagged, remaining_tbd, warnings[]}` from the test-spec-worker, or `null` (not run / crashed) |
    | `test_spec_check_reports[{round, doc_id, report}]` | ISO 29119 check of each scaffolded test-specification document: `report` is `{findings[], verdict}`, `null` = the checker crashed; `[]` when nothing was scaffolded |
    | `pending_followups[]` | unresolved BLOCKER/MAJOR findings, including `source: 'workflow'` crashes |
-   | `requirement_log[]` | per-round trace |
+   | `requirement_log[]` | per-round trace; every entry carries `profile`, the resolved profile |
    | `profile` | `elite` only (absent otherwise): `'elite'` |
+   | `model` | `elite` only (absent otherwise): the model the `elite-requirement-author` ran on (`elite_model`, default `fable`) |
+   | `token_usage` | `elite` only (absent otherwise): the usage metadata the author returned with its report, as it gave it; `null` when it returned none (not "zero tokens") |
    | `elite_report` | `elite` only (absent otherwise): the `elite-requirement-author` report as returned, before it was unpacked into the fields above; `null` = the agent crashed |
 
    > **A `null` report is a failure, never a pass.** A missing worker/checker/reviewer result
@@ -698,7 +700,9 @@ differs:
 - **`pending_followups[].source`** still names the stage a finding came from (`checker`,
   `reviewer`, `test_spec_checker`, `workflow`); under `elite` those stages were all run by the
   one author.
-- **`profile: 'elite'` and `elite_report`** are present only on an elite result.
+- **`profile: 'elite'`, `elite_report`, `model` and `token_usage`** are present only on an
+  elite result. `model` and `token_usage` are what the run cost to produce: name them when
+  you report the result, and say "not reported" for a `null` `token_usage`.
 
 "Send a scope back" and "Run another targeted round" start a new run for the named scopes, as
 under the other profiles; keep the same pipeline profile unless the user changes it. Step 5 of

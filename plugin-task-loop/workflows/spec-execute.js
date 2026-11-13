@@ -70,6 +70,9 @@ export const meta = {
 //   problems: string[],           // why status is 'failed'; empty otherwise
 //   warnings: string[],           // what the coordinator must tell the user (unvalidated diagrams, ...)
 //   elite_report,                 // the author's report as returned; null when it crashed
+//   model,                        // the model the elite-spec-author ran on
+//   token_usage,                  // the usage metadata it returned with its report, as it gave it;
+//                                 // null when it returned none
 // }
 //
 // The `report` of each area has the format of the phase agent it replaces
@@ -132,6 +135,11 @@ const GENERATE_PHASE = 'Generate';
 /** The phase agents of the multi-agent flow, which the coordinator briefs itself. */
 const PHASE_AGENTS = ['spec-architect', 'spec-gui-designer', 'spec-usecase-analyst'];
 const AREAS = ['architecture', 'gui', 'use_cases'];
+// What the one elite-spec-author produces, in order: the three areas, then the
+// draft. The workflow cannot watch them being written inside one launch: it
+// names them before the launch and logs how each ended after it.
+const ELITE_STAGES = [...AREAS, 'draft_spec'];
+const ELITE_STAGE_NOT_REPORTED = 'not reported';
 const AUTHOR_STATUSES = ['done', 'needs_input', 'blocked'];
 /** Mermaid diagram types an architecture report must open at least one block with. */
 const ARCHITECTURE_DIAGRAM_TYPES = ['flowchart', 'C4Context'];
@@ -558,11 +566,30 @@ function draftProblems(draft) {
 // A report the workflow cannot use is returned as `failed`, not retried: a
 // re-run is the coordinator's decision, usually after asking the user.
 
+// --- BEGIN COPY: elite-usage (source: lib/elite-report.js) ---
+// lib/elite-report.js is mirrored into session-execute.js only, so this helper is
+// copied here by hand. lib/elite-observability.test.js evaluates this block and
+// fails when it disagrees with the lib on any input.
+/**
+ * The usage metadata an agent returned with its result, or null when it returned
+ * none. It is passed on for the coordinator to display and is never computed
+ * with: a non-negative number, or an object, as the agent gave it.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+// --- END COPY: elite-usage ---
+
 phase(GENERATE_PHASE);
 log(
   `--- Elite | ${topic} | one ${ELITE_AGENT_LABEL} (${ELITE_MODEL}) | ${scope_items.length} scope item(s) | ` +
     `${HAS_GUI ? `${SCREENS.length} screen(s)` : 'no GUI'} ---`,
 );
+
+log(`--- Elite stages | ${ELITE_STAGES.join(' -> ')} ---`);
 
 const result = await agent(buildEliteSpecPrompt(), {
   label: ELITE_AGENT_LABEL,
@@ -586,6 +613,7 @@ if (!usable) {
   status = 'failed';
   problems.push(`${ELITE_AGENT_LABEL} produced no usable report; nothing it may have written was checked`);
   log(`The ${ELITE_AGENT_LABEL} returned no usable report — generation FAILED (fail-closed).`);
+  for (const stage of ELITE_STAGES) log(`Elite | ${stage}: ${ELITE_STAGE_NOT_REPORTED}`);
 } else {
   const found = {
     architecture: architectureProblems(result.architecture),
@@ -607,6 +635,14 @@ if (!usable) {
     useCases = pickSchemaProperties(result.use_cases, ELITE_SPEC_SCHEMA.properties.use_cases);
   }
   if (found.draft_spec.length === 0) draftSpec = result.draft_spec;
+
+  // How each area ended under the checks above, whatever the author's own status
+  // says. "not usable" is an area the result does not return: whether that is a
+  // defect or a stop to ask the user is decided below, from the status.
+  for (const stage of ELITE_STAGES) {
+    const skipped = stage === 'gui' && gui !== null && gui.status === 'skipped';
+    log(`Elite | ${stage}: ${skipped ? 'skipped' : found[stage].length === 0 ? 'ok' : 'not usable'}`);
+  }
 
   if (result.status !== 'done') {
     // The author stopped to ask. What it left out is not a defect of the report.
@@ -676,4 +712,8 @@ return {
   warnings,
   // The author's report as it was returned, before it was checked.
   elite_report: result === undefined ? null : result,
+  // The model the author ran on, and the usage metadata it returned with its
+  // report (null when it returned none). Passed on, never computed with.
+  model: ELITE_MODEL,
+  token_usage: eliteTokenUsage(result),
 };

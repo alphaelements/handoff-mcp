@@ -365,7 +365,7 @@ test('reports for a facet nobody asked for are dropped and reported', async () =
 test('SPEC-ELITE-063 AC1: elite keeps every standard result key and adds only optional ones', async () => {
   const r = await run(eliteArgs({ output_path: 'tmp/261101-errors.md' }));
   for (const key of STANDARD_RESULT_KEYS) assert.ok(key in r, `elite result.${key}`);
-  assert.deepEqual(resultKeys(r).filter((k) => !STANDARD_RESULT_KEYS.includes(k)), ['profile', 'warnings']);
+  assert.deepEqual(resultKeys(r).filter((k) => !STANDARD_RESULT_KEYS.includes(k)), ['model', 'profile', 'token_usage', 'warnings']);
   assert.equal(r.profile, 'elite');
   assert.equal(r.session_id, 's-1');
   assert.equal(r.research_topic, 'MCP protocol error handling');
@@ -419,7 +419,7 @@ test('SPEC-ELITE-063 AC3: a crashed or malformed elite-researcher fails closed w
     assert.equal(r.review_report, null, label);
     assert.equal(r.review_escalation, null, label);
     assert.ok(r.warnings.some((w) => /elite-researcher returned no usable result/.test(w)), label);
-    assert.deepEqual(r.research_log, [{ round: 0, phase: 'elite', summary: 'AGENT_ERROR' }], label);
+    assert.deepEqual(r.research_log, [{ round: 0, phase: 'elite', summary: 'AGENT_ERROR', profile: 'elite' }], label);
     for (const key of STANDARD_RESULT_KEYS) assert.ok(key in r, `result.${key}`);
   }
 });

@@ -251,6 +251,10 @@ differences:
 - `profile` is `'elite'`, and `warnings[]` lists every degradation the workflow found while
   reading the single report (a facet with no report, a round count over its limit, ...).
   Report every entry to the user.
+- `model` is the model the elite-researcher ran on, and `token_usage` the usage metadata it
+  returned with its result (`null` when it returned none, which is not "zero tokens"). Name
+  them when you report what the run cost. Every `research_log[]` entry carries `profile`,
+  under every profile.
 - `investigation_reports[]` and `verification_reports[]` hold one entry per **facet**, in
   `facets` order (`null` = the agent returned none for that facet).
 - `gate_report` and `review_report` are the elite-researcher's own verdicts, in the
