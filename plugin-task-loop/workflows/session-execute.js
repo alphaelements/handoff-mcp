@@ -123,6 +123,8 @@ const {
  *   express  — developer                                   (1 serial turn)
  *   standard — spec-prep -> developer -> tester -> spec-reconcile       (4 serial turns)
  *   full     — spec-prep -> developer -> tester -> reviewer -> spec-reconcile (5 serial turns)
+ *   elite    — every stage above, run by ONE agent in one context (see
+ *              SINGLE_AGENT_PROFILES). Opt-in only: never the default.
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -141,7 +143,7 @@ const {
  * own scope. `express` drops the adversarial layers, never the gates — see
  * agents/session-developer.md.
  */
-const PROFILES = ['express', 'standard', 'full'];
+const PROFILES = ['express', 'standard', 'full', 'elite'];
 
 const DEFAULT_PROFILE = 'standard';
 
@@ -166,11 +168,27 @@ const DEFAULT_PROFILE = 'standard';
 // the missing basic_spec (and, under full, detailed_spec) from each task's
 // requirement and scaffolds the verification layer, so developers implement
 // against a written contract. `express` skips it for the same reason.
+//
+// `elite` opens every gate, like `full`. The gates say WHICH verification layers
+// the session gets, not how many agents deliver them: under `elite` one agent
+// carries all of them (see SINGLE_AGENT_PROFILES), so no layer is dropped in
+// exchange for the shared context.
 const PROFILE_STAGES = Object.freeze({
   express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false, specPrep: false }),
   standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true, specPrep: true }),
   full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
+  elite: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
 });
+
+/**
+ * Profiles whose enabled stages are all run by ONE agent, in one context,
+ * instead of being handed from agent to agent.
+ *
+ * This cannot be read off PROFILE_STAGES: `elite` and `full` have identical
+ * gates. What differs is who does the work, and that decides whether the
+ * per-stage inputs the manager partitions (`test_assignments`) exist at all.
+ */
+const SINGLE_AGENT_PROFILES = Object.freeze(['elite']);
 
 /**
  * Normalize `args.profile`. Unspecified means DEFAULT_PROFILE ('standard').
@@ -202,6 +220,11 @@ function profileStages(profile) {
     reconcile: stages.reconcile,
     specPrep: stages.specPrep,
   };
+}
+
+/** Does one agent run every enabled stage of this profile? Throws on an unknown profile. */
+function isSingleAgentProfile(profile) {
+  return SINGLE_AGENT_PROFILES.includes(resolveProfile(profile));
 }
 
 /**
@@ -263,10 +286,14 @@ function resolveIntegrationExpected(value) {
  *
  * The integration stage adds nothing: exactly one integration tester runs per
  * session, over the whole tree, so there are no assignments to partition.
+ *
+ * A single-agent profile tests too, but inside the one agent that implemented:
+ * no tester is launched, so there is no tester to assign work to. It still
+ * requires the core three, like every profile.
  */
 function requiredArgsForProfile(profile) {
   const required = ['session_id', 'tasks', 'dev_assignments'];
-  if (profileStages(profile).test) required.push('test_assignments');
+  if (profileStages(profile).test && !isSingleAgentProfile(profile)) required.push('test_assignments');
   return required;
 }
 
@@ -341,6 +368,23 @@ function innerLoopSatisfied(profile, devResults, testResults, allTestsPassedFn) 
 // --- END GENERATED: profile ---
 
 const PROFILE = resolveProfile(profile);
+
+// A single-agent profile is registered (it resolves, has stage gates and an
+// effort entry) but this workflow has no single-agent pipeline yet. Its gates
+// equal `full`, so falling through would run the multi-agent pipeline on the
+// multi-agent models and report the session under the single-agent profile's
+// name — a silent downgrade. Reject it here, before any agent launches and
+// before arg validation, until the branch that launches the single agent
+// replaces this throw.
+if (isSingleAgentProfile(PROFILE)) {
+  const runnable = PROFILES.filter((p) => !isSingleAgentProfile(p));
+  throw new Error(
+    `session-execute: profile ${JSON.stringify(PROFILE)} is a single-agent profile, and this ` +
+      `workflow does not implement the single-agent pipeline yet. Running it as the multi-agent ` +
+      `pipeline would not be ${PROFILE}. Use one of: ${runnable.join(', ')}.`,
+  );
+}
+
 const STAGES = profileStages(PROFILE);
 
 // Project trace tier from session-loop Step 2f. null = unspecified: the pipeline
@@ -945,6 +989,12 @@ const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'revie
  * `express` still names an effort for the three layers it never launches. The
  * table is total over ROLES so effortForRole() cannot return undefined; the
  * entries are unreachable, not meaningful.
+ *
+ * `elite` is high in every role: it is the profile that spends more to get
+ * the highest quality, so nothing under it reasons at reduced depth. Its entry is
+ * total over ROLES like the others, and also names `repairer` and `closer`, the
+ * two further roles the elite spec (SPEC-ELITE-003) lists. Neither is in ROLES,
+ * so effortForRole() rejects them: no lookup reads those two keys yet.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
   express: Object.freeze({
@@ -964,6 +1014,14 @@ const EFFORT_BY_PROFILE_ROLE = Object.freeze({
     tester: 'high',
     'integration-tester': 'high',
     reviewer: 'high',
+  }),
+  elite: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+    repairer: 'high',
+    closer: 'high',
   }),
 });
 

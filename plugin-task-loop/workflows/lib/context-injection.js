@@ -45,6 +45,12 @@ const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'revie
  * `express` still names an effort for the three layers it never launches. The
  * table is total over ROLES so effortForRole() cannot return undefined; the
  * entries are unreachable, not meaningful.
+ *
+ * `elite` is high in every role: it is the profile that spends more to get
+ * the highest quality, so nothing under it reasons at reduced depth. Its entry is
+ * total over ROLES like the others, and also names `repairer` and `closer`, the
+ * two further roles the elite spec (SPEC-ELITE-003) lists. Neither is in ROLES,
+ * so effortForRole() rejects them: no lookup reads those two keys yet.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
   express: Object.freeze({
@@ -64,6 +70,14 @@ const EFFORT_BY_PROFILE_ROLE = Object.freeze({
     tester: 'high',
     'integration-tester': 'high',
     reviewer: 'high',
+  }),
+  elite: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+    repairer: 'high',
+    closer: 'high',
   }),
 });
 
@@ -332,6 +346,7 @@ function buildInjectedContextSection(sessionContext) {
 
 export {
   ROLES,
+  EFFORT_BY_PROFILE_ROLE,
   effortForRole,
   handoffToolsForRole,
   buildHandoffContextSection,

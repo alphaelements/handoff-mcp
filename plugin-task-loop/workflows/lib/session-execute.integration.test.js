@@ -460,6 +460,47 @@ test('an unknown profile throws instead of silently downgrading', async () => {
   );
 });
 
+// `elite` is a registered profile, but this workflow has no single-agent
+// pipeline for it yet. Its stage gates equal `full`, so without a guard a
+// session asked for `elite` would run the ordinary multi-agent pipeline on the
+// ordinary models and report itself as elite — a silent downgrade, the same
+// failure the unknown-profile test above forbids.
+test('elite is rejected before any agent launches: it must not run the multi-agent pipeline under its name', async () => {
+  const launched = [];
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        { ...baseArgs(), profile: 'elite' },
+        { onAgentCall: (_prompt, opts) => launched.push(opts.label) },
+      ),
+    (err) => {
+      assert.match(err.message, /^session-execute: /);
+      assert.match(err.message, /profile "elite"/);
+      assert.match(err.message, /single-agent/);
+      assert.match(err.message, /express, standard, full/, 'the error must name the profiles that do run');
+      assert.doesNotMatch(err.message, /full, elite/, 'elite must not be offered as an alternative to itself');
+      return true;
+    },
+  );
+  assert.deepEqual(launched, [], 'no agent may be launched for a profile the workflow cannot run');
+});
+
+test('elite is rejected however the name is written, and before the args are validated', async () => {
+  await assert.rejects(() => runWorkflow({ ...baseArgs(), profile: '  ELITE ' }), /profile "elite"/);
+  // The profile decides which pipeline runs at all, so its error comes first:
+  // "missing required args" would send the manager to fix args for a run that
+  // cannot start.
+  await assert.rejects(() => runWorkflow({ profile: 'elite' }), /profile "elite"/);
+});
+
+test('rejecting elite leaves the multi-agent profiles launching as before', async () => {
+  for (const profile of ['express', 'standard', 'full']) {
+    const r = await runWorkflow({ ...baseArgs(), profile });
+    assert.equal(r.profile, profile);
+    assert.ok(r.calls.includes('dev:A'), `${profile} must still launch the developer`);
+  }
+});
+
 // ============================================================
 // "did not test" must never read as "tests failed"
 // ============================================================
