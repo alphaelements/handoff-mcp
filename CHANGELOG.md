@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Elite profile** (`profile: 'elite'`): a single Fable-tier agent replaces the multi-agent pipeline in all five task-loop workflows (session, brainstorm, requirement, research, spec). Closer and verifier remain independent Sonnet agents. Five new agent definitions: `elite-developer`, `elite-investigator`, `elite-requirement-author`, `elite-researcher`, `elite-spec-author`.
+- New `elite_model` arg for session-execute (and all elite-enabled workflows): overrides the default Fable model for the elite agent without affecting other roles. `dev_model` is not read under elite.
+- `config.toml` `[session_loop] profile` key: persists the default pipeline profile (read by the session-loop skill via `handoff_get_config`). `args.profile` overrides it per invocation.
+- `handoff_get_config` / `handoff_update_config` expose the new `[session_loop]` section (Rust struct + handler).
+- Cost warning in session-loop: displayed before launching a Workflow when the resolved profile is `elite`.
+- Elite observability: session log entries carry a `profile` field; elite results include `model`, `token_usage`, and `stage_timings` (session-execute only). Stage-by-stage `log()` calls for `/workflows` progress.
+- `resolveProfileFromConfig()` in profile.js: resolves the effective profile from config + args.
+- `elite-report.js`: parser for the elite-developer's structured report format (stage progress, timings, token usage).
+- 54 cross-profile backward-compatibility tests (`elite-compat.test.js`), 74 observability tests (`elite-observability.test.js`), and profile-copy parity tests across all workflows.
+
 ## [0.47.4] — 2026-11-12
 
 ### Added
