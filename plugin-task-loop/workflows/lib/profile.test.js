@@ -6,6 +6,7 @@ import {
   resolveProfile,
   profileStages,
   requiredArgsForProfile,
+  isSingleAgentProfile,
   resolveRoundBudget,
   allDevelopersReported,
   innerLoopSatisfied,
@@ -29,6 +30,29 @@ test('each named profile resolves to itself', () => {
   assert.equal(resolveProfile('express'), 'express');
   assert.equal(resolveProfile('standard'), 'standard');
   assert.equal(resolveProfile('full'), 'full');
+  assert.equal(resolveProfile('elite'), 'elite');
+});
+
+test('elite is registered alongside the three existing profiles', () => {
+  for (const p of ['express', 'standard', 'full', 'elite']) {
+    assert.ok(PROFILES.includes(p), `PROFILES must include ${p}`);
+  }
+  assert.equal(PROFILES.length, 4, 'no profile was added or dropped by accident');
+});
+
+test('elite is normalized like every other profile name', () => {
+  assert.equal(resolveProfile('  ELITE '), 'elite');
+  assert.equal(resolveProfile('Elite'), 'elite');
+});
+
+test('registering elite does not change the default profile', () => {
+  // elite is opt-in only: an unspecified profile must never resolve to it.
+  assert.equal(resolveProfile(undefined), 'standard');
+  assert.notEqual(resolveProfile(''), 'elite');
+});
+
+test('the unknown-profile error offers elite as a choice', () => {
+  assert.throws(() => resolveProfile('elit'), /express, standard, full, elite/);
 });
 
 test('profile names are case-insensitive and trimmed', () => {
@@ -62,6 +86,22 @@ test('standard runs developer + tester + integration, no reviewer', () => {
 test('full runs all four stages', () => {
   const s = profileStages('full');
   assert.deepEqual(s, { implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true });
+});
+
+test('elite opens every stage gate', () => {
+  const s = profileStages('elite');
+  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true });
+});
+
+test('the elite stage map is a copy, not the shared table', () => {
+  const a = profileStages('elite');
+  a.review = false;
+  a.specPrep = false;
+  assert.deepEqual(
+    profileStages('elite'),
+    { implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true },
+    'a caller must not corrupt the elite entry',
+  );
 });
 
 test('every declared profile has a stage map', () => {
@@ -155,6 +195,13 @@ test('standard is 4 serial turns: test + integrate share a single agent', () => 
   assert.equal(serialTurnsForProfile('standard'), 4);
 });
 
+test('elite is 3 serial turns: one agent covers implement, test, integrate, and review in a single turn', () => {
+  // Same gates as full, but the four middle stages are one launch, not three.
+  assert.deepEqual(profileStages('elite'), profileStages('full'), 'precondition: identical gates');
+  assert.equal(serialTurnsForProfile('elite'), 3, 'spec-prep + elite-developer + spec-reconcile');
+  assert.equal(serialTurnsForProfile('full'), 5, 'full is unchanged');
+});
+
 test('serialTurnsForProfile rejects an unknown profile', () => {
   assert.throws(() => serialTurnsForProfile('turbo'), /unknown profile/i);
 });
@@ -202,12 +249,59 @@ test('standard and full require test_assignments', () => {
   }
 });
 
-test('every profile requires the core three args', () => {
+// ============================================================
+// elite — one agent runs every enabled stage.
+//
+// elite's `test` gate is true, but no separate tester is launched: the single
+// elite agent tests its own work in the same context. There is no tester to
+// partition work across, so demanding `test_assignments` would make the manager
+// invent a partition nobody reads. The stage map alone cannot say this — a true
+// `test` gate means "testing happens", not "a second agent does it".
+//
+// The same holds for `dev_assignments`: the one agent takes every task, so there
+// is no split of the work for the manager to describe.
+// ============================================================
+test('elite is the only single-agent profile', () => {
+  assert.equal(isSingleAgentProfile('elite'), true);
+  for (const p of ['express', 'standard', 'full']) {
+    assert.equal(isSingleAgentProfile(p), false, `${p} hands work from agent to agent`);
+  }
+});
+
+test('isSingleAgentProfile normalizes and validates like resolveProfile', () => {
+  assert.equal(isSingleAgentProfile('  ELITE '), true);
+  assert.equal(isSingleAgentProfile(undefined), false, 'the default profile is standard');
+  assert.throws(() => isSingleAgentProfile('turbo'), /unknown profile/i);
+});
+
+test('elite does not require test_assignments even though its test gate is open', () => {
+  assert.equal(profileStages('elite').test, true, 'precondition: elite does test');
+  assert.ok(!requiredArgsForProfile('elite').includes('test_assignments'));
+});
+
+test('elite requires session_id and tasks only: one agent takes every task, so nothing is assigned', () => {
+  assert.equal(profileStages('elite').implement, true, 'precondition: elite does implement');
+  assert.deepEqual(requiredArgsForProfile('elite'), ['session_id', 'tasks']);
+  assert.deepEqual(requiredArgsForProfile(' Elite '), ['session_id', 'tasks']);
+});
+
+test('requiredArgsForProfile returns a fresh array per call', () => {
+  const a = requiredArgsForProfile('elite');
+  a.push('test_assignments');
+  assert.ok(!requiredArgsForProfile('elite').includes('test_assignments'));
+});
+
+test('every profile requires session_id and tasks; the multi-agent ones also require dev_assignments', () => {
   for (const p of PROFILES) {
     const req = requiredArgsForProfile(p);
-    for (const k of ['session_id', 'tasks', 'dev_assignments']) {
+    for (const k of ['session_id', 'tasks']) {
       assert.ok(req.includes(k), `${p} must require ${k}`);
     }
+    assert.equal(
+      req.includes('dev_assignments'),
+      !isSingleAgentProfile(p),
+      `${p}: dev_assignments is required exactly when developers are assigned work`,
+    );
   }
 });
 

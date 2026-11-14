@@ -32,7 +32,9 @@ TARGET="plugin-task-loop/workflows/session-execute.js"
 # zone until their block is evaluated).
 # `task-graph` is self-contained (pure union-find over the assignment arrays), so
 # its position is free; it sits last to keep the dependency-ordered prefix intact.
-MODULES=(verdict-logic profile context-injection budget gate-ledger task-graph closer-verify)
+# `elite-report` calls escapeRegExp() from `verdict-logic`. That is a function
+# declaration, hoisted across the whole script, so its position is free too.
+MODULES=(verdict-logic profile context-injection budget gate-ledger task-graph closer-verify elite-report)
 
 CHECK_MODE=0
 if [ "${1:-}" = "--check" ]; then

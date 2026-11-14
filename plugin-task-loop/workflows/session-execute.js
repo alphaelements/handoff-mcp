@@ -1,7 +1,7 @@
 export const meta = {
   name: 'session-execute',
   description:
-    'Execute one session as serial stages: implement all tasks, test entire scope, review entire scope, then close the tasks',
+    'Execute one session as serial stages: implement all tasks, test entire scope, review entire scope, then close the tasks. Under the elite profile one agent runs the implement, test, and review stages',
   whenToUse:
     'Called by the session manager to execute one batch of tasks. Pass session design via args, including the pipeline `profile`.',
   phases: [
@@ -9,8 +9,9 @@ export const meta = {
     { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
     { title: 'Test', detail: 'Single tester verifies entire scope: adversarial per-task + integration + E2E (standard, full)' },
     { title: 'Review', detail: 'Reviewer audits design and test quality (full only)' },
+    { title: 'Elite', detail: 'One elite-developer implements, tests, reviews, and fixes every task in a single context (elite only; replaces Implement, Test, and Review)' },
     { title: 'Spec-Reconcile', detail: 'Sync specs with implementation (standard/full only)' },
-    { title: 'Close', detail: 'Closer agent checks off done_criteria, updates task status, runs trace_update, and applies plan updates (standard, full)' },
+    { title: 'Close', detail: 'Closer agent checks off done_criteria, updates task status, runs trace_update, and applies plan updates (standard, full, elite)' },
   ],
 };
 
@@ -30,7 +31,9 @@ export const meta = {
 //     instructions?: string,   // detailed implementation instructions for developer
 //   }],
 //
-//   // --- Developer assignments ---
+//   // --- Developer assignments (required, except under `elite`) ---
+//   // elite: optional, and not used to split the work. The one elite-developer
+//   // receives every task in `tasks`; only `extra_context` is carried into its prompt.
 //   dev_assignments: [{
 //     dev_label: string,       // display label (e.g. "A", "B")
 //     tasks: string[],         // task IDs assigned to this dev
@@ -39,15 +42,21 @@ export const meta = {
 //   }],
 //
 //   // --- Model defaults ---
-//   dev_model?: string,        // default model for developers (default: 'sonnet')
+//   dev_model?: string,        // default model for developers (default: 'sonnet';
+//                              // not read under elite — see elite_model)
 //   integration_tester_model?: string, // model for the tester (default: 'sonnet')
 //   reviewer_model?: string,   // model for reviewer (default: 'opus')
+//   elite_model?: string,      // model of the elite-developer (default: 'fable'); read
+//                              // under elite only. Pass it only when the user names a
+//                              // model: omitted is what makes an elite session elite
 //
 //   // --- Pipeline depth ---
-//   profile?: 'express' | 'standard' | 'full',
+//   profile?: 'express' | 'standard' | 'full' | 'elite',
 //     // express  = developer only                              (1 serial turn)
 //     // standard = developer -> tester                         (2 serial turns)  <-- DEFAULT
 //     // full     = developer -> tester -> reviewer             (3 serial turns)
+//     // elite    = ONE elite-developer does all three          (1 serial turn per round)
+//     //            opt-in only; Spec-Prep, Spec-Reconcile, and Close run as under full
 //     // An unrecognized value throws; it is never silently downgraded.
 //
 //   // --- Project trace tier (set by session-loop Step 2f) ---
@@ -65,9 +74,11 @@ export const meta = {
 //   response_language?: string, // explicit language name/tag; inferred from task content when omitted
 //
 //   // --- Loop control (positive integers; 0 / negative / non-number throw) ---
-//   max_rounds?: number,         // max main-loop rounds (default: 3)
+//   max_rounds?: number,         // max main-loop rounds (default: 3). Under elite it bounds
+//                                // both the elite-developer launches and, passed in its
+//                                // prompt, the fix loop inside each launch
 //
-//   // --- Per-role budgets (advisory; omit to use defaults) ---
+//   // --- Per-role budgets (advisory; omit to use defaults; not applied under elite) ---
 //   budgets?: {
 //     developer?: { max_turns?: number, max_tool_calls?: number, soft_wall_time_s?: number },
 //     'integration-tester'?: { max_turns?: number, max_tool_calls?: number, soft_wall_time_s?: number },
@@ -92,10 +103,11 @@ const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});
 const {
   session_id,
   tasks,
-  dev_assignments,
+  dev_assignments: devAssignmentsArg,
   dev_model,
   integration_tester_model,
   reviewer_model,
+  elite_model,
   max_rounds,
   profile,
   trace_profile,
@@ -123,6 +135,9 @@ const {
  *   express  — developer                                   (1 serial turn)
  *   standard — spec-prep -> developer -> tester -> spec-reconcile       (4 serial turns)
  *   full     — spec-prep -> developer -> tester -> reviewer -> spec-reconcile (5 serial turns)
+ *   elite    — spec-prep -> elite-developer -> spec-reconcile            (3 serial turns)
+ *              ONE agent runs the developer, tester, and reviewer stages in one
+ *              context (see SINGLE_AGENT_PROFILES). Opt-in only: never the default.
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -141,7 +156,7 @@ const {
  * own scope. `express` drops the adversarial layers, never the gates — see
  * agents/session-developer.md.
  */
-const PROFILES = ['express', 'standard', 'full'];
+const PROFILES = ['express', 'standard', 'full', 'elite'];
 
 const DEFAULT_PROFILE = 'standard';
 
@@ -166,11 +181,27 @@ const DEFAULT_PROFILE = 'standard';
 // the missing basic_spec (and, under full, detailed_spec) from each task's
 // requirement and scaffolds the verification layer, so developers implement
 // against a written contract. `express` skips it for the same reason.
+//
+// `elite` opens every gate, like `full`. The gates say WHICH verification layers
+// the session gets, not how many agents deliver them: under `elite` one agent
+// carries all of them (see SINGLE_AGENT_PROFILES), so no layer is dropped in
+// exchange for the shared context.
 const PROFILE_STAGES = Object.freeze({
   express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false, specPrep: false }),
   standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true, specPrep: true }),
   full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
+  elite: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
 });
+
+/**
+ * Profiles whose enabled stages are all run by ONE agent, in one context,
+ * instead of being handed from agent to agent.
+ *
+ * This cannot be read off PROFILE_STAGES: `elite` and `full` have identical
+ * gates. What differs is who does the work, and that decides whether the
+ * per-stage inputs the manager partitions (`test_assignments`) exist at all.
+ */
+const SINGLE_AGENT_PROFILES = Object.freeze(['elite']);
 
 /**
  * Normalize `args.profile`. Unspecified means DEFAULT_PROFILE ('standard').
@@ -204,6 +235,11 @@ function profileStages(profile) {
   };
 }
 
+/** Does one agent run every enabled stage of this profile? Throws on an unknown profile. */
+function isSingleAgentProfile(profile) {
+  return SINGLE_AGENT_PROFILES.includes(resolveProfile(profile));
+}
+
 /**
  * How many SERIAL agent turns this profile costs — the wall-clock term.
  *
@@ -216,15 +252,24 @@ function profileStages(profile) {
  *
  * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
  * `full` and silently misprice the profile.
+ *
+ * A single-agent profile runs implement, test, integrate, and review as ONE
+ * launch, so those gates cost one turn together however many of them are open.
+ * This is per round: a rework round repeats the middle turn(s) under every
+ * profile.
  */
 function serialTurnsForProfile(profile) {
   const s = profileStages(profile);
   let turns = 0;
   if (s.specPrep) turns += 1;
-  if (s.implement) turns += 1;
-  // test and integrate are handled by a single integration tester agent.
-  if (s.test || s.integrate) turns += 1;
-  if (s.review) turns += 1;
+  if (isSingleAgentProfile(profile)) {
+    if (s.implement || s.test || s.integrate || s.review) turns += 1;
+  } else {
+    if (s.implement) turns += 1;
+    // test and integrate are handled by a single integration tester agent.
+    if (s.test || s.integrate) turns += 1;
+    if (s.review) turns += 1;
+  }
   if (s.reconcile) turns += 1;
   return turns;
 }
@@ -263,9 +308,15 @@ function resolveIntegrationExpected(value) {
  *
  * The integration stage adds nothing: exactly one integration tester runs per
  * session, over the whole tree, so there are no assignments to partition.
+ *
+ * A single-agent profile implements and tests too, but inside one agent that
+ * takes every task: no developer and no tester is launched, so there is no work
+ * to assign to either. It requires `session_id` and `tasks` only.
  */
 function requiredArgsForProfile(profile) {
-  const required = ['session_id', 'tasks', 'dev_assignments'];
+  const required = ['session_id', 'tasks'];
+  if (isSingleAgentProfile(profile)) return required;
+  required.push('dev_assignments');
   if (profileStages(profile).test) required.push('test_assignments');
   return required;
 }
@@ -341,6 +392,13 @@ function innerLoopSatisfied(profile, devResults, testResults, allTestsPassedFn) 
 // --- END GENERATED: profile ---
 
 const PROFILE = resolveProfile(profile);
+
+// Does ONE agent run the implement / test / review stages (`elite`)? Its gates
+// equal `full`, so nothing in STAGES tells the two apart: every place that
+// launches a developer, a tester, or a reviewer must ask this instead, or an
+// elite session would run the multi-agent pipeline under the elite name.
+const SINGLE_AGENT_MODE = isSingleAgentProfile(PROFILE);
+
 const STAGES = profileStages(PROFILE);
 
 // Project trace tier from session-loop Step 2f. null = unspecified: the pipeline
@@ -358,25 +416,51 @@ function resolveTraceProfile(value) {
 const TRACE_PROFILE = resolveTraceProfile(trace_profile);
 const TRACE_NEEDS_SPECS = TRACE_PROFILE === 'standard' || TRACE_PROFILE === 'full';
 
-// v2: test_assignments is no longer required — the single integration tester
-// covers the entire scope. Override requiredArgsForProfile's demand.
-const REQUIRED_FIELDS = ['session_id', 'tasks', 'dev_assignments'];
+// The profile decides what is required (requiredArgsForProfile), with one
+// override. v2: test_assignments is no longer required — the single integration
+// tester covers the entire scope.
+//
+// A single-agent profile requires no dev_assignments either: one agent takes
+// every task, so there is nothing to assign.
+const REQUIRED_FIELD_HELP = {
+  session_id: 'session_id (handoff session)',
+  tasks: 'tasks ([{ id, title, done_criteria[] }] — from handoff_list_tasks)',
+  dev_assignments: 'dev_assignments ([{ dev_label, tasks: [task_ids] }] — who implements what)',
+};
+const REQUIRED_FIELDS = requiredArgsForProfile(PROFILE).filter((k) => k !== 'test_assignments');
 const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k] === null);
 if (missing.length > 0) {
   throw new Error(
     `session-execute: missing required args: ${missing.join(', ')}. ` +
     `Follow the session-loop command (Skill handoff-task-loop:session-loop) to build args. ` +
-    `Required: { session_id (handoff session), ` +
-    `tasks ([{ id, title, done_criteria[] }] — from handoff_list_tasks), ` +
-    `dev_assignments ([{ dev_label, tasks: [task_ids] }] — who implements what) }. ` +
+    `Required: { ${REQUIRED_FIELDS.map((k) => REQUIRED_FIELD_HELP[k]).join(', ')} }. ` +
     `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
     `from the previous run — you must pass the same 'args' object again explicitly.`
   );
 }
 
+// Which developer report covers which task: `devResults[i]` is the report of
+// `dev_assignments[i]`. Under a single-agent profile the one report is cut into a
+// block per task (see lib/elite-report.js), so the list has one slot per task and
+// the closer and the spec-reconciler find a task's report the way they always do.
+// The manager's own `dev_assignments` do not split the work there.
+const ELITE_AGENT_LABEL = 'elite-developer';
+const dev_assignments = SINGLE_AGENT_MODE
+  ? tasks.map((t) => ({ dev_label: ELITE_AGENT_LABEL, tasks: [t.id] }))
+  : devAssignmentsArg;
+
 const DEV_MODEL = dev_model || 'sonnet';
 const INTEGRATION_TESTER_MODEL = integration_tester_model || 'sonnet';
 const REVIEWER_MODEL = reviewer_model || 'opus';
+// The elite-developer runs on the elite tier's model unless the manager names
+// another through `elite_model`. `dev_model` is deliberately NOT that override:
+// the session-loop skill passes `dev_model: 'sonnet'` on every run, so reading it
+// here would put the elite-developer on Sonnet after the user was told the
+// session runs on Fable. Under elite `dev_model` is as unused as the tester and
+// reviewer models — no agent of those roles is launched.
+const ELITE_AGENT_TYPE = 'handoff-task-loop:elite-developer';
+const ELITE_DEFAULT_MODEL = 'fable';
+const ELITE_MODEL = elite_model || ELITE_DEFAULT_MODEL;
 // The closer only transcribes reports into handoff state — no deep reasoning.
 const CLOSER_MODEL = 'sonnet';
 const CLOSER_EFFORT = 'medium';
@@ -945,6 +1029,16 @@ const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'revie
  * `express` still names an effort for the three layers it never launches. The
  * table is total over ROLES so effortForRole() cannot return undefined; the
  * entries are unreachable, not meaningful.
+ *
+ * `elite` is high in every role: it is the profile that spends more to get
+ * the highest quality, so nothing under it reasons at reduced depth. Its one
+ * agent is launched at the `developer` effort; the other three entries keep the
+ * table total over ROLES, as under `express`.
+ *
+ * Every entry names exactly the roles in ROLES. A key outside ROLES could never
+ * be read (effortForRole() rejects the role first), so it would only look like
+ * configuration. The closer's effort is a constant of the workflow, not a
+ * per-profile choice.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
   express: Object.freeze({
@@ -960,6 +1054,12 @@ const EFFORT_BY_PROFILE_ROLE = Object.freeze({
     reviewer: 'high',
   }),
   full: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
+  elite: Object.freeze({
     developer: 'high',
     tester: 'high',
     'integration-tester': 'high',
@@ -1823,6 +1923,152 @@ function buildDevPrompt(assignment, currentRound, maxRound, reworkSource) {
     buildHandoffContextSection('developer', PROFILE),
     RESOLVED_BUDGETS ? `\n${buildBudgetSection('developer', RESOLVED_BUDGETS.developer)}` : '',
   ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+// ============================================================
+// Helper: build elite-developer prompt (single-agent profiles)
+// ============================================================
+/** Do this task's instructions ask for requirement tracking? */
+function tracksRequirements(t) {
+  return typeof t.instructions === 'string' && /requirements_tracking\s*:\s*true/i.test(t.instructions);
+}
+
+/**
+ * `extra_context` the manager attached to developer assignments. The elite
+ * agent has no assignment of its own, but what the manager wrote there is still
+ * about these tasks, so it is carried over rather than dropped with the split.
+ */
+function renderEliteExtraContext() {
+  const list = Array.isArray(devAssignmentsArg) ? devAssignmentsArg : [];
+  const notes = list
+    .filter((a) => a && typeof a.extra_context === 'string' && a.extra_context.trim() !== '')
+    .map((a) => {
+      const scope = Array.isArray(a.tasks) && a.tasks.length > 0 ? a.tasks.join(', ') : 'the whole session';
+      return `### For ${scope}\n${a.extra_context.trim()}`;
+    });
+  return notes.length > 0 ? `\n## Additional context from the manager\n${notes.join('\n\n')}` : '';
+}
+
+/**
+ * The one prompt of an elite-developer launch: every task of the session, in
+ * order, plus the conditions the agent works under.
+ *
+ * `maxRounds` is passed through as the limit of the agent's own fix loop. The
+ * workflow applies the same number to its launches (see the elite loop below),
+ * so `currentRound` of `maxRounds` is also the launch count.
+ *
+ * The "Report format" section is the contract lib/elite-report.js parses: one
+ * `## dev result:` block per task, each complete by itself, because each is
+ * handed to the closer alone.
+ */
+function buildElitePrompt(taskList, context, maxRounds, currentRound = 1) {
+  const isRework = currentRound > 1;
+  const taskBriefs = taskList
+    .map((t) => {
+      let rework = '';
+      if (t.rework_notes) {
+        rework = `**REWORK (elite round ${currentRound})**: Still open after the previous round:\n${t.rework_notes}\n`;
+      } else if (isRework) {
+        rework =
+          `**No rework requested**: the previous round left nothing open for this task. Do not redo it. ` +
+          `Its previous report stands unless your changes affect it; if they do, re-verify it and report a full block for it.\n`;
+      }
+      return (
+        `### Task: ${t.id} — ${t.title}\n` +
+        `**done_criteria**: ${JSON.stringify(t.done_criteria)}\n` +
+        `**spec**: ${t.spec_path || 'none'}\n` +
+        `**instructions**: ${t.instructions || 'Follow standard TDD flow'}\n` +
+        rework
+      );
+    })
+    .join('\n---\n');
+
+  const tracked = taskList.filter(tracksRequirements);
+  const trackingSection =
+    tracked.length > 0
+      ? [
+          ``,
+          `## Requirements tracking`,
+          `These tasks track requirements. In each one's block, list every stable_id you addressed under`,
+          `\`### Requirements addressed\`, one line per fact. The session-closer turns those lines into trace`,
+          `links and state; do not write them yourself.`,
+          ...tracked.map((t) => {
+            const linked =
+              Array.isArray(t.requirement_ids) && t.requirement_ids.length > 0 ? JSON.stringify(t.requirement_ids) : 'none';
+            return `- ${t.id} — pre-linked: ${linked}`;
+          }),
+        ].join('\n')
+      : '';
+
+  return [
+    `You are the elite-developer: the only agent that implements, tests, and reviews this session's work.`,
+    `No tester and no reviewer runs after you. The session-closer transcribes your report into handoff`,
+    `state without re-checking the work behind it.`,
+    `\n${RESPONSE_LANGUAGE_INSTRUCTION}`,
+    `\n## Session info`,
+    `- Session: ${session_id}`,
+    `- Branch: ${context.branch}`,
+    `- Profile: ${PROFILE}`,
+    `- Round: ${currentRound}/${maxRounds} (${isRework ? 'rework' : 'initial'})`,
+    `- max_rounds: ${maxRounds} — the limit of your fix loop (stage 6) for each task. What is still open when you`,
+    `  reach it goes under \`### pendingFollowups\`; it is never dropped and never downgraded.`,
+    isRework ? `- WARNING: This is a rework round. Resolve the open findings first.` : '',
+    isRework
+      ? `\n## Previous round context\nAn earlier elite-developer launch left its work in the tree and reported the findings under each ` +
+        `task's REWORK note as unresolved. Start from the tree as it is: do not redo finished work, resolve what is ` +
+        `listed, and verify again. Your context is new, so read the code before relying on any earlier claim.`
+      : '',
+    `\n## Execution order`,
+    `Process the tasks below sequentially, in the order listed, never in parallel: complete all seven stages`,
+    `(spec_check, implementation, adversarial_test, full_suite, review, fix_loop, spec_reconcile) for one task`,
+    `before starting the next.`,
+    `\n## Assigned tasks`,
+    taskBriefs,
+    renderEliteExtraContext(),
+    `\n## Wiring expectation`,
+    `**integration_expected = ${INTEGRATION_EXPECTED}**`,
+    INTEGRATION_EXPECTED
+      ? `This session's work is expected to be reachable from a real entry point. Code that is implemented but` +
+        `\nunwired is a BLOCKER finding, even if every test passes.`
+      : `This session deliberately builds a foundation and wires it in a later session. Unwired code is not a` +
+        `\nfinding here: record what is left unconnected under \`### Wiring\`. The whole-project suite and E2E must` +
+        `\nstill pass.`,
+    trackingSection,
+    `\n## Report format`,
+    `Return one \`## dev result: <task_id> <task_title>\` block per task, in the order you processed them.`,
+    `Each block is your full Return format for that one task: the status and summary lines, the \`### Task:\``,
+    `block with its seven stage sections, and every closing section (\`### pendingFollowups\`,`,
+    `\`### Actual time\`, \`### done_criteria progress\`, \`### Requirements addressed\` when tracked,`,
+    `\`### Discovered issues\`).`,
+    `\nThe workflow cuts your report at these headings and hands each block, alone, to the session-closer:`,
+    `- Start each heading with the exact task id from "Assigned tasks", and never put two tasks under one`,
+    `  heading. A task with no block of its own counts as not reported, and the session fails.`,
+    `- Do not share a closing section between tasks. \`### Actual time\` in a block is the time spent on that one`,
+    `  task, not a total: the closer logs each block's figure against its task, so the blocks add up to your total.`,
+    `- Keep headings, field names, and status values exactly as the Return format spells them, in English,`,
+    `  whatever the response language. Write \`- None\` under \`### pendingFollowups\` when nothing is open.`,
+    `- The verdicts are read from each block: the \`#### full_suite\` status, the \`#### review\` status,`,
+    `  \`fix_loop\` unresolved, and \`### pendingFollowups\`. Anything left open relaunches an elite-developer with`,
+    `  those findings while rounds remain, and is filed as a follow-up task after the last round.`,
+    `- Stage times are read from \`- elapsed_ms: <milliseconds>\` under a stage section and reported to the manager`,
+    `  as \`stage_timings\`. Write the line only for a stage you timed, with the measured number alone; leave it out`,
+    `  otherwise. An estimate is worse than no figure.`,
+    isRework
+      ? `- This round's blocks replace the previous round's. For a task with a REWORK note, write the complete` +
+        `\n  block again: every stage and every done_criteria line, not only what changed.`
+      : '',
+    renderSpecPrepForDeveloper(),
+    `\n${buildInjectedContextSection(context)}`,
+    `\n## Handoff context access`,
+    `The session context above was fetched once by the manager. Do not call \`handoff_load_context\`: it`,
+    `returns what you already have. Your own reads, and the one write you may make (spec text during`,
+    `spec_reconcile), are as your instructions define. Every other handoff write belongs to the`,
+    `session-closer, which runs after you.`,
+  ]
+    // Drops the conditional entries that rendered as ''. Blank lines between
+    // sections are part of the heading strings, so they survive it.
     .filter(Boolean)
     .join('\n');
 }
@@ -3084,6 +3330,599 @@ function canCreateFollowup(finding, { blocksAcceptance, existingTaskIds = [], fo
 
 // --- END GENERATED: verdict-logic ---
 
+// ============================================================
+// Elite report mapping (single-agent profiles)
+// ============================================================
+// --- BEGIN GENERATED: elite-report (source: lib/elite-report.js) ---
+// AUTO-GENERATED — DO NOT EDIT BY HAND.
+// Source: plugin-task-loop/workflows/lib/elite-report.js
+// Regenerate: ./scripts/sync-workflow-inline.sh
+
+/**
+ * Under the `elite` profile one agent implements, tests, and reviews, and hands
+ * back ONE markdown report (agents/elite-developer.md, "Return format"). The
+ * stages after it were written for a pipeline with three reports: a developer
+ * report per task for the closer, a tester verdict, and a reviewer verdict.
+ *
+ * This module maps the one onto the three, so the closer, the spec-reconciler,
+ * and the follow-up filing keep reading the shapes they already read:
+ *
+ *   `## dev result: <task_id>` block        -> that task's entry in `dev_reports`
+ *   `#### full_suite`                       -> `integration_report`
+ *   `#### review` / `#### adversarial_test`
+ *     / `#### fix_loop` / `### pendingFollowups` -> `review_report`
+ *
+ * Everything here fails closed. Nobody runs after the elite agent to notice a
+ * section it left out, so a section that is missing or cannot be read is never
+ * taken as a pass: it becomes a finding, and the finding says what is missing.
+ */
+
+/** `source` of a follow-up that came out of an elite report, and the marker on a derived report. */
+const ELITE_REPORT_SOURCE = 'elite-developer';
+
+const ELITE_FINDING_SEVERITIES = Object.freeze(['BLOCKER', 'MAJOR', 'MINOR', 'NIT']);
+
+/**
+ * Severity of an open finding that names none. MAJOR, as everywhere else in this
+ * workflow (`f.severity || 'MAJOR'`): an open item of unknown weight must not be
+ * read as a nit.
+ */
+const ELITE_DEFAULT_SEVERITY = 'MAJOR';
+
+/**
+ * The seven stages the elite-developer runs for each task, in order: the
+ * `#### <stage>` sections of its report (agents/elite-developer.md).
+ */
+const ELITE_STAGES = Object.freeze([
+  'spec_check',
+  'implementation',
+  'adversarial_test',
+  'full_suite',
+  'review',
+  'fix_loop',
+  'spec_reconcile',
+]);
+
+/**
+ * The `- status:` values each stage may report. `fix_loop` has no status line:
+ * it reports counts, which eliteStageStatus() reads instead.
+ */
+const ELITE_STAGE_STATUSES = Object.freeze({
+  spec_check: Object.freeze(['pass', 'warn']),
+  implementation: Object.freeze(['pass', 'fail']),
+  adversarial_test: Object.freeze(['pass', 'findings']),
+  full_suite: Object.freeze(['pass', 'fail']),
+  review: Object.freeze(['approve', 'request_changes']),
+  spec_reconcile: Object.freeze(['pass', 'updated']),
+});
+
+/** How a stage with no readable result is shown in the progress log. */
+const ELITE_STAGE_NOT_REPORTED = 'not reported';
+
+/** Index of the task a `## dev result:` heading names, or -1. Whole-id match: t1 is not t12. */
+function eliteBlockOwner(headingRest, taskIds) {
+  let best = -1;
+  for (let i = 0; i < taskIds.length; i++) {
+    const named = new RegExp(`^[\`*]*${escapeRegExp(taskIds[i])}(?![\\w.+-])`).test(headingRest);
+    if (named && (best < 0 || String(taskIds[i]).length > String(taskIds[best]).length)) best = i;
+  }
+  return best;
+}
+
+/**
+ * Cut the report into one block per task, at its `## dev result: <task_id>`
+ * headings. Returns an array aligned with `taskIds`; a task with no block of its
+ * own is `null`, which the caller must treat as "not reported", never as done.
+ *
+ * A second block for the same task replaces the first: the report is written in
+ * the order the work happened, so the later block is the agent's final word.
+ */
+function splitEliteReport(report, taskIds) {
+  const ids = Array.isArray(taskIds) ? taskIds : [];
+  const slots = ids.map(() => null);
+  if (typeof report !== 'string' || report.trim() === '') return slots;
+
+  const heading = /^##[ \t]+[Dd]ev[ \t]+[Rr]esult[ \t]*:[ \t]*(.*)$/gm;
+  const starts = [];
+  let m;
+  while ((m = heading.exec(report)) !== null) starts.push({ index: m.index, rest: m[1] });
+
+  for (let i = 0; i < starts.length; i++) {
+    const owner = eliteBlockOwner(starts[i].rest, ids);
+    if (owner < 0) continue;
+    const end = i + 1 < starts.length ? starts[i + 1].index : report.length;
+    slots[owner] = report.slice(starts[i].index, end).trim();
+  }
+  return slots;
+}
+
+/** Body of a `#### <stage>` subsection, or null when the block has none. */
+function eliteStageSection(block, stage) {
+  const m = block.match(
+    new RegExp(`^####[ \\t]+${escapeRegExp(stage)}(?![\\w])[^\\n]*\\n?([\\s\\S]*?)(?=^#{1,4}[ \\t]|(?![\\s\\S]))`, 'm'),
+  );
+  return m ? m[1] : null;
+}
+
+/** Body of the `### pendingFollowups` section, or null when the block has none. */
+function elitePendingSection(block) {
+  const m = block.match(
+    /^###[ \t]+pending[ \t_-]*follow[ \t_-]*ups?(?![\w])[^\n]*\n?([\s\S]*?)(?=^#{1,3}[ \t]|(?![\s\S]))/im,
+  );
+  return m ? m[1] : null;
+}
+
+/** Raw value of a `- <name>: <value>` line, or null. */
+function eliteFieldValue(section, name) {
+  if (typeof section !== 'string') return null;
+  const m = section.match(new RegExp(`^[ \\t]*[-*][ \\t]+(?:\\*\\*)?${name}(?:\\*\\*)?[ \\t]*:[ \\t]*(.*)$`, 'm'));
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Read one enum token out of a raw field value. A trailing remark is fine
+ * (`pass (132 tests)`), but the token must be whole and must not be followed by
+ * `|` or `/`: the report template itself says `pass|fail`, and a template line
+ * echoed back is not a result.
+ */
+function eliteEnumValue(raw, allowed) {
+  if (typeof raw !== 'string') return null;
+  const m = raw.replace(/^[^A-Za-z]+/, '').match(/^([A-Za-z_]+)(?![A-Za-z_])(?![ \t`*]*[|/])/);
+  if (!m) return null;
+  const value = m[1].toLowerCase();
+  return allowed.includes(value) ? value : null;
+}
+
+function eliteIntValue(raw) {
+  if (typeof raw !== 'string') return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isInteger(n) ? n : null;
+}
+
+/** Is this the agent saying "nothing here" (`None`, `N/A`, `(or "None")`, `なし`)? */
+function isEliteNone(text) {
+  const t = String(text).trim().replace(/^[\s("'`*_[]+/, '');
+  return /^(?:or[ \t]+["'`*_]*)?(?:none|n\/a)(?![\w])/i.test(t) || /^(?:該当)?(?:なし|無し)/.test(t);
+}
+
+/** Does the text say anything at all (a lone `]` or `-` does not)? */
+function eliteHasContent(text) {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+/**
+ * Entries of a `- <name>: [...]` list field, written inline or as nested bullets.
+ * An inline list stays ONE entry: its items are free prose with commas of their
+ * own, so splitting on commas would cut findings in half.
+ */
+function eliteListField(section, name) {
+  if (typeof section !== 'string') return [];
+  const lines = section.split('\n');
+  const key = new RegExp(`^([ \\t]*)[-*][ \\t]+(?:\\*\\*)?${name}(?:\\*\\*)?[ \\t]*:[ \\t]*(.*)$`);
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(key);
+    if (!m) continue;
+    const entries = [];
+    const inline = m[2].trim().replace(/^\[/, '').replace(/\]$/, '').trim();
+    if (inline !== '') entries.push(inline);
+    for (let j = i + 1; j < lines.length; j++) {
+      if (lines[j].trim() === '') continue;
+      if (lines[j].match(/^[ \t]*/)[0].length <= m[1].length) break;
+      entries.push(lines[j].trim().replace(/^[-*][ \t]+/, ''));
+    }
+    return entries.filter((e) => eliteHasContent(e) && !isEliteNone(e));
+  }
+  return [];
+}
+
+/**
+ * Entries of the `### pendingFollowups` section: one per top-level line, with
+ * more-indented lines folded into the entry above them. Every line that is not
+ * a way of saying "none" counts, bullet or not, in the documented slash format
+ * or not: an open item the agent phrased loosely is still open.
+ */
+function elitePendingEntries(sectionBody) {
+  const entries = [];
+  let base = null;
+  for (const raw of sectionBody.split('\n')) {
+    if (raw.trim() === '') continue;
+    const indent = raw.match(/^[ \t]*/)[0].length;
+    const text = raw.trim().replace(/^[-*][ \t]+/, '');
+    if (base !== null && indent > base && entries.length > 0) {
+      entries[entries.length - 1] += ` ${text}`;
+      continue;
+    }
+    if (base === null) base = indent;
+    entries.push(text);
+  }
+  return entries.filter((e) => eliteHasContent(e) && !isEliteNone(e));
+}
+
+/**
+ * One `### pendingFollowups` entry as a finding. The documented line is
+ * `<task_id> / <severity> / <file:line> / <problem>`. The owner defaults to the
+ * block the entry was found in; an entry may hand itself to another task of the
+ * session or to `*`, and an owner this session does not know stays in the text.
+ */
+function eliteFollowupFinding(entry, blockTaskId, taskIds) {
+  const parts = entry.split(/[ \t]+\/[ \t]+/);
+  const stated = parts.length >= 4 ? parts[1].replace(/[^A-Za-z]/g, '').toUpperCase() : '';
+  if (!ELITE_FINDING_SEVERITIES.includes(stated)) {
+    const sev = entry.match(/\b(BLOCKER|MAJOR|MINOR|NIT)\b/);
+    return { task_id: blockTaskId, severity: sev ? sev[1] : ELITE_DEFAULT_SEVERITY, location: null, problem: entry };
+  }
+
+  const owner = parts[0].replace(/[`<>]/g, '').trim();
+  const where = parts[2].replace(/`/g, '').trim();
+  const problem = parts.slice(3).join(' / ').trim();
+  const known = owner === '*' || taskIds.includes(owner);
+  return {
+    task_id: known ? owner : blockTaskId,
+    severity: stated,
+    location: /^(?:-|—|n\/a|none)?$/i.test(where) ? null : where,
+    problem: known ? problem : `${parts[0].trim()}: ${problem}`,
+  };
+}
+
+/** Everything the derivation reads from one task's block. Absent parts are null, never guessed. */
+function parseEliteTaskBlock(block, taskId, taskIds) {
+  const head = block.split(/^###/m)[0];
+  const statusLine = head.match(/^[ \t]*(?:\*\*)?status(?:\*\*)?[ \t]*:[ \t]*(.*)$/m);
+  const fullSuite = eliteStageSection(block, 'full_suite');
+  const review = eliteStageSection(block, 'review');
+  const adversarial = eliteStageSection(block, 'adversarial_test');
+  const fixLoop = eliteStageSection(block, 'fix_loop');
+  const pending = elitePendingSection(block);
+
+  return {
+    status: statusLine ? eliteEnumValue(statusLine[1], ['done', 'needs_more_work', 'blocked']) : null,
+    full_suite: {
+      text: fullSuite,
+      status: eliteEnumValue(eliteFieldValue(fullSuite, 'status'), ELITE_STAGE_STATUSES.full_suite),
+      passed: eliteIntValue(eliteFieldValue(fullSuite, 'passed')),
+      failed: eliteIntValue(eliteFieldValue(fullSuite, 'failed')),
+      skipped: eliteIntValue(eliteFieldValue(fullSuite, 'skipped')),
+    },
+    review: {
+      text: review,
+      status: eliteEnumValue(eliteFieldValue(review, 'status'), ELITE_STAGE_STATUSES.review),
+    },
+    adversarial_test: {
+      text: adversarial,
+      status: eliteEnumValue(eliteFieldValue(adversarial, 'status'), ELITE_STAGE_STATUSES.adversarial_test),
+    },
+    fix_loop: {
+      text: fixLoop,
+      iterations: eliteIntValue(eliteFieldValue(fixLoop, 'iterations')),
+      unresolved: eliteListField(fixLoop, 'unresolved'),
+    },
+    pending_text: pending,
+    // null = the section is absent, which is not the same as "nothing pending".
+    followups:
+      pending === null ? null : elitePendingEntries(pending).map((e) => eliteFollowupFinding(e, taskId, taskIds)),
+  };
+}
+
+/**
+ * Derive the tester-shaped and reviewer-shaped results from the per-task blocks
+ * (`blocks[i]` belongs to `taskIds[i]`; see splitEliteReport).
+ *
+ * Both results have the fields the multi-agent pipeline's results have
+ * (`verdict`, `findings[]`, `report`), so `normalizeIntegrationVerdict`,
+ * `normalizeReviewVerdict`, and `extractUnresolvedFindings` read them as they
+ * are. Two more fields say where they came from: `derived_from`, and
+ * `missing_sections` (`"<task_id>: <section>"` for every part that was absent or
+ * unreadable).
+ *
+ * integration_report — the whole-tree gates.
+ *   PASS only if every task's `full_suite` reads `status: pass` and counts no
+ *   failure. `full_suite` reports the last full run, so it is already the final
+ *   state.
+ *
+ * review_report — is anything still open?
+ *   Deliberately NOT a copy of `review.status`. A stage reports what it found,
+ *   and a review whose findings the fix loop then resolved still reads
+ *   `request_changes`; copying it would hold every such task in `review` forever.
+ *   As with the reviewer's own verdict, APPROVE means "nothing is left open":
+ *   the review ran, and neither `### pendingFollowups` nor `fix_loop.unresolved`
+ *   lists anything. Three more things are not an approval: a block whose
+ *   `**status**` is not `done` while it lists nothing open, stage findings that
+ *   no fix-loop iteration accounts for, and a missing section.
+ */
+function deriveEliteVerdicts(blocks, taskIds) {
+  const ids = Array.isArray(taskIds) ? taskIds : [];
+  const integration = { findings: [], missing: [], text: [] };
+  const review = { findings: [], missing: [], text: [] };
+  const finding = (task_id, severity, problem) => ({ task_id, severity, location: null, problem });
+  const count = (n) => (n === null ? '?' : n);
+
+  ids.forEach((id, i) => {
+    const block = Array.isArray(blocks) ? blocks[i] : null;
+    if (typeof block !== 'string' || block.trim() === '') {
+      const problem =
+        `The elite-developer returned no \`## dev result: ${id}\` block. ` +
+        `Nothing was reported for this task, so nothing about it is verified.`;
+      for (const side of [integration, review]) {
+        side.missing.push(`${id}: dev result`);
+        side.findings.push(finding(id, 'BLOCKER', problem));
+        side.text.push(`### ${id}\n(no \`## dev result\` block)`);
+      }
+      return;
+    }
+
+    const p = parseEliteTaskBlock(block, id, ids);
+
+    // --- full_suite -> integration_report ---
+    const suite = p.full_suite;
+    integration.text.push(`### ${id}\n#### full_suite\n${suite.text === null ? '(section missing)' : suite.text.trim()}`);
+    let suiteFailed = false;
+    if (suite.status === null) {
+      suiteFailed = true;
+      integration.missing.push(`${id}: full_suite`);
+      integration.findings.push(
+        finding(
+          id,
+          'BLOCKER',
+          `The report for ${id} has no readable \`#### full_suite\` status (expected pass or fail). ` +
+            `The whole-project suite, E2E, and gates are unverified for this task.`,
+        ),
+      );
+    } else if (suite.status !== 'pass' || (suite.failed !== null && suite.failed > 0)) {
+      suiteFailed = true;
+      integration.findings.push(
+        finding(
+          id,
+          'BLOCKER',
+          `full_suite did not pass for ${id} (status: ${suite.status}, passed: ${count(suite.passed)}, ` +
+            `failed: ${count(suite.failed)}, skipped: ${count(suite.skipped)}).`,
+        ),
+      );
+    }
+
+    // --- review / adversarial_test / fix_loop / pendingFollowups -> review_report ---
+    review.text.push(
+      [
+        `### ${id}`,
+        ...['adversarial_test', 'review', 'fix_loop'].map(
+          (s) => `#### ${s}\n${p[s].text === null ? '(section missing)' : p[s].text.trim()}`,
+        ),
+        `#### pendingFollowups\n${p.pending_text === null ? '(section missing)' : p.pending_text.trim()}`,
+      ].join('\n'),
+    );
+
+    if (p.review.status === null) {
+      review.missing.push(`${id}: review`);
+      review.findings.push(
+        finding(
+          id,
+          'BLOCKER',
+          `The report for ${id} has no readable \`#### review\` status (expected approve or request_changes). ` +
+            `No review of this task is on record.`,
+        ),
+      );
+    }
+    if (p.followups === null) {
+      review.missing.push(`${id}: pendingFollowups`);
+      review.findings.push(
+        finding(
+          id,
+          ELITE_DEFAULT_SEVERITY,
+          `The report for ${id} has no \`### pendingFollowups\` section, so open findings cannot be ruled out.`,
+        ),
+      );
+    }
+
+    // `### pendingFollowups` is where open work is handed on, one line per item.
+    // `fix_loop.unresolved` is read only when that section lists nothing, so a
+    // report that forgot to repeat its unresolved items still shows them.
+    const listed = p.followups || [];
+    const open =
+      listed.length > 0
+        ? listed
+        : p.fix_loop.unresolved.map((entry) => {
+            const sev = entry.match(/\b(BLOCKER|MAJOR|MINOR|NIT)\b/);
+            return finding(id, sev ? sev[1] : ELITE_DEFAULT_SEVERITY, `fix_loop.unresolved: ${entry}`);
+          });
+    review.findings.push(...open);
+
+    if (open.length === 0) {
+      const stagesFoundSomething = p.review.status === 'request_changes' || p.adversarial_test.status === 'findings';
+      const fixLoopRan = p.fix_loop.iterations !== null && p.fix_loop.iterations >= 1;
+      if (stagesFoundSomething && !fixLoopRan) {
+        review.findings.push(
+          finding(
+            id,
+            ELITE_DEFAULT_SEVERITY,
+            `adversarial_test / review reported findings for ${id}, but fix_loop shows no iteration and nothing ` +
+              `is listed as unresolved: those findings are unaccounted for.`,
+          ),
+        );
+      }
+      // A failed suite already explains a block that does not claim `done`.
+      if (!suiteFailed && (p.status === 'needs_more_work' || p.status === 'blocked')) {
+        review.findings.push(
+          finding(
+            id,
+            ELITE_DEFAULT_SEVERITY,
+            `The report for ${id} says **status**: ${p.status} but lists no unresolved finding.`,
+          ),
+        );
+      }
+    }
+  });
+
+  return {
+    integration_report: {
+      verdict: integration.findings.length === 0 ? 'PASS' : 'FAIL',
+      findings: integration.findings,
+      report: integration.text.join('\n\n'),
+      derived_from: ELITE_REPORT_SOURCE,
+      missing_sections: integration.missing,
+    },
+    review_report: {
+      verdict: review.findings.length === 0 ? 'APPROVE' : 'REQUEST_CHANGES',
+      findings: review.findings,
+      report: review.text.join('\n\n'),
+      derived_from: ELITE_REPORT_SOURCE,
+      missing_sections: review.missing,
+    },
+  };
+}
+
+/**
+ * Rework notes for the next elite launch: per task, what the previous launch
+ * left open. A finding owned by `*` (or by nothing this session knows) belongs
+ * to the seam between tasks, so every task carries it.
+ *
+ * Returns Map taskId -> note (only tasks with something open).
+ */
+function extractEliteReworkNotes(integrationReport, reviewReport, taskIds, round) {
+  const notes = new Map();
+  if (!Array.isArray(taskIds)) return notes;
+
+  const findings = [];
+  for (const r of [integrationReport, reviewReport]) {
+    if (r && typeof r === 'object' && Array.isArray(r.findings)) {
+      findings.push(...r.findings.filter((f) => f && typeof f === 'object'));
+    }
+  }
+  if (findings.length === 0) return notes;
+
+  const known = new Set(taskIds);
+  const shared = findings.filter((f) => !known.has(f.task_id));
+  const render = (list) =>
+    list
+      .map((f) => `- [${f.severity || ELITE_DEFAULT_SEVERITY}] ${f.location ? `${f.location} — ` : ''}${f.problem || ''}`.trim())
+      .join('\n');
+
+  for (const taskId of taskIds) {
+    const mine = findings.filter((f) => f.task_id === taskId).concat(shared);
+    if (mine.length === 0) continue;
+    notes.set(taskId, `[Unresolved after elite round ${round}]\n${render(mine)}`);
+  }
+  return notes;
+}
+
+// ------------------------------------------------------------
+// Observability: what the one agent says about its own stages
+// ------------------------------------------------------------
+// The workflow launches the elite-developer once per round and cannot see a
+// stage begin or end. What it can show is read from the report afterwards. As
+// with the verdicts above, nothing is guessed: a stage the report does not
+// answer for is null, and the caller shows it as not reported.
+
+/**
+ * The result one stage of one task block reports, or null when the block has no
+ * readable answer for it. `fix_loop` reports how far it went, since it has no
+ * status of its own.
+ */
+function eliteStageStatus(block, stage) {
+  if (typeof block !== 'string') return null;
+  const section = eliteStageSection(block, stage);
+  if (section === null) return null;
+  if (stage === 'fix_loop') {
+    const iterations = eliteIntValue(eliteFieldValue(section, 'iterations'));
+    if (iterations === null || iterations < 0) return null;
+    return `${iterations} iteration(s), ${eliteListField(section, 'unresolved').length} unresolved`;
+  }
+  return eliteEnumValue(eliteFieldValue(section, 'status'), ELITE_STAGE_STATUSES[stage] || []);
+}
+
+/**
+ * `{ task_id, stage, status }` for every task and every stage, in task order,
+ * then stage order (`blocks[i]` belongs to `taskIds[i]`; see splitEliteReport).
+ * `status` is null for a stage that was not reported, and a task without a block
+ * still has its seven entries.
+ */
+function eliteStageProgress(blocks, taskIds) {
+  const ids = Array.isArray(taskIds) ? taskIds : [];
+  const progress = [];
+  ids.forEach((id, i) => {
+    const block = Array.isArray(blocks) ? blocks[i] : null;
+    for (const stage of ELITE_STAGES) progress.push({ task_id: id, stage, status: eliteStageStatus(block, stage) });
+  });
+  return progress;
+}
+
+/**
+ * The `- elapsed_ms:` a stage section reports, as a whole number of
+ * milliseconds, or null. Only a plain non-negative number counts, with `ms` as
+ * the one unit allowed after it and no other word following: `90s` or `1.5 min`
+ * read as milliseconds would be wrong by orders of magnitude, so they are not
+ * read at all. A remark in brackets after the number is fine.
+ */
+function eliteStageElapsedMs(block, stage) {
+  if (typeof block !== 'string') return null;
+  const raw = eliteFieldValue(eliteStageSection(block, stage), 'elapsed_ms');
+  if (raw === null) return null;
+  const m = raw.match(/^(\d+(?:\.\d+)?)(?:[ \t]*ms)?(?![ \t]*[\w.])/i);
+  return m ? Math.round(Number(m[1])) : null;
+}
+
+/**
+ * Wall-clock milliseconds per stage, summed over the given task blocks. Every
+ * stage of ELITE_STAGES is a key. A stage no block gives a time for is null,
+ * which means "not measured" and is not the same as 0.
+ *
+ * Pass the blocks as each launch returned them, not the per-task list the
+ * session keeps: a block carried over from an earlier round would be counted
+ * again.
+ */
+function eliteStageTimings(blocks) {
+  const timings = {};
+  for (const stage of ELITE_STAGES) {
+    let total = null;
+    for (const block of Array.isArray(blocks) ? blocks : []) {
+      const ms = eliteStageElapsedMs(block, stage);
+      if (ms !== null) total = (total === null ? 0 : total) + ms;
+    }
+    timings[stage] = total;
+  }
+  return timings;
+}
+
+/**
+ * The usage metadata an agent returned with its result, or null when it
+ * returned none. It is passed on for the manager to display and is never
+ * computed with: a non-negative number, or an object, as the agent gave it.
+ *
+ * Copied by hand into the four workflow scripts this file is not mirrored into
+ * (COPY: elite-usage); lib/elite-observability.test.js compares each copy with
+ * this function.
+ */
+function eliteTokenUsage(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const usage = result.token_usage;
+  if (typeof usage === 'number') return Number.isFinite(usage) && usage >= 0 ? usage : null;
+  return usage !== null && typeof usage === 'object' && !Array.isArray(usage) ? usage : null;
+}
+
+/**
+ * The usage of a session that launched the agent more than once. A single
+ * reported usage is returned as it is. Several are totalled: numbers are added,
+ * objects are added field by field, and a field that is not a number is left
+ * out, since it has no total. Usages that cannot be added to each other (a
+ * number and an object) give null: an unknown total is reported as unknown, not
+ * as the last launch's share of it.
+ */
+function sumEliteTokenUsage(usages) {
+  const reported = (Array.isArray(usages) ? usages : []).filter((u) => u !== null && u !== undefined);
+  if (reported.length === 0) return null;
+  if (reported.length === 1) return reported[0];
+  if (reported.every((u) => typeof u === 'number')) return reported.reduce((sum, u) => sum + u, 0);
+  if (!reported.every((u) => typeof u === 'object')) return null;
+
+  const total = {};
+  for (const usage of reported) {
+    for (const [field, value] of Object.entries(usage)) {
+      if (typeof value === 'number' && Number.isFinite(value)) total[field] = (total[field] || 0) + value;
+    }
+  }
+  return total;
+}
+
+// --- END GENERATED: elite-report ---
+
 const TASK_IDS = tasks.map((t) => t.id);
 const workflowT0 = _now();
 
@@ -3100,6 +3939,9 @@ const workflowT0 = _now();
 //
 // On any stage failure, rework notes are extracted and the loop restarts at
 // stage 1. No nested loops — one flat loop with sequential stages.
+//
+// Under `elite`, stages 1-3 are one agent: the ELITE loop below replaces the
+// multi-agent loop, and Stage 0, Stage 3.5, and Close run around it unchanged.
 
 // ============================================================
 // STAGE 0 — SPEC-PREP (standard, full): derive missing specs before implementing
@@ -3165,7 +4007,149 @@ let reviewStageRan = false;
 
 const EFFECTIVE_MAX_ROUNDS = HAS_TEST_STAGE || HAS_REVIEW_STAGE ? MAX_ROUNDS : 1;
 
-while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
+// ============================================================
+// ELITE — one elite-developer per round replaces stages 1-3
+// ============================================================
+// The agent implements, tests, reviews, and fixes every task in one context and
+// returns one report. That report is cut into a developer report per task and
+// read for the two verdicts the later stages expect (lib/elite-report.js), so
+// Spec-Reconcile and Close below run exactly as they do after the multi-agent
+// loop.
+//
+// A round whose report leaves something open relaunches the agent with those
+// findings as rework notes. MAX_ROUNDS bounds the launches, and after the last
+// one what is still open is filed as follow-ups: the same no-escalation policy
+// as the test and review stages. The agent's own fix loop is bounded by the same
+// number, passed in its prompt.
+let eliteResult = null;
+const eliteWarnings = [];
+// Observability of the launches (elite only; see the return value): the task
+// blocks each launch wrote, for `stage_timings`, and the usage metadata each
+// launch returned, for `token_usage`.
+const eliteTimedBlocks = [];
+const eliteTokenUsages = [];
+if (SINGLE_AGENT_MODE && RESOLVED_BUDGETS) {
+  eliteWarnings.push(
+    `budgets were not applied: they are per-role limits for the developer, the integration tester, and the reviewer, ` +
+      `and the ${PROFILE} profile launches none of them. The ${ELITE_AGENT_LABEL} ran without an advisory limit.`,
+  );
+}
+
+while (SINGLE_AGENT_MODE && mainRound < MAX_ROUNDS && !sessionPassed) {
+  mainRound++;
+  const reworkedTaskIds = tasks.filter((t) => t.rework_notes).map((t) => t.id);
+
+  phase('Elite');
+  log(`--- Round ${mainRound}/${MAX_ROUNDS} | Elite | Session ${session_id} | profile ${PROFILE} | ${tasks.length} tasks ---`);
+  // The stages run inside one launch, where the workflow cannot watch them
+  // begin. Naming them here is what the progress display has to go on until the
+  // agent returns; how each one ended is logged from its report below.
+  log(`--- Round ${mainRound}/${MAX_ROUNDS} | Elite stages | profile ${PROFILE} | ${tasks.length} tasks | ${ELITE_STAGES.join(' -> ')} ---`);
+
+  eliteResult = await trackedAgent(
+    buildElitePrompt(tasks, sessionContext, MAX_ROUNDS, mainRound),
+    {
+      label: ELITE_AGENT_LABEL,
+      phase: 'Elite',
+      agentType: ELITE_AGENT_TYPE,
+      model: ELITE_MODEL,
+      effort: effortForRole(PROFILE, 'developer'),
+    },
+    { round: mainRound, stage: 'elite', role: ELITE_AGENT_LABEL, task_ids: TASK_IDS },
+  );
+  const eliteAgentSeq = stageTelemetry.length - 1;
+  const eliteText = reportText(eliteResult);
+  eliteTokenUsages.push(eliteTokenUsage(eliteResult));
+
+  // One slot per task. A task the previous round left with nothing open keeps
+  // its earlier block when this report does not mention it; a reworked task
+  // does not, or its stale block would stand in for the rework. A crashed
+  // launch reported nothing, so it keeps nothing.
+  const previousBlocks = devResults;
+  const reportedBlocks = splitEliteReport(eliteText, TASK_IDS);
+  // Stage times are per launch: only what this launch wrote is counted, so a
+  // block carried over below is not counted a second time.
+  eliteTimedBlocks.push(...reportedBlocks.filter((block) => block !== null));
+  devResults = reportedBlocks.map((block, i) => {
+    if (block !== null) return block;
+    const carriedOver = eliteText && mainRound > 1 && !reworkedTaskIds.includes(TASK_IDS[i]);
+    return carriedOver && typeof previousBlocks[i] === 'string' ? previousBlocks[i] : null;
+  });
+
+  if (!eliteText) {
+    integrationResult = null;
+    reviewResult = null;
+    sessionLog.push({ round: mainRound, phase: 'elite', summary: 'AGENT_ERROR' });
+    log(`The ${ELITE_AGENT_LABEL} returned no report — round FAILED (fail-closed). Cannot proceed.`);
+    break;
+  }
+
+  // How each stage ended, per task: what stands for the task after this round.
+  for (const { task_id, stage, status } of eliteStageProgress(devResults, TASK_IDS)) {
+    log(`Elite round ${mainRound} | ${task_id} | ${stage}: ${status === null ? ELITE_STAGE_NOT_REPORTED : status}`);
+  }
+
+  const derived = deriveEliteVerdicts(devResults, TASK_IDS);
+  integrationResult = derived.integration_report;
+  reviewResult = derived.review_report;
+  // The review ran inside the agent; it is reported as run once the agent reported.
+  reviewStageRan = true;
+
+  sessionLog.push({
+    round: mainRound,
+    phase: 'elite',
+    integration_verdict: normalizeIntegrationVerdict(integrationResult),
+    review_verdict: normalizeReviewVerdict(reviewResult),
+    tasks_reported: TASK_IDS.filter((_, i) => devResults[i] !== null),
+    summary: eliteText.substring(0, 500),
+  });
+  for (const [stage, verdict] of [
+    ['test', normalizeIntegrationVerdict(integrationResult)],
+    ['review', normalizeReviewVerdict(reviewResult)],
+  ]) {
+    gateLedger.record({
+      round: mainRound,
+      stage,
+      role: ELITE_AGENT_LABEL,
+      verdict,
+      devsToLaunch: [ELITE_AGENT_LABEL],
+      agentSeq: eliteAgentSeq,
+      elapsed_ms: stageTelemetry[eliteAgentSeq]?.elapsed_ms,
+    });
+  }
+
+  // A task with no block of its own was not reported. Like a developer that
+  // never came back, that is a failure of the round, not something to file and
+  // move past: the closer would have nothing to transcribe for it.
+  if (!allDevelopersReported(devResults)) {
+    const unreported = TASK_IDS.filter((_, i) => devResults[i] === null);
+    log(`The ${ELITE_AGENT_LABEL} report has no \`## dev result\` block for: ${unreported.join(', ')} — round FAILED (fail-closed). Cannot proceed.`);
+    break;
+  }
+
+  if (isIntegrationPassed(integrationResult) && isReviewApproved(reviewResult)) {
+    sessionPassed = true;
+    log(`Session ${session_id} PASSED in round ${mainRound}!`);
+    break;
+  }
+
+  log(`Elite round ${mainRound} left findings open (suite ${normalizeIntegrationVerdict(integrationResult)}, review ${normalizeReviewVerdict(reviewResult)}). Extracting rework notes...`);
+  applyReworkNotes(tasks, extractEliteReworkNotes(integrationResult, reviewResult, TASK_IDS, mainRound));
+
+  if (mainRound >= MAX_ROUNDS) {
+    log(`Findings are still open after ${MAX_ROUNDS} rounds. Filing them as follow-ups instead of failing the session.`);
+    pendingFollowups = pendingFollowups.concat(
+      extractUnresolvedFindings(integrationResult, ELITE_REPORT_SOURCE),
+      extractUnresolvedFindings(reviewResult, ELITE_REPORT_SOURCE),
+    );
+    sessionPassed = true;
+  }
+}
+
+// ============================================================
+// MULTI-AGENT LOOP — stages 1-3 (express, standard, full)
+// ============================================================
+while (!SINGLE_AGENT_MODE && mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
   mainRound++;
   const reworkSource = mainRound === 1 ? 'initial' : 'rework';
 
@@ -3401,7 +4385,7 @@ if (sessionPassed && HAS_RECONCILE_STAGE) {
 // verification stages. It is surfaced as `warnings` so the manager can finish
 // the close-out by hand instead of silently skipping it.
 let closerResult = null;
-const closerWarnings = [...specPrepWarnings, ...reconcileWarnings];
+const closerWarnings = [...specPrepWarnings, ...eliteWarnings, ...reconcileWarnings];
 // Tasks whose close-out the closer reported as failed or incomplete
 // (ops_failed / unexecuted_ops), tasks missing from its tasks_processed, or
 // every task when the closer itself failed (`error`). Empty when the closer
@@ -3577,7 +4561,27 @@ return {
   // when the session converged normally. The manager files one follow-up task
   // per entry instead of failing the session — see session-loop.md.
   pending_followups: pendingFollowups,
-  session_log: sessionLog,
+  // elite only (these keys are absent under the other profiles).
+  //   elite_report  — the last elite-developer report as it was returned, before
+  //                   it was cut into `dev_reports`. null when that launch crashed.
+  //   model         — the model the elite-developer ran on.
+  //   token_usage   — the usage metadata its launches returned, totalled over the
+  //                   rounds; null when they returned none. Passed on for the
+  //                   manager to display, never converted into a cost here.
+  //   stage_timings — wall-clock ms per stage, as the reports state them
+  //                   (`- elapsed_ms:`), summed over tasks and rounds. Always the
+  //                   seven stages; null = the agent did not time that stage.
+  ...(SINGLE_AGENT_MODE
+    ? {
+        elite_report: reportText(eliteResult),
+        model: ELITE_MODEL,
+        token_usage: sumEliteTokenUsage(eliteTokenUsages),
+        stage_timings: eliteStageTimings(eliteTimedBlocks),
+      }
+    : {}),
+  // Every entry names the profile it was logged under, so a log read on its own
+  // (a report, an excerpt) still says which pipeline produced it.
+  session_log: sessionLog.map((entry) => ({ ...entry, profile: PROFILE })),
   stage_telemetry: stageTelemetry,
   gate_ledger: gateLedger.entries(),
   gate_stats: gateLedger.stats(),

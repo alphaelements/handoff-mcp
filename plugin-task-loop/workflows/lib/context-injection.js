@@ -45,6 +45,16 @@ const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'revie
  * `express` still names an effort for the three layers it never launches. The
  * table is total over ROLES so effortForRole() cannot return undefined; the
  * entries are unreachable, not meaningful.
+ *
+ * `elite` is high in every role: it is the profile that spends more to get
+ * the highest quality, so nothing under it reasons at reduced depth. Its one
+ * agent is launched at the `developer` effort; the other three entries keep the
+ * table total over ROLES, as under `express`.
+ *
+ * Every entry names exactly the roles in ROLES. A key outside ROLES could never
+ * be read (effortForRole() rejects the role first), so it would only look like
+ * configuration. The closer's effort is a constant of the workflow, not a
+ * per-profile choice.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
   express: Object.freeze({
@@ -60,6 +70,12 @@ const EFFORT_BY_PROFILE_ROLE = Object.freeze({
     reviewer: 'high',
   }),
   full: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
+  elite: Object.freeze({
     developer: 'high',
     tester: 'high',
     'integration-tester': 'high',
@@ -332,6 +348,7 @@ function buildInjectedContextSection(sessionContext) {
 
 export {
   ROLES,
+  EFFORT_BY_PROFILE_ROLE,
   effortForRole,
   handoffToolsForRole,
   buildHandoffContextSection,

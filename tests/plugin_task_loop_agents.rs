@@ -3,7 +3,7 @@
 //! Every agent file must carry well-formed frontmatter (name matching the file
 //! stem, a description, a known model, an effort, a tools list), and the
 //! brainstorm agents must exist with the model/tool contract the brainstorm
-//! workflow relies on.
+//! workflow relies on. The elite agents are the only ones allowed on `fable`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -40,6 +40,23 @@ fn agent_files() -> Vec<(String, String)> {
     out
 }
 
+/// Name prefix of the single-agent definitions the `elite` profile launches.
+const ELITE_AGENT_PREFIX: &str = "elite-";
+
+/// May the agent in `<stem>.md` declare this model?
+///
+/// `opus` and `sonnet` are open to every agent. `fable` is the elite tier's
+/// model and is accepted only on an `elite-` agent: it costs more per turn, so
+/// moving one of the multi-agent pipeline's agents onto it must be a decision
+/// that changes this rule, not a one-word frontmatter edit that passes unnoticed.
+fn model_is_allowed(stem: &str, model: Option<&str>) -> bool {
+    match model {
+        Some("opus" | "sonnet") => true,
+        Some("fable") => stem.starts_with(ELITE_AGENT_PREFIX),
+        _ => false,
+    }
+}
+
 #[test]
 fn every_agent_has_well_formed_frontmatter() {
     let mut problems = Vec::new();
@@ -54,8 +71,11 @@ fn every_agent_has_well_formed_frontmatter() {
         if fm.get("description").is_none_or(|d| d.is_empty()) {
             problems.push(format!("{stem}: empty description"));
         }
-        if !matches!(fm.get("model").map(String::as_str), Some("opus" | "sonnet")) {
-            problems.push(format!("{stem}: unknown model {:?}", fm.get("model")));
+        if !model_is_allowed(&stem, fm.get("model").map(String::as_str)) {
+            problems.push(format!(
+                "{stem}: model {:?} is unknown or not allowed for this agent",
+                fm.get("model")
+            ));
         }
         if fm.get("tools").is_none_or(|v| v.is_empty()) {
             problems.push(format!("{stem}: missing tools"));
@@ -65,6 +85,84 @@ fn every_agent_has_well_formed_frontmatter() {
         problems.is_empty(),
         "agent frontmatter problems:\n{}",
         problems.join("\n")
+    );
+}
+
+#[test]
+fn fable_is_a_known_model_only_for_elite_agents() {
+    // The elite agents run on Fable.
+    assert!(model_is_allowed("elite-developer", Some("fable")));
+    // No other agent may be moved to it by an edit to its frontmatter alone.
+    for stem in ["session-developer", "session-reviewer", "developer-elite"] {
+        assert!(
+            !model_is_allowed(stem, Some("fable")),
+            "{stem} must not be allowed to declare fable"
+        );
+    }
+    // The existing models stay valid for every agent, elite or not.
+    for stem in ["session-developer", "elite-developer"] {
+        for model in ["opus", "sonnet"] {
+            assert!(model_is_allowed(stem, Some(model)), "{stem}: {model}");
+        }
+    }
+    // A missing, empty, misspelled or differently-cased model is never allowed.
+    for stem in ["session-developer", "elite-developer"] {
+        for model in [
+            None,
+            Some(""),
+            Some("Fable"),
+            Some("fable-5"),
+            Some("haiku"),
+        ] {
+            assert!(!model_is_allowed(stem, model), "{stem}: {model:?}");
+        }
+    }
+}
+
+#[test]
+fn elite_developer_is_a_fable_agent_with_the_required_tools_listed_in_readme() {
+    let files: BTreeMap<_, _> = agent_files().into_iter().collect();
+    let text = files
+        .get("elite-developer")
+        .expect("elite-developer agent file missing");
+    let fm = frontmatter(text).expect("elite-developer: bad frontmatter");
+    assert_eq!(fm["model"], "fable", "elite-developer: model");
+    let have: Vec<&str> = fm["tools"].split(',').map(str::trim).collect();
+    let required = [
+        "Read",
+        "Edit",
+        "Write",
+        "Bash",
+        "Grep",
+        "Glob",
+        "TodoWrite",
+        "ToolSearch",
+        "WebSearch",
+        "WebFetch",
+    ];
+    for t in required.iter().chain(MCP_TOOL_PATTERNS.iter()) {
+        assert!(
+            have.contains(t),
+            "elite-developer: tool {t} missing from {have:?}"
+        );
+    }
+    assert_eq!(
+        have.len(),
+        required.len() + MCP_TOOL_PATTERNS.len(),
+        "elite-developer: tools beyond the required set, or one listed twice: {have:?}"
+    );
+    // The workflow passes effort per profile; a pinned effort would override it.
+    assert!(
+        !fm.contains_key("effort"),
+        "elite-developer: effort must not be pinned in the frontmatter"
+    );
+    let readme = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin-task-loop/README.md"),
+    )
+    .unwrap();
+    assert!(
+        readme.contains("elite-developer (Fable"),
+        "README.md does not list elite-developer with its model"
     );
 }
 

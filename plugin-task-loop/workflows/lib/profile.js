@@ -19,6 +19,9 @@
  *   express  — developer                                   (1 serial turn)
  *   standard — spec-prep -> developer -> tester -> spec-reconcile       (4 serial turns)
  *   full     — spec-prep -> developer -> tester -> reviewer -> spec-reconcile (5 serial turns)
+ *   elite    — spec-prep -> elite-developer -> spec-reconcile            (3 serial turns)
+ *              ONE agent runs the developer, tester, and reviewer stages in one
+ *              context (see SINGLE_AGENT_PROFILES). Opt-in only: never the default.
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -37,7 +40,7 @@
  * own scope. `express` drops the adversarial layers, never the gates — see
  * agents/session-developer.md.
  */
-const PROFILES = ['express', 'standard', 'full'];
+const PROFILES = ['express', 'standard', 'full', 'elite'];
 
 const DEFAULT_PROFILE = 'standard';
 
@@ -62,11 +65,27 @@ const DEFAULT_PROFILE = 'standard';
 // the missing basic_spec (and, under full, detailed_spec) from each task's
 // requirement and scaffolds the verification layer, so developers implement
 // against a written contract. `express` skips it for the same reason.
+//
+// `elite` opens every gate, like `full`. The gates say WHICH verification layers
+// the session gets, not how many agents deliver them: under `elite` one agent
+// carries all of them (see SINGLE_AGENT_PROFILES), so no layer is dropped in
+// exchange for the shared context.
 const PROFILE_STAGES = Object.freeze({
   express: Object.freeze({ implement: true, test: false, integrate: false, review: false, reconcile: false, specPrep: false }),
   standard: Object.freeze({ implement: true, test: true, integrate: true, review: false, reconcile: true, specPrep: true }),
   full: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
+  elite: Object.freeze({ implement: true, test: true, integrate: true, review: true, reconcile: true, specPrep: true }),
 });
+
+/**
+ * Profiles whose enabled stages are all run by ONE agent, in one context,
+ * instead of being handed from agent to agent.
+ *
+ * This cannot be read off PROFILE_STAGES: `elite` and `full` have identical
+ * gates. What differs is who does the work, and that decides whether the
+ * per-stage inputs the manager partitions (`test_assignments`) exist at all.
+ */
+const SINGLE_AGENT_PROFILES = Object.freeze(['elite']);
 
 /**
  * Normalize `args.profile`. Unspecified means DEFAULT_PROFILE ('standard').
@@ -100,6 +119,11 @@ function profileStages(profile) {
   };
 }
 
+/** Does one agent run every enabled stage of this profile? Throws on an unknown profile. */
+function isSingleAgentProfile(profile) {
+  return SINGLE_AGENT_PROFILES.includes(resolveProfile(profile));
+}
+
 /**
  * How many SERIAL agent turns this profile costs — the wall-clock term.
  *
@@ -112,15 +136,24 @@ function profileStages(profile) {
  *
  * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
  * `full` and silently misprice the profile.
+ *
+ * A single-agent profile runs implement, test, integrate, and review as ONE
+ * launch, so those gates cost one turn together however many of them are open.
+ * This is per round: a rework round repeats the middle turn(s) under every
+ * profile.
  */
 function serialTurnsForProfile(profile) {
   const s = profileStages(profile);
   let turns = 0;
   if (s.specPrep) turns += 1;
-  if (s.implement) turns += 1;
-  // test and integrate are handled by a single integration tester agent.
-  if (s.test || s.integrate) turns += 1;
-  if (s.review) turns += 1;
+  if (isSingleAgentProfile(profile)) {
+    if (s.implement || s.test || s.integrate || s.review) turns += 1;
+  } else {
+    if (s.implement) turns += 1;
+    // test and integrate are handled by a single integration tester agent.
+    if (s.test || s.integrate) turns += 1;
+    if (s.review) turns += 1;
+  }
   if (s.reconcile) turns += 1;
   return turns;
 }
@@ -159,9 +192,15 @@ function resolveIntegrationExpected(value) {
  *
  * The integration stage adds nothing: exactly one integration tester runs per
  * session, over the whole tree, so there are no assignments to partition.
+ *
+ * A single-agent profile implements and tests too, but inside one agent that
+ * takes every task: no developer and no tester is launched, so there is no work
+ * to assign to either. It requires `session_id` and `tasks` only.
  */
 function requiredArgsForProfile(profile) {
-  const required = ['session_id', 'tasks', 'dev_assignments'];
+  const required = ['session_id', 'tasks'];
+  if (isSingleAgentProfile(profile)) return required;
+  required.push('dev_assignments');
   if (profileStages(profile).test) required.push('test_assignments');
   return required;
 }
@@ -244,6 +283,7 @@ export {
   serialTurnsForProfile,
   resolveIntegrationExpected,
   requiredArgsForProfile,
+  isSingleAgentProfile,
   resolveRoundBudget,
   allDevelopersReported,
   innerLoopSatisfied,

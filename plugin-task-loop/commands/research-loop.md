@@ -31,6 +31,11 @@ Research cycle:
   |-- Process results -> save document -> update handoff
 ```
 
+Under the `elite` profile (see [Profile](#profile)) the workflow launches **one**
+`elite-researcher` (Fable) instead: it investigates every facet, tries to refute its own
+findings, drafts the document, and judges both gates in a single context. No investigator,
+verifier, drafter, or director runs, and the result has the same shape.
+
 ## Configuration parameters
 
 | Parameter                  | Default  | Description                              |
@@ -41,6 +46,34 @@ Research cycle:
 | `DIRECTOR_MODEL`           | `opus`   | Model for director (gate + review)       |
 | `MAX_INVESTIGATION_ROUNDS` | `2`      | Max investigation/re-investigation rounds|
 | `MAX_REVISION_ROUNDS`      | `2`      | Max draft revision rounds                |
+| `PROFILE`                  | `standard` | `elite` = one elite-researcher runs the whole cycle. Every other profile runs the multi-agent pipeline above |
+| `ELITE_MODEL`              | `fable`  | Model for the elite-researcher; read under `elite` only. Omit it unless the user names a model for this run |
+
+### Profile
+
+`elite` is **opt-in only** — never choose it for the user. Stop at the first source that
+gives a profile:
+
+1. **Explicit for this run** — the user named one in the `/research-loop` invocation
+   (`profile: <name>`, see Argument parsing) or in the conversation. It wins over
+   `config.toml` in both directions and applies to this run only.
+2. **Configured default** — `handoff_get_config` → `session_loop.profile`, the same setting
+   `/session-loop` reads (`[session_loop] profile = "elite"` in `config.toml`).
+3. Neither: `standard`.
+
+The value must be one of `express`, `standard`, `full`, `elite`; on anything else, stop and
+ask the user which they meant — the workflow rejects an unknown profile. `express`,
+`standard` and `full` differ only in how deep a development session goes, so here all three
+run the same multi-agent pipeline; only `elite` changes this workflow.
+
+**Elite cost warning.** When the profile is `elite`, say so in the research plan (step 2)
+and show this before calling `Workflow()`:
+
+> Elite profile uses the Fable model — costs ~3-5x more than standard. Proceeding with elite profile.
+
+It is information, not a second approval gate. If the user named a model for the
+elite-researcher, name that model instead of Fable and pass it as `elite_model`. Never copy
+`investigator_model` or another role's model into `elite_model`.
 
 ## Detailed procedure
 
@@ -124,9 +157,15 @@ Present the facet plan to the user:
 Proceed?
 ```
 
+Under `elite`, the Team is one elite-researcher (Fable) and the estimated workflow is one
+agent call; say which source selected `elite`.
+
 **Wait for user approval before launching.**
 
 ### 3. Assign investigators and verifiers
+
+Skip this step under `elite`: one agent takes every facet, and the workflow neither requires
+nor reads `investigator_assignments` / `verifier_assignments`.
 
 - **Investigators**: 1 per facet (or 1 per 2 facets if closely related)
 - **Verifiers**: Cross-assign — each verifier checks a DIFFERENT investigator's work
@@ -157,6 +196,9 @@ Workflow({
     output_path: 'tmp/260701-<topic>.md',
     target_audience: 'development team',
     additional_instructions: '<any extra context>',
+
+    // profile: 'elite',        // only when step "Profile" resolved to elite; omit otherwise
+    // elite_model: 'fable',    // elite only, and only when the user names a model
 
     facets: [
       {
@@ -202,6 +244,27 @@ Workflow({
 ### 5. Process results
 
 After receiving the Workflow result:
+
+**Under `elite`** the result carries the same fields, read the same way, with these
+differences:
+
+- `profile` is `'elite'`, and `warnings[]` lists every degradation the workflow found while
+  reading the single report (a facet with no report, a round count over its limit, ...).
+  Report every entry to the user.
+- `model` is the model the elite-researcher ran on, and `token_usage` the usage metadata it
+  returned with its result (`null` when it returned none, which is not "zero tokens"). Name
+  them when you report what the run cost. Every `research_log[]` entry carries `profile`,
+  under every profile.
+- `investigation_reports[]` and `verification_reports[]` hold one entry per **facet**, in
+  `facets` order (`null` = the agent returned none for that facet).
+- `gate_report` and `review_report` are the elite-researcher's own verdicts, in the
+  director's format. No independent director judged them — say so when you present the
+  document. `gate_passed` is `false` when any facet lacks an investigation or a verification
+  report, whatever the verdict line says, and `document_approved` is `false` without a draft.
+- `review_escalation` is set when the document was approved with caveats; its
+  `unresolved_issues[]` lists them. Treat it as partial success.
+- The agent ran once: `investigation_rounds` / `revision_rounds` are the rounds it reports
+  having run inside that one launch.
 
 **On success (document_approved: true):**
 
@@ -264,6 +327,7 @@ handoff_save_context(
 | `output: <type>` | Output type | `/research-loop ... output: spec` |
 | `path: <path>` | Output file path | `/research-loop ... path: wiki/42-adc.md` |
 | `task: <id>` | Link to handoff task | `/research-loop ... task: t15` |
+| `profile: <name>` | Profile for this run (see Profile) | `/research-loop ... profile: elite` |
 
 Short forms for output type:
 - `spec` → `specification`

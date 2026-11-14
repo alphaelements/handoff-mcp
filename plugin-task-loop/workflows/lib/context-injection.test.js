@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { PROFILES } from './profile.js';
 import {
   ROLES,
+  EFFORT_BY_PROFILE_ROLE,
   effortForRole,
   handoffToolsForRole,
   buildHandoffContextSection,
@@ -54,6 +56,66 @@ test('every role has an effort under every profile — none can return undefined
       assert.ok(effortForRole(p, role), `${p}/${role} has no effort`);
     }
   }
+});
+
+// ============================================================
+// elite — the highest-quality profile never reasons below high effort.
+//
+// The table must also stay total over ROLES for elite. The loop above names the
+// three original profiles by hand, so a profile added to PROFILES without an
+// effort entry would slip past it and effortForRole() would throw a TypeError
+// (or return undefined for a missing role) at launch time.
+// ============================================================
+test('every role reasons at high effort under elite', () => {
+  for (const role of ROLES) {
+    assert.equal(effortForRole('elite', role), 'high', `elite/${role}`);
+  }
+  assert.equal(effortForRole('  ELITE ', 'developer'), 'high');
+});
+
+test('the elite effort entry names exactly the four roles, all at high effort', () => {
+  const elite = EFFORT_BY_PROFILE_ROLE.elite;
+  assert.deepEqual(
+    { ...elite },
+    { developer: 'high', tester: 'high', 'integration-tester': 'high', reviewer: 'high' },
+  );
+});
+
+test('no effort entry names a role effortForRole() would reject', () => {
+  // A key outside ROLES can never be read: effortForRole() throws on the role
+  // before it reaches the table. `repairer` and `closer` once sat in the elite
+  // entry that way, looking configured and doing nothing.
+  for (const p of PROFILES) {
+    assert.deepEqual(Object.keys(EFFORT_BY_PROFILE_ROLE[p]).sort(), [...ROLES].sort(), `${p} entry`);
+  }
+  for (const role of ['repairer', 'closer']) {
+    assert.throws(() => effortForRole('elite', role), /unknown role/);
+  }
+});
+
+test('the elite effort entry is frozen like the others', () => {
+  assert.ok(Object.isFrozen(EFFORT_BY_PROFILE_ROLE), 'the table is frozen');
+  for (const p of PROFILES) {
+    // Object.isFrozen(undefined) is true, so a missing entry must fail first.
+    assert.equal(typeof EFFORT_BY_PROFILE_ROLE[p], 'object', `${p} has an effort entry`);
+    assert.ok(Object.isFrozen(EFFORT_BY_PROFILE_ROLE[p]), `${p} entry is frozen`);
+  }
+});
+
+test('every profile in PROFILES has an effort for every role', () => {
+  assert.deepEqual(Object.keys(EFFORT_BY_PROFILE_ROLE).sort(), [...PROFILES].sort());
+  for (const p of PROFILES) {
+    for (const role of ROLES) {
+      assert.ok(effortForRole(p, role), `${p}/${role} has no effort`);
+    }
+  }
+});
+
+test('adding elite leaves the effort of the existing profiles untouched', () => {
+  const allHigh = { developer: 'high', tester: 'high', 'integration-tester': 'high', reviewer: 'high' };
+  assert.deepEqual({ ...EFFORT_BY_PROFILE_ROLE.express }, { ...allHigh, developer: 'medium' });
+  assert.deepEqual({ ...EFFORT_BY_PROFILE_ROLE.standard }, allHigh);
+  assert.deepEqual({ ...EFFORT_BY_PROFILE_ROLE.full }, allHigh);
 });
 
 test('the integration tester always reasons at high effort — it is an adversarial layer', () => {

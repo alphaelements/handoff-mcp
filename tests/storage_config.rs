@@ -1,4 +1,6 @@
-use handoff_mcp::storage::config::{read_config, write_config, Config};
+use handoff_mcp::storage::config::{
+    read_config, write_config, Config, SessionLoopConfig, SESSION_LOOP_PROFILES,
+};
 use std::fs;
 use tempfile::TempDir;
 
@@ -340,4 +342,159 @@ fn session_prune_limit_round_trips_and_is_independent_of_history_limit() {
     let back = read_config(&path).unwrap();
     assert_eq!(back.settings.history_limit, Some(20));
     assert_eq!(back.settings.session_prune_limit, Some(7));
+}
+
+/// SPEC-ELITE-031 AC1 / SPEC-ELITE-035: `[session_loop] profile` is a known
+/// key, read into `Config.session_loop.profile`.
+#[test]
+fn session_loop_profile_is_parsed() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[project]\nname = \"p\"\n\n[session_loop]\nprofile = \"elite\"\n",
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert_eq!(config.session_loop.profile.as_deref(), Some("elite"));
+}
+
+/// SPEC-ELITE-035 AC1 (persistence half): the profile survives a typed
+/// rewrite. Every tool that writes `config.toml` through `write_config`
+/// (assignees, milestones, typed settings) re-serializes `Config`, so a
+/// section `Config` does not know is silently dropped.
+#[test]
+fn session_loop_profile_round_trips_through_write_config() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[project]\nname = \"p\"\n\n[session_loop]\nprofile = \"elite\"\n",
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    write_config(&path, &config).unwrap();
+
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("[session_loop]\nprofile = \"elite\""),
+        "config.toml:\n{raw}"
+    );
+    let back = read_config(&path).unwrap();
+    assert_eq!(back.session_loop.profile.as_deref(), Some("elite"));
+}
+
+/// SPEC-ELITE-031 AC3 / SPEC-ELITE-035 AC2: a config.toml without
+/// `[session_loop]` loads as before and a rewrite does not invent the section.
+#[test]
+fn session_loop_section_absent_is_unset_and_not_emitted() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+
+    let config = Config::new("no-session-loop", "");
+    assert_eq!(config.session_loop.profile, None);
+    write_config(&path, &config).unwrap();
+
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.lines().any(|l| l.trim() == "[session_loop]"),
+        "config.toml:\n{raw}"
+    );
+    assert!(!raw.contains("profile"), "config.toml:\n{raw}");
+    assert_eq!(read_config(&path).unwrap().session_loop.profile, None);
+}
+
+/// SPEC-ELITE-035 AC3: `[session_loop]` (pipeline profile) and
+/// `[worktree.session_loop]` (multi-WT settings) are separate sections that
+/// do not read or overwrite each other.
+#[test]
+fn session_loop_and_worktree_session_loop_are_independent() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[project]\nname = \"p\"\n\n[session_loop]\nprofile = \"full\"\n\n\
+         [worktree.session_loop]\nauto_assign = true\nmax_concurrent_wts = 2\n",
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    write_config(&path, &config).unwrap();
+    let back = read_config(&path).unwrap();
+
+    assert_eq!(back.session_loop.profile.as_deref(), Some("full"));
+    assert!(back.worktree.session_loop.auto_assign);
+    assert_eq!(back.worktree.session_loop.max_concurrent_wts, 2);
+    assert_eq!(back.worktree.session_loop.merge_strategy, "merge-commit");
+}
+
+/// A hand-edited unknown profile must not make the whole config.toml
+/// unreadable (every other tool reads it); `validate` is what reports it.
+#[test]
+fn session_loop_unknown_profile_parses_leniently_and_fails_validation() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[project]\nname = \"p\"\n\n[session_loop]\nprofile = \"fast\"\n",
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert_eq!(config.session_loop.profile.as_deref(), Some("fast"));
+    let err = config.session_loop.validate().unwrap_err();
+    assert!(err.contains("fast"), "{err}");
+    for known in SESSION_LOOP_PROFILES {
+        assert!(err.contains(known), "error should list {known}: {err}");
+    }
+}
+
+/// Every profile in the vocabulary validates, as does "unset" in both of its
+/// spellings (no key, and the empty string a `null` update writes) — the
+/// session-loop skill treats both as "no configured profile".
+#[test]
+fn session_loop_known_profiles_and_unset_pass_validation() {
+    for profile in SESSION_LOOP_PROFILES {
+        let cfg = SessionLoopConfig {
+            profile: Some((*profile).to_string()),
+        };
+        assert_eq!(cfg.validate(), Ok(()), "{profile}");
+    }
+    assert_eq!(SessionLoopConfig::default().validate(), Ok(()));
+    let empty = SessionLoopConfig {
+        profile: Some(String::new()),
+    };
+    assert_eq!(empty.validate(), Ok(()));
+    // Canonical spelling only: what is stored is what the skill passes on.
+    let shouted = SessionLoopConfig {
+        profile: Some("Elite".to_string()),
+    };
+    assert!(shouted.validate().is_err());
+}
+
+/// `SESSION_LOOP_PROFILES` restates the workflow's `PROFILES`
+/// (plugin-task-loop/workflows/lib/profile.js, the single source of truth for
+/// `resolveProfile`). The two must not drift: a profile the workflow accepts
+/// but the config rejects could never be activated persistently.
+#[test]
+fn session_loop_profiles_match_the_workflow_profile_vocabulary() {
+    let profile_js = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugin-task-loop/workflows/lib/profile.js"),
+    )
+    .unwrap();
+    let line = profile_js
+        .lines()
+        .find(|l| l.starts_with("const PROFILES = ["))
+        .expect("profile.js must declare `const PROFILES = [...]` on one line");
+    let list = &line[line.find('[').unwrap() + 1..line.rfind(']').unwrap()];
+    let workflow_profiles: Vec<&str> = list
+        .split(',')
+        .map(|s| s.trim().trim_matches('\''))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    assert_eq!(workflow_profiles, SESSION_LOOP_PROFILES);
 }

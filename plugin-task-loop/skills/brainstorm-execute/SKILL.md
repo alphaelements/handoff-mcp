@@ -31,6 +31,38 @@ After A and B finish:
 Every agent is read-only and returns schema-validated JSON (plus a markdown `report`). The
 workflow itself writes nothing to handoff — **you** file the results (section 5).
 
+### Elite profile
+
+With `profile: 'elite'` the workflow launches **one** `elite-investigator` (Fable) in place of
+Stream A's investigators and Stream B's director and investigators. It covers both streams in a
+single context and returns a risk-rated self-review of its own findings. The adversarial reviewer
+still runs after it as its own agent, and is told that one agent produced both streams.
+
+```
+elite-investigator                  technical facets + regulatory scope, findings, synthesis + self-review
+  -> brainstorm-adversarial-reviewer  independent; verifies the findings and the self-review
+```
+
+The result has the same fields, filed the same way (sections 4 and 5).
+
+`elite` is **opt-in only** — never choose it for the user. Stop at the first source that gives a
+profile:
+
+1. **Explicit for this run** — the user asked for it in the `/brainstorm-loop` invocation or in the
+   conversation ("run the research with elite"). It wins over `config.toml` in both directions.
+2. **Configured default** — `handoff_get_config` → `session_loop.profile`, the same setting
+   `/session-loop` reads (`[session_loop] profile = "elite"` in `config.toml`).
+3. Neither: omit `profile` (the workflow defaults to `standard`).
+
+On a value that is not one of `express`, `standard`, `full`, `elite`, stop and ask which was meant —
+the workflow rejects an unknown profile. `express`, `standard` and `full` differ only in how deep a
+development session goes, so here all three run the same multi-agent pipeline.
+
+When the profile is `elite`, show this before calling `Workflow()` (information, not a second
+approval gate):
+
+> Elite profile uses the Fable model — costs ~3-5x more than standard. Proceeding with elite profile.
+
 ## 2. Build the args
 
 Read the session first:
@@ -58,12 +90,14 @@ platform; for `target_milestones`, name them so findings can be tied to the mile
 | `brainstorm_summary` | yes | | brief described above |
 | `response_language` | no | `English` | set to the user's language |
 | `additional_instructions` | no | | extra instructions for every agent |
+| `profile` | no | `standard` | `elite` = one elite-investigator covers both streams (see "Elite profile"). Every other profile runs the multi-agent pipeline |
+| `elite_model` | no | `fable` | elite-investigator; read under `elite` only. Omit it unless the user names a model for this run, and never copy `investigator_model` into it |
 | `tech_investigations` | no | feasibility / existing / competitors | `[{id, title, questions[], sources_hint?}]`; replaces the three defaults. Ids must be unique |
 | `skip_regulatory` | no | `false` | `true` = no Stream B. Only when nothing about the product is regulated; the reviewer will list regulation as unexamined |
 | `max_regulatory_investigators` | no | `6` | cap on regulatory areas investigated in parallel |
-| `investigator_model` | no | `sonnet` | research-investigator and regulatory investigators |
-| `director_model` | no | `opus` | regulatory director |
-| `reviewer_model` | no | `opus` | adversarial reviewer |
+| `investigator_model` | no | `sonnet` | research-investigator and regulatory investigators; not read under `elite` |
+| `director_model` | no | `opus` | regulatory director; not read under `elite` |
+| `reviewer_model` | no | `opus` | adversarial reviewer (under `elite` too) |
 
 ### Turn attachments (GUI projects)
 
@@ -117,6 +151,8 @@ Workflow({
     // skip_regulatory: false,
     // max_regulatory_investigators: 6,
     // investigator_model: 'sonnet', director_model: 'opus', reviewer_model: 'opus',
+    // profile: 'elite',     // only when "Elite profile" resolved to elite; omit otherwise
+    // elite_model: 'fable', // elite only, and only when the user names a model
   },
 });
 ```
@@ -142,11 +178,22 @@ All fields are always present.
 | `review` | `{verdict, risks[{severity, axis, description, evidence, mitigation, decision_needed_from_user?}], showstoppers[], unexamined[], cross_stream_conflicts?, conditions?}` or `null` |
 | `review.verdict` | `PROCEED`, `PROCEED_WITH_CONDITIONS`, or `RECONSIDER` |
 | `warnings[]` | every degradation, in plain words |
-| `research_log[]` | `{stream, step, status}` trail |
+| `research_log[]` | `{stream, step, status, profile}` trail; `profile` is the resolved profile on every entry (under `elite`, a `stream: 'elite'` entry for the single launch precedes the A and B entries derived from its report) |
+| `profile` | `elite` only (absent otherwise): `'elite'` |
+| `model` | `elite` only (absent otherwise): the model the elite-investigator ran on (`elite_model`, default `fable`) |
+| `token_usage` | `elite` only (absent otherwise): the usage metadata the elite-investigator returned with its result, as it gave it; `null` when it returned none (not "zero tokens") |
+| `elite_self_review` | `elite` only (absent otherwise): the elite-investigator's own `{risks[], showstoppers[], unexamined[], cross_stream_conflicts?}`, or `null` when it returned none. A self-assessment, not a review: `review` is the independent reviewer's and wins where the two disagree |
+
+Under `elite` the stream fields are derived from the one report: `stream_a.failed_facets[]` and
+`stream_b.failed_areas[]` list what the elite-investigator was asked for and returned no usable
+findings on, and `stream_b.synthesis` is its own cross-check of its regulatory findings — the
+independent check on both streams is `review`.
 
 **Fail closed.** A missing or malformed agent result is reported as a failure, never as a pass:
 
 - `review: null` means the research is **unreviewed** — say so; do not present the project as vetted.
+  Under `elite` this holds even when `elite_self_review` is present: an agent's review of its own
+  findings is not the review.
 - `stream_b.status` of `failed` or `partial` means regulatory exposure is not established — do not
   tell the user "no regulatory issues". Say which areas are unverified.
 - On `partial` or `failed` you may re-run the workflow once with narrower `tech_investigations`
