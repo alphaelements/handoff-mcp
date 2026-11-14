@@ -3,6 +3,8 @@ use serde_json::Value;
 
 use super::HandlerContext;
 use crate::storage;
+use crate::storage::config::ONBOARDING_PRESETS;
+use crate::storage::config_preset;
 
 /// `handoff_init` runs before `.handoff/` exists, so unlike every other
 /// handler it must not rely on `ctx.handoff_dir` (which the dispatch layer
@@ -22,7 +24,17 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    storage::init_handoff(project_dir, project_name, description)?;
+    let preset = match arguments.get("preset") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(config_preset::resolve_preset_name(name)?),
+        Some(other) => anyhow::bail!(
+            "preset must be a string (one of {}), got {other}",
+            ONBOARDING_PRESETS.join("/")
+        ),
+    };
+
+    let applied =
+        storage::init_handoff_with_preset(project_dir, project_name, description, preset)?;
 
     // Version marker (spec §3.7): lets `handoff_load_context` warn when a
     // different handoff-mcp binary later opens the same shared `.handoff/`,
@@ -33,10 +45,20 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         env!("CARGO_PKG_VERSION").as_bytes(),
     )?;
 
-    Ok(format!(
+    let mut reply = format!(
         "Initialized handoff tracking for '{}' at {}/.handoff/\n\
          Created: config.toml, sessions/, tasks/, memory/",
         project_name,
         project_dir.display()
-    ))
+    );
+    if let Some(plan) = applied {
+        let settings = plan
+            .changes
+            .iter()
+            .map(|change| format!("{} = {}", change.key, change.new))
+            .collect::<Vec<_>>()
+            .join(", ");
+        reply.push_str(&format!("\nApplied preset '{}': {settings}", plan.preset));
+    }
+    Ok(reply)
 }

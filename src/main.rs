@@ -27,19 +27,21 @@ fn main() {
     if args.len() >= 2 {
         match args[1].as_str() {
             "setup" => {
-                let check = args.iter().any(|a| a == "--check");
-                let uninstall = args.iter().any(|a| a == "--uninstall");
-                let mcp_json = args.iter().any(|a| a == "--mcp-json");
-                let yes = args.iter().any(|a| a == "-y" || a == "--yes");
-                let global = args.iter().any(|a| a == "--global");
-                let force = args.iter().any(|a| a == "--force");
-                if let Err(e) = handoff_mcp::setup::run_setup_with_opts(
-                    check, uninstall, mcp_json, yes, global, force,
-                ) {
-                    eprintln!("Error: {e:#}");
-                    std::process::exit(1);
+                use handoff_mcp::setup::SetupCommand;
+                let result = SetupCommand::parse(&args[2..]).and_then(|command| match command {
+                    SetupCommand::Help => {
+                        println!("{}", handoff_mcp::setup::SETUP_USAGE);
+                        Ok(0)
+                    }
+                    SetupCommand::Run(opts) => handoff_mcp::setup::run(opts),
+                });
+                match result {
+                    Ok(exit_code) => std::process::exit(exit_code),
+                    Err(e) => {
+                        eprintln!("Error: {e:#}");
+                        std::process::exit(1);
+                    }
                 }
-                return;
             }
             "--version" | "-V" => {
                 println!("handoff-mcp v{}", env!("CARGO_PKG_VERSION"));
@@ -146,17 +148,11 @@ fn print_help() {
 SERVER MODE:
     handoff-mcp              Start the MCP server (stdio transport)
 
-SETUP:
-    handoff-mcp setup              Install hooks + MCP server + CLAUDE.md template
-    handoff-mcp setup --global     Use ~/.claude/settings.json mcpServers (not .mcp.json)
-    handoff-mcp setup --check      Check if hooks, MCP, and CLAUDE.md are configured
-    handoff-mcp setup --uninstall  Remove handoff hooks and MCP entry
-    handoff-mcp setup --mcp-json   Add handoff MCP server entry only (non-interactive)
-    handoff-mcp setup --force      Replace existing CLAUDE.md handoff section with latest
-    handoff-mcp setup -y           Skip all confirmation prompts
+{setup}
 
 OPTIONS:
     -h, --help       Print this help message
-    -V, --version    Print version"
+    -V, --version    Print version",
+        setup = handoff_mcp::setup::SETUP_USAGE
     );
 }

@@ -1,12 +1,16 @@
 use serde_json::{json, Value};
 
 use super::types::ToolDefinition;
+use crate::setup::doctor::{
+    CHECK_IDS as DOCTOR_CHECK_IDS, COMMAND_CHECKS as DOCTOR_COMMAND_CHECKS,
+};
+use crate::storage::config::ONBOARDING_PRESETS;
 
 pub fn all_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "handoff_init".to_string(),
-            description: "Initialize handoff tracking for a new project. Creates .handoff/ directory structure.".to_string(),
+            description: "Initialize handoff tracking for a new project. Creates .handoff/ directory structure. Pass preset='beginner' to start with the settings for one person building a first application: trace.profile=minimal, trace.done_guard=warn, session_loop.profile=standard, and the [onboarding] guidance and checks switched on (preflight=run, next_step, smoke_check, release_guard=warn, security_min_nfr). Without preset the config is the plain default. An unknown preset is an error and creates nothing.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -21,6 +25,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "description": {
                         "type": "string",
                         "description": "Project description"
+                    },
+                    "preset": {
+                        "type": "string",
+                        "enum": ONBOARDING_PRESETS,
+                        "description": "Optional settings preset applied to the new config.toml."
                     }
                 },
                 "required": ["project_name"]
@@ -463,7 +472,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_update_config".to_string(),
-            description: "Update the project's handoff configuration.".to_string(),
+            description: "Update the project's handoff configuration. Pass either `updates` (individual keys) or `preset` (a named set of values), not both. `updates` replies with plain text. `preset` replies with JSON {preset, applied, changes:[{key, old, new}], overwrites:[key], message}: keys that had no value are set at once; when the preset would replace a value the project already set (overwrites is not empty) nothing is written and applied=false unless confirm=true - show `changes` to the user and call again with confirm=true. `[commands]` values must be strings; `[onboarding]` values are validated (preflight: off/check/run, release_guard: off/warn/block, the switches are booleans).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -473,10 +482,72 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "updates": {
                         "type": "object",
-                        "description": "Key-value pairs to update (dot-notation keys like 'settings.session_prune_limit')"
+                        "description": "Key-value pairs to update (dot-notation keys like 'settings.session_prune_limit'). Required unless `preset` is given."
+                    },
+                    "preset": {
+                        "type": "string",
+                        "enum": ONBOARDING_PRESETS,
+                        "description": "Settings preset to apply to this project instead of `updates`. 'beginner' sets trace.profile=minimal, trace.done_guard=warn, session_loop.profile=standard and switches the [onboarding] guidance and checks on."
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "With `preset`: write even though existing values are replaced. Default false."
                     }
-                },
-                "required": ["updates"]
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doctor".to_string(),
+            description: "Diagnose whether the project is ready for agent-driven work: handoff initialized, MCP server registered, CLAUDE.md sections present and filled in (no `TODO(handoff)` left), `[commands]` defined, and whether the project's commands succeed. Works on a project that is not initialized yet. Read-only. This tool never runs a command and never starts a process: it returns the commands in `commands_to_run` [{id, command, timeout_sec}]; run each one yourself from the project root through the shell, stopping it after timeout_sec, then call again with `results` and the tool judges them. Returns JSON {ready, checks: [{id, status, detail, next_step?, command?, exit_code?, duration_ms?, source?}], commands_to_run, warnings}. status is pass / fail / skip / manual; skip means the check was not carried out (no result given, or nothing defined) and is never a pass. Every fail carries next_step. ready is true when nothing failed (a skip does not lower it), except that once results are reported a project without `[commands] test` is not ready. A result whose `command` differs from the current `[commands]` value is not used and fails the check. The same diagnosis is available in a terminal as `handoff-mcp setup --check` (add `--run` to let the CLI run the commands, `--json` for this JSON).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "checks": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": DOCTOR_CHECK_IDS },
+                        "description": "Only run these checks. Omit to run all of them."
+                    },
+                    "results": {
+                        "type": "array",
+                        "description": "Results of the commands from `commands_to_run` that you ran. Omit on the first call.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "enum": DOCTOR_COMMAND_CHECKS.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                                    "description": "The `id` from commands_to_run."
+                                },
+                                "command": {
+                                    "type": "string",
+                                    "description": "The command line you ran, exactly as commands_to_run gave it."
+                                },
+                                "exit_code": {
+                                    "type": "integer",
+                                    "description": "The command's exit code. Required unless `error` is given."
+                                },
+                                "duration_ms": {
+                                    "type": "integer",
+                                    "description": "How long the command ran, in milliseconds."
+                                },
+                                "output_tail": {
+                                    "type": "string",
+                                    "description": "The last lines of the command's output (about 20 lines)."
+                                },
+                                "error": {
+                                    "type": "string",
+                                    "description": "Why there is no exit code: the command could not be started, or it was stopped after timeout_sec (for example 'timed out after 600s'). Leave it out when the command ran to completion: a result with an `error` fails, and an empty `error` is rejected."
+                                }
+                            },
+                            "required": ["id", "command"]
+                        }
+                    }
+                }
             }),
         },
         ToolDefinition {

@@ -117,8 +117,9 @@ fn every_mcp_tool_is_documented_in_a_skill() {
 /// Tools that no longer exist but are named on purpose (migration tables).
 const REMOVED_TOOLS: &[&str] = &["handoff_doc_req_test_sync"];
 
-/// `handoff_`-prefixed identifiers that are not tools (session fields).
-const NOT_TOOLS: &[&str] = &["handoff_notes", "handoff_note"];
+/// `handoff_`-prefixed identifiers that are not tools (session fields, and
+/// the `handoff_initialized` check id of `handoff_doctor`).
+const NOT_TOOLS: &[&str] = &["handoff_notes", "handoff_note", "handoff_initialized"];
 
 /// Every identifier in `text` starting at a word boundary with `prefix`,
 /// extended over identifier characters (`handoff_trace_report`).

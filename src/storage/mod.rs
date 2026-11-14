@@ -3,6 +3,7 @@ pub mod approvals;
 pub mod baselines;
 pub mod clears;
 pub mod config;
+pub mod config_preset;
 pub mod deltas;
 pub mod docs;
 pub mod events;
@@ -136,7 +137,7 @@ pub fn atomic_write(path: impl AsRef<Path>, content: &[u8]) -> Result<()> {
 /// `HOME` is the POSIX variable; Windows does not set it and uses `USERPROFILE`
 /// instead. Mirrors the same fallback order as [`crate::setup`] so a `~/` path
 /// resolves identically whether it came from `config.toml` or from setup.
-fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
@@ -479,7 +480,7 @@ pub fn worktree_key(project_dir: &Path) -> Option<String> {
 /// when there is no config, no override set, or the override path does not
 /// exist — an override to a location that is not there yet is treated the
 /// same as "no override" rather than silently creating it.
-fn worktree_handoff_root_override(primary_handoff: &Path) -> Option<PathBuf> {
+pub(crate) fn worktree_handoff_root_override(primary_handoff: &Path) -> Option<PathBuf> {
     let config = config::read_config(&primary_handoff.join("config.toml")).ok()?;
     let root = config.worktree.handoff_root?;
     let expanded = PathBuf::from(expand_tilde(&root));
@@ -528,6 +529,21 @@ pub fn ensure_handoff_exists(project_dir: &Path) -> Result<PathBuf> {
 }
 
 pub fn init_handoff(project_dir: &Path, project_name: &str, description: &str) -> Result<()> {
+    init_handoff_with_preset(project_dir, project_name, description, None).map(|_| ())
+}
+
+/// [`init_handoff`] with an optional config preset (SPEC-ONB-010) applied to
+/// the new `config.toml`. Returns what the preset set, `None` without one.
+///
+/// The config text is prepared before anything is created, so a preset that
+/// is rejected leaves no half-initialized `.handoff/` behind. Without a
+/// preset the file is exactly what `init_handoff` has always written.
+pub fn init_handoff_with_preset(
+    project_dir: &Path,
+    project_name: &str,
+    description: &str,
+    preset: Option<&str>,
+) -> Result<Option<config_preset::PresetPlan>> {
     let dir = handoff_dir(project_dir);
     if dir.exists() {
         anyhow::bail!(
@@ -536,15 +552,22 @@ pub fn init_handoff(project_dir: &Path, project_name: &str, description: &str) -
         );
     }
 
+    let default_text = config::render_config(&config::Config::new(project_name, description))?;
+    let plan = preset
+        .map(|name| config_preset::plan_preset(&default_text, name))
+        .transpose()?;
+    let config_text = plan.as_ref().map_or(&default_text, |plan| &plan.rendered);
+
     std::fs::create_dir_all(dir.join("sessions")).context("Failed to create .handoff/sessions/")?;
     std::fs::create_dir_all(dir.join("tasks")).context("Failed to create .handoff/tasks/")?;
     std::fs::create_dir_all(dir.join("memory")).context("Failed to create .handoff/memory/")?;
 
-    let config = config::Config::new(project_name, description);
-    config::write_config(&dir.join("config.toml"), &config)?;
+    let config_path = dir.join("config.toml");
+    atomic_write(&config_path, config_text.as_bytes())
+        .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
     // Only `.handoff/.gitignore`; the project's own repo and `.gitignore` are
     // never touched.
     gitignore::ensure_recommended_gitignore(&dir)?;
 
-    Ok(())
+    Ok(plan)
 }

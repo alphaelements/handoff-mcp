@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+pub mod doctor;
+mod infer;
+mod runner;
+mod scaffold;
+
 const HOOK_SERVER: &str = "handoff";
 const HOOK_TOOL_QUERY: &str = "handoff_memory_query";
 const CLAUDE_MD_MARKER: &str = "## Session Handoff";
@@ -314,6 +319,121 @@ fn strip_legacy_session_start_hook(hooks_obj: &mut serde_json::Map<String, Value
     removed
 }
 
+/// What `handoff-mcp setup` was asked to do. Build one with
+/// [`SetupCommand::parse`], or from `SetupOptions::default()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SetupOptions {
+    /// `--check`: report the current state, change nothing.
+    pub check: bool,
+    /// `--uninstall`: remove the handoff hooks (and the global MCP entry).
+    pub uninstall: bool,
+    /// `--mcp-json`: only add the MCP server entry.
+    pub mcp_json: bool,
+    /// `-y` / `--yes`: answer every prompt with yes.
+    pub yes: bool,
+    /// `--global`: use `~/.claude/settings.json` instead of `.mcp.json`.
+    pub global: bool,
+    /// `--force`: replace an existing `Session Handoff` section.
+    pub force: bool,
+    /// `--claude-md-scaffold`: only add the project sections to `CLAUDE.md`
+    /// (and record the detected commands), without prompting.
+    pub claude_md_scaffold: bool,
+    /// `--run` (with `--check`): run the `[commands]` commands and judge the
+    /// project by their results.
+    pub run_commands: bool,
+    /// `--json` (with `--check`): print the diagnosis as the JSON
+    /// `handoff_doctor` returns, and nothing else.
+    pub json: bool,
+}
+
+/// A parsed `handoff-mcp setup ...` command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupCommand {
+    Run(SetupOptions),
+    Help,
+}
+
+/// Usage text of `handoff-mcp setup`, shared by `setup --help` and the
+/// top-level help.
+pub const SETUP_USAGE: &str = "\
+SETUP:
+    handoff-mcp setup              Install hooks + MCP server + CLAUDE.md sections,
+                                   and record detected commands in [commands]
+    handoff-mcp setup --global     Use ~/.claude/settings.json mcpServers (not .mcp.json)
+    handoff-mcp setup --check      Check if hooks, MCP, CLAUDE.md and [commands] are ready
+                                   (exit code 1 when the project is not ready)
+    handoff-mcp setup --check --run
+                                   Also run the [commands] commands and judge the results
+    handoff-mcp setup --check --json
+                                   Print the diagnosis as JSON (same as handoff_doctor)
+    handoff-mcp setup --uninstall  Remove handoff hooks and MCP entry
+    handoff-mcp setup --mcp-json   Add handoff MCP server entry only (non-interactive)
+    handoff-mcp setup --claude-md-scaffold
+                                   Add the project sections to CLAUDE.md and record
+                                   detected commands only (non-interactive)
+    handoff-mcp setup --force      Replace existing CLAUDE.md handoff section with latest
+    handoff-mcp setup -y           Skip all confirmation prompts";
+
+impl SetupCommand {
+    /// Parses the arguments that follow `setup`. An argument this command
+    /// does not know is an error: silently ignoring a misspelled flag would
+    /// run a different (and file-modifying) action than the one asked for.
+    pub fn parse(args: &[String]) -> Result<Self> {
+        let mut opts = SetupOptions::default();
+        for arg in args {
+            match arg.as_str() {
+                "--help" | "-h" => return Ok(Self::Help),
+                "--check" => opts.check = true,
+                "--uninstall" => opts.uninstall = true,
+                "--mcp-json" => opts.mcp_json = true,
+                "-y" | "--yes" => opts.yes = true,
+                "--global" => opts.global = true,
+                "--force" => opts.force = true,
+                "--claude-md-scaffold" => opts.claude_md_scaffold = true,
+                "--run" => opts.run_commands = true,
+                "--json" => opts.json = true,
+                other => anyhow::bail!(
+                    "unknown setup argument '{other}'. Run `handoff-mcp setup --help` for usage."
+                ),
+            }
+        }
+        opts.validate()?;
+        Ok(Self::Run(opts))
+    }
+}
+
+impl SetupOptions {
+    /// Rejects combinations that name two different actions.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !(self.check && self.uninstall),
+            "--check and --uninstall cannot be used together"
+        );
+        for (set, flag) in [(self.run_commands, "--run"), (self.json, "--json")] {
+            anyhow::ensure!(
+                !set || self.check,
+                "{flag} is only used together with --check"
+            );
+        }
+        if self.claude_md_scaffold {
+            for (set, flag) in [
+                (self.check, "--check"),
+                (self.uninstall, "--uninstall"),
+                (self.mcp_json, "--mcp-json"),
+                (self.global, "--global"),
+                (self.force, "--force"),
+            ] {
+                anyhow::ensure!(
+                    !set,
+                    "--claude-md-scaffold cannot be used together with {flag}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn run_setup(check_only: bool, uninstall: bool) -> Result<()> {
     run_setup_with_opts(check_only, uninstall, false, false, false, false)
 }
@@ -326,27 +446,244 @@ pub fn run_setup_with_opts(
     global: bool,
     force: bool,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !(check_only && uninstall),
-        "--check and --uninstall cannot be used together"
-    );
+    run(SetupOptions {
+        check: check_only,
+        uninstall,
+        mcp_json,
+        yes,
+        global,
+        force,
+        ..SetupOptions::default()
+    })
+    .map(|_exit_code| ())
+}
+
+/// Exit code of a setup run that did what was asked.
+const EXIT_OK: i32 = 0;
+/// Exit code of `setup --check` when the project is not ready.
+const EXIT_NOT_READY: i32 = 1;
+
+/// Runs `handoff-mcp setup` in the current directory and returns the process
+/// exit code: 0, or 1 when `--check` found the project not ready. A setup
+/// that could not be carried out is an `Err`.
+pub fn run(opts: SetupOptions) -> Result<i32> {
+    opts.validate()?;
+
+    if opts.claude_md_scaffold {
+        let project_dir = current_project_dir()?;
+        run_project_scaffold(&project_dir, true)?;
+        return Ok(EXIT_OK);
+    }
+
+    if opts.check && opts.json {
+        // JSON mode prints the diagnosis only, so it needs neither the hook
+        // settings nor a home directory to read them from.
+        let report = diagnose_current_project(opts.run_commands)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(readiness_exit_code(&report));
+    }
 
     let path = settings_path()?;
     let mut settings = read_settings(&path)?;
 
-    if check_only {
-        return run_check(&settings, &path, global);
+    if opts.check {
+        run_check(&settings, &path, opts.global)?;
+        let report = diagnose_current_project(opts.run_commands)?;
+        println!("\n{}", doctor::render_text(&report).trim_end());
+        return Ok(readiness_exit_code(&report));
     }
 
-    if uninstall {
-        return run_uninstall(&mut settings, &path, global);
+    if opts.uninstall {
+        run_uninstall(&mut settings, &path, opts.global)?;
+        return Ok(EXIT_OK);
     }
 
-    if mcp_json {
-        return run_mcp_json_only(global, &mut settings, &path);
+    if opts.mcp_json {
+        run_mcp_json_only(opts.global, &mut settings, &path)?;
+        return Ok(EXIT_OK);
     }
 
-    run_install(&mut settings, &path, yes, global, force)
+    let project_dir = current_project_dir()?;
+    run_install(&mut settings, &path, opts.yes, opts.global, opts.force)?;
+    run_project_scaffold(&project_dir, opts.yes)?;
+
+    println!("\nRestart Claude Code for changes to take effect.");
+    Ok(EXIT_OK)
+}
+
+fn readiness_exit_code(report: &doctor::DoctorReport) -> i32 {
+    if report.ready {
+        EXIT_OK
+    } else {
+        EXIT_NOT_READY
+    }
+}
+
+/// The readiness diagnosis of the current directory (SPEC-ONB-002), the same
+/// one `handoff_doctor` gives. With `run_commands` the `[commands]` commands
+/// are executed here first and judged by their results; this CLI path is the
+/// only one that ever runs them.
+fn diagnose_current_project(run_commands: bool) -> Result<doctor::DoctorReport> {
+    let project_dir = current_project_dir()?;
+    // The MCP tool is handed a canonical project path; use the same form so
+    // both entry points describe the project identically. A directory that
+    // cannot be resolved is diagnosed as it is: the checks then report what
+    // they cannot find.
+    let project_dir = std::fs::canonicalize(&project_dir).unwrap_or(project_dir);
+    let home_dir = crate::storage::home_dir().map(PathBuf::from);
+    let request = |results: &[doctor::CommandResult], run_requested: bool| {
+        doctor::diagnose(&doctor::DoctorRequest {
+            project_dir: &project_dir,
+            home_dir: home_dir.as_deref(),
+            checks: None,
+            results,
+            source: doctor::ResultSource::Executed,
+            run_requested,
+        })
+    };
+    if !run_commands {
+        return request(&[], false);
+    }
+
+    let pending = request(&[], false)?.commands_to_run;
+    let results: Vec<doctor::CommandResult> = pending
+        .iter()
+        .map(|pending| {
+            // Progress goes to stderr so that `--json` output stays pure.
+            eprintln!("  running {}: {}", pending.id, pending.command);
+            let execution = runner::run_command(
+                &pending.command,
+                &project_dir,
+                std::time::Duration::from_secs(pending.timeout_sec),
+            );
+            doctor::CommandResult {
+                id: pending.id.to_string(),
+                command: pending.command.clone(),
+                exit_code: execution.exit_code,
+                duration_ms: Some(execution.duration_ms),
+                output_tail: Some(execution.output_tail),
+                error: execution.error,
+            }
+        })
+        .collect();
+    request(&results, true)
+}
+
+fn current_project_dir() -> Result<PathBuf> {
+    std::env::current_dir().context("cannot determine the current directory")
+}
+
+/// Records the commands detected in the project's manifests under
+/// `[commands]` and adds the project sections `CLAUDE.md` lacks
+/// (SPEC-ONB-001). Each of the two files is only written when it has
+/// something to gain, and only after the user agreed (`assume_yes` skips the
+/// question).
+fn run_project_scaffold(project_dir: &Path, assume_yes: bool) -> Result<()> {
+    let inference = infer::infer_commands(project_dir);
+    for note in &inference.notes {
+        println!("  {note}");
+    }
+
+    let config_path = crate::storage::handoff_dir(project_dir).join("config.toml");
+    let listing = |commands: &[(&'static str, String)]| {
+        commands
+            .iter()
+            .map(|(key, command)| format!("{key} = \"{command}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if inference.commands.is_empty() {
+        println!(
+            "  [commands]: no commands detected in the project's manifests. Write them under \
+             [commands] in .handoff/config.toml."
+        );
+    } else {
+        match scaffold::pending_commands(&config_path, &inference.commands) {
+            Ok(None) => {
+                let detected: Vec<_> = inference
+                    .commands
+                    .iter()
+                    .map(|(key, command)| (*key, command.clone()))
+                    .collect();
+                println!(
+                    "  [commands]: .handoff/config.toml not found, so the detected commands \
+                     ({}) were not recorded. Initialize the project (`handoff_init`), then run \
+                     `handoff-mcp setup` again.",
+                    listing(&detected)
+                );
+            }
+            Ok(Some(pending)) if pending.is_empty() => {
+                println!("  [commands]: nothing to add to .handoff/config.toml");
+            }
+            Ok(Some(pending)) => {
+                let agreed = assume_yes || {
+                    println!();
+                    prompt_yn(&format!(
+                        "Record detected commands in .handoff/config.toml [commands] ({})?",
+                        listing(&pending)
+                    ))
+                };
+                if agreed {
+                    match scaffold::record_inferred_commands(&config_path, &inference.commands)? {
+                        scaffold::CommandsOutcome::Added(added) => println!(
+                            "  [commands]: added {} to .handoff/config.toml",
+                            listing(&added)
+                        ),
+                        // The file changed between the question and the write.
+                        scaffold::CommandsOutcome::Unchanged
+                        | scaffold::CommandsOutcome::NoConfig => {
+                            println!("  [commands]: nothing was added to .handoff/config.toml");
+                        }
+                    }
+                } else {
+                    println!("  [commands]: skipped");
+                }
+            }
+            // A config.toml that cannot be read is the user's to repair; it
+            // must not keep CLAUDE.md from being prepared, so say so and
+            // carry on.
+            Err(e) => {
+                eprintln!("  [commands]: skipped, .handoff/config.toml is not usable ({e:#})");
+            }
+        }
+    }
+
+    let claude_md = project_dir.join("CLAUDE.md");
+    let missing = scaffold::missing_section_titles(&claude_md)?;
+    if missing.is_empty() {
+        println!("  CLAUDE.md: project sections already present");
+    } else {
+        let listing = missing.join(", ");
+        let agreed = assume_yes || {
+            println!();
+            prompt_yn(&format!("Add project sections to CLAUDE.md ({listing})?"))
+        };
+        if agreed {
+            let commands = scaffold::effective_commands(&config_path, &inference.commands);
+            let outcome = scaffold::ensure_scaffold_sections(&claude_md, &commands)?;
+            let verb = if outcome.created {
+                "created with"
+            } else {
+                "added"
+            };
+            println!(
+                "  CLAUDE.md: {verb} project sections: {}",
+                outcome.added.join(", ")
+            );
+        } else {
+            println!("  CLAUDE.md: project sections skipped");
+        }
+    }
+
+    let unfilled = scaffold::todo_marker_count(&claude_md);
+    if unfilled > 0 {
+        println!(
+            "  CLAUDE.md: {unfilled} field(s) still marked {}. Fill each one in (write `n/a` \
+             when the project has no such step).",
+            scaffold::TODO_MARKER
+        );
+    }
+    Ok(())
 }
 
 fn run_check(settings: &Value, path: &Path, global: bool) -> Result<()> {
@@ -607,7 +944,6 @@ fn run_install(
         }
     }
 
-    println!("\nRestart Claude Code for changes to take effect.");
     Ok(())
 }
 
@@ -785,6 +1121,163 @@ mod tests {
     #[test]
     fn check_and_uninstall_conflict_is_rejected() {
         assert!(run_setup(true, true).is_err());
+    }
+
+    // --- command line ---
+
+    fn parse(args: &[&str]) -> Result<SetupCommand> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        SetupCommand::parse(&args)
+    }
+
+    #[test]
+    fn no_arguments_is_a_plain_install() {
+        assert_eq!(
+            parse(&[]).unwrap(),
+            SetupCommand::Run(SetupOptions::default())
+        );
+    }
+
+    #[test]
+    fn every_flag_sets_exactly_its_own_option() {
+        let cases: [(&str, SetupOptions); 8] = [
+            (
+                "--check",
+                SetupOptions {
+                    check: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--uninstall",
+                SetupOptions {
+                    uninstall: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--mcp-json",
+                SetupOptions {
+                    mcp_json: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "-y",
+                SetupOptions {
+                    yes: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--yes",
+                SetupOptions {
+                    yes: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--global",
+                SetupOptions {
+                    global: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--force",
+                SetupOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--claude-md-scaffold",
+                SetupOptions {
+                    claude_md_scaffold: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (flag, expected) in cases {
+            assert_eq!(
+                parse(&[flag]).unwrap(),
+                SetupCommand::Run(expected),
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            parse(&["--global", "-y", "--force"]).unwrap(),
+            SetupCommand::Run(SetupOptions {
+                global: true,
+                yes: true,
+                force: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn run_and_json_are_modifiers_of_check() {
+        assert_eq!(
+            parse(&["--check", "--run", "--json"]).unwrap(),
+            SetupCommand::Run(SetupOptions {
+                check: true,
+                run_commands: true,
+                json: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            parse(&["--json", "--check"]).unwrap(),
+            SetupCommand::Run(SetupOptions {
+                check: true,
+                json: true,
+                ..Default::default()
+            })
+        );
+        for alone in ["--run", "--json"] {
+            for with in [vec![], vec!["-y"], vec!["--uninstall"], vec!["--mcp-json"]] {
+                let mut args = with.clone();
+                args.push(alone);
+                let err = parse(&args).unwrap_err().to_string();
+                assert!(
+                    err.contains(alone) && err.contains("--check"),
+                    "{args:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_wins_wherever_it_appears() {
+        assert_eq!(parse(&["--help"]).unwrap(), SetupCommand::Help);
+        assert_eq!(parse(&["-y", "-h"]).unwrap(), SetupCommand::Help);
+    }
+
+    #[test]
+    fn unknown_arguments_are_errors_that_name_the_argument() {
+        for bad in ["--chek", "--claude-md-scafold", "check", "-Y", ""] {
+            let err = parse(&["-y", bad]).unwrap_err().to_string();
+            assert!(err.contains(&format!("'{bad}'")), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn scaffold_only_cannot_be_combined_with_another_action() {
+        for other in [
+            "--check",
+            "--uninstall",
+            "--mcp-json",
+            "--global",
+            "--force",
+        ] {
+            let err = parse(&["--claude-md-scaffold", other])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(other), "{other}: {err}");
+        }
+        assert!(parse(&["--claude-md-scaffold", "-y"]).is_ok());
+        assert!(parse(&["--check", "--uninstall"]).is_err());
     }
 
     #[test]

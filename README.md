@@ -392,20 +392,67 @@ handoff-mcp setup
 
 This installs Claude Code hooks into `~/.claude/settings.json` and adds a
 `handoff` server entry to the project's `.mcp.json` (required for hooks to
-connect). The command is interactive by default — use `-y` to skip prompts:
+connect). It also prepares the project's `CLAUDE.md` and records the project's
+commands (see [Project sections and commands](#project-sections-and-commands)).
+The command is interactive by default — use `-y` to skip prompts:
 
 ```bash
-handoff-mcp setup -y           # non-interactive (auto-approve everything)
-handoff-mcp setup --mcp-json   # only add .mcp.json entry (skip hooks)
-handoff-mcp setup --check      # check if hooks and .mcp.json are configured
+handoff-mcp setup -y                    # non-interactive (auto-approve everything)
+handoff-mcp setup --mcp-json            # only add .mcp.json entry (skip hooks)
+handoff-mcp setup --claude-md-scaffold  # only add the CLAUDE.md project sections and [commands]
+handoff-mcp setup --check               # check hooks, .mcp.json, CLAUDE.md and [commands] (see Readiness check)
 ```
 
-Restart Claude Code after running setup.
+Restart Claude Code after running setup. An argument `setup` does not know is
+rejected (`handoff-mcp setup --help` lists them).
+
+### Project sections and commands
+
+`handoff-mcp setup` runs in the project directory and, besides the
+`Session Handoff` section, adds the sections the task-loop agents read from
+`CLAUDE.md`: **Build & Test**, **Coding Rules**, **Project Structure** and
+**Documentation Contract**.
+
+- A section counts as present when `CLAUDE.md` has a heading with that title
+  (any heading level, case-insensitive; headings inside fenced code blocks do
+  not count). A section that is present is never
+  changed; only missing ones are appended, after the existing content. Running
+  setup again changes nothing.
+- Without a `CLAUDE.md`, setup creates one.
+- Every field setup cannot fill in is marked `TODO(handoff)`. Replace each marker
+  with the real value, or with `n/a` when the project has no such step.
+
+The commands themselves live in the `[commands]` section of
+`.handoff/config.toml`, which is their source of truth; **Build & Test** is a
+copy for people and agents to read. Setup detects commands from the project's
+manifests and writes them to `[commands]`, leaving any key that already has a
+value untouched:
+
+| Manifest | Detected |
+|----------|----------|
+| `package.json` | `build` / `test` / `lint` / `format` / `typecheck`, one per script of that name, as `npm run <name>` (`pnpm` / `yarn` / `bun` when `packageManager` or a lockfile says so). The placeholder `test` script written by `npm init` is not counted. |
+| `Cargo.toml` | `build` = `cargo build`, `test` = `cargo test`, `lint` = `cargo clippy`, `format` = `cargo fmt` |
+| `pyproject.toml` | `test` = `pytest` when pytest is configured or listed as a dependency; `lint` = `ruff check .` and `format` = `ruff format .` likewise for ruff (prefixed with `uv run` / `poetry run` when the project has that lockfile) |
+
+When several manifests offer the same key, the first in this order wins.
+`install`, `smoke` and `audit` are never guessed. Any other project layout
+(a `Makefile`, Gradle, ...) is not an error: nothing is detected, every field is
+marked, and you write the commands yourself:
+
+```toml
+[commands]
+test = "make test"
+smoke = "./scripts/smoke.sh"
+```
+
+`[commands]` is only written to a project that is already initialized
+(`handoff_init`). On a project that is not, setup still fills **Build & Test**
+with what it detected; run it again after initializing to record the commands.
 
 You can check the current status or remove the hooks:
 
 ```bash
-handoff-mcp setup --check      # Show hook status
+handoff-mcp setup --check      # Show hook status and the readiness check
 handoff-mcp setup --uninstall  # Remove handoff hooks
 ```
 
@@ -543,7 +590,7 @@ For a subtask, rename the directory inside its parent's directory the same way.
 
 | Tool | Purpose |
 |------|---------|
-| `handoff_init` | Initialize `.handoff/` directory for a project |
+| `handoff_init` | Initialize `.handoff/` directory for a project (`preset: "beginner"` starts with the [beginner preset](#beginner-preset-and-onboarding)) |
 | `handoff_load_context` | Load session context, tasks, and git state at session start |
 | `handoff_save_context` | Save session state — establish an active session or close it with handoff data |
 | `handoff_update_session` | Incrementally update active session (toggle checklist, add decisions/notes/pointers) |
@@ -580,7 +627,8 @@ For a subtask, rename the directory inside its parent's directory the same way.
 | Tool | Purpose |
 |------|---------|
 | `handoff_get_config` | Read project configuration (full TOML as JSON) |
-| `handoff_update_config` | Update config: settings, calendar, assignees, effort budget, gantt view |
+| `handoff_update_config` | Update config: settings, calendar, assignees, effort budget, gantt view, commands, onboarding; or apply a preset (`preset: "beginner"`) |
+| `handoff_doctor` | Diagnose whether the project is ready for agent-driven work (handoff initialized, MCP registered, `CLAUDE.md` sections filled in, `[commands]` defined and succeeding). Never runs commands: returns `commands_to_run` and judges the `results` you report. See [Readiness check](#readiness-check) |
 | `handoff_list_assignees` | List team members with task counts and effort stats |
 | `handoff_add_assignee` | Add a team member (`[assignees.<key>]`) |
 | `handoff_update_assignee` | Update a team member's fields (partial; null clears a field) |
@@ -925,9 +973,108 @@ mode = "compare"           # plan, actual, compare
 [trace]
 profile = "standard"
 # See `handoff-trace` skill for layers/done_guard/id_prefixes/custom profiles.
+
+[commands]                 # Project commands; any shell command line. All keys optional.
+install = "npm install"
+build = "npm run build"
+test = "npm run test"
+lint = "npm run lint"
+format = "npm run format"
+typecheck = "npm run typecheck"
+smoke = "./scripts/smoke.sh"   # One command that shows the app still starts and works
+audit = "npm audit"            # Dependency audit
 ```
 
+`[commands]` is the source of truth for the project's commands; `handoff-mcp setup`
+fills it from the project's manifests (see
+[Project sections and commands](#project-sections-and-commands)). The MCP server
+never runs these commands itself.
+
 All configuration sections can be updated via `handoff_update_config` with dot-notation keys (e.g., `"calendar.work_hours_per_day": 7`).
+
+### Readiness check
+
+`handoff_doctor` (MCP) and `handoff-mcp setup --check` (terminal) give the same
+diagnosis of whether the project is ready for the task loop:
+
+| Check | Passes when |
+|-------|-------------|
+| `handoff_initialized` | `.handoff/config.toml` exists and can be read |
+| `mcp_registered` | a handoff server entry is found in `.mcp.json`, `~/.claude/settings.json`, `~/.claude.json`, the Claude Code plugin list or `~/.codex/config.toml` (`skip` when none is found: other clients are not inspected) |
+| `claude_md_sections` | `CLAUDE.md` has the four [project sections](#project-sections-and-commands) |
+| `claude_md_todo` | no `TODO(handoff)` marker is left in `CLAUDE.md` |
+| `commands_defined` | `[commands]` defines at least one command |
+| `cmd_install` / `cmd_build` / `cmd_test` / `cmd_lint` / `cmd_typecheck` | that command ran with exit code 0 |
+| `smoke_defined` | `[commands] smoke` is defined (`skip`, never a failure, when it is not) |
+
+Each check is `pass`, `fail` or `skip` (`manual`, a person has to confirm, is
+part of the same vocabulary for the release check). `skip` means the check was
+not carried out and is never counted as a pass. Every `fail` comes with a
+`next_step`. The project is **ready** when nothing failed.
+
+Commands are only run when you ask for it, and never by the MCP server:
+
+- **`handoff_doctor()`** returns the defined commands in `commands_to_run`
+  (`{id, command, timeout_sec}`) and marks their checks `skip`. The agent runs
+  them and calls again with
+  `results: [{id, command, exit_code?, duration_ms?, output_tail?, error?}]`;
+  the tool judges those (`source: "reported"`). A result for a command that is
+  not the current `[commands]` value is not used and fails the check. A call
+  with an argument or result field the tool does not know, or with an empty
+  `error`, is rejected instead of being judged.
+- **`handoff-mcp setup --check --run`** runs the commands itself, in the project
+  directory, through the shell (`sh -c`; `cmd /C` on Windows), and judges the
+  results (`source: "executed"`). A command that cannot be found, or that runs
+  longer than `[onboarding] command_timeout_sec` (default 600), fails. `format`,
+  `smoke` and `audit` are not run.
+- Once commands were run, a project without `[commands] test` is not ready.
+
+`handoff-mcp setup --check` prints the hook status followed by the diagnosis;
+add `--json` to print only the JSON that `handoff_doctor` returns. The exit code
+is 0 when the project is ready and 1 when it is not.
+
+### Beginner preset and `[onboarding]`
+
+The `[onboarding]` section switches on guidance and checks aimed at first-time
+users. Every key is off by default, and a `config.toml` without the section is
+read as all-off and is never rewritten because of it, so existing projects
+behave exactly as before.
+
+```toml
+[onboarding]
+preset = "beginner"        # Name of the preset that was applied
+preflight = "run"          # "off" (default) | "check" | "run": readiness check before a session is planned
+next_step = true           # Add the recommended next step to handoff_load_context (default false)
+smoke_check = true         # Run [commands] smoke before implementation starts (default false)
+release_guard = "warn"     # "off" (default) | "warn" | "block": pre-release check when a milestone is released
+security_min_nfr = true    # Require a decision on the minimum security requirements (default false)
+command_timeout_sec = 600  # Seconds a [commands] command may run in the readiness check (default 600)
+```
+
+handoff-mcp stores and validates these values; the task-loop commands read them
+to decide which checks to run.
+
+The **`beginner` preset** sets everything for one person building a first
+application, in one step:
+
+| Key | Value |
+|-----|-------|
+| `trace.profile` | `minimal` |
+| `trace.done_guard` | `warn` |
+| `session_loop.profile` | `standard` |
+| `onboarding.*` | the values shown above |
+
+- **New project**: `handoff_init(project_name: "...", preset: "beginner")`, or
+  `handoff-mcp init --project-name <name> --preset beginner`. Without `preset`
+  the new `config.toml` is the same as it has always been.
+- **Existing project**: `handoff_update_config(preset: "beginner")`, or
+  `handoff-mcp config update --preset beginner`. The reply is JSON
+  `{preset, applied, changes: [{key, old, new}], overwrites: [key], message}`.
+  Keys without a value are set immediately. If the preset would replace a value
+  the project already set, nothing is written and `overwrites` names those
+  keys; repeat the call with `confirm: true` (`--confirm`) to apply it.
+- An unknown preset name is an error that lists the accepted names and changes
+  nothing. `preset` and `updates` cannot be combined in one call.
 
 ### Estimates and AI effort
 
@@ -1236,7 +1383,7 @@ on the wiki for the full command list.
 
 ## Recommended CLAUDE.md Setup
 
-Copy the template from [`templates/claude-md-section.md`](templates/claude-md-section.md) into your project's `CLAUDE.md`. It declares that the project uses handoff-mcp and points to the `handoff` skill for the full procedure. Plugin users get the skill automatically; non-plugin users should copy `skills/` to `~/.claude/skills/`.
+Run `handoff-mcp setup` in the project (see [Project sections and commands](#project-sections-and-commands)), or copy the templates by hand: [`templates/claude-md-section.md`](templates/claude-md-section.md) declares that the project uses handoff-mcp and points to the `handoff` skill for the full procedure, and the `templates/claude-md-*.md` files hold the Build & Test, Coding Rules, Project Structure and Documentation Contract sections. Plugin users get the skill automatically; non-plugin users should copy `skills/` to `~/.claude/skills/`.
 
 ## Skills
 

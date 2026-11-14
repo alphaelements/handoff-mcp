@@ -267,7 +267,10 @@ The task loop **does not hardcode any language or framework**. Instead:
 ### Required CLAUDE.md sections
 
 The task loop agents look for the following in your project's `CLAUDE.md`.
-Copy this template and fill in your project's specifics:
+`handoff-mcp setup` (or `handoff-mcp setup --claude-md-scaffold` for these
+sections only) appends the missing ones, with the commands it can detect filled
+in and every other field marked `TODO(handoff)`. To write them by hand, copy this
+template and fill in your project's specifics:
 
 ```markdown
 ## Build & Test

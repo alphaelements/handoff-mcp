@@ -210,11 +210,7 @@ fn build_handler_context(
 ) -> anyhow::Result<handlers::HandlerContext> {
     let project_dir = handlers::resolve_project_dir(arguments)?;
 
-    let handoff_dir = if matches!(tool_name, "handoff_init" | "handoff_load_context") {
-        crate::storage::handoff_dir(&project_dir)
-    } else {
-        crate::storage::ensure_handoff_exists(&project_dir)?
-    };
+    let handoff_dir = handlers::handoff_dir_for_tool(tool_name, &project_dir)?;
 
     Ok(handlers::HandlerContext {
         agent_id: None,
@@ -660,6 +656,7 @@ const STRING_FIELDS: &[&str] = &[
     "priority",
     "project_dir",
     "project_name",
+    "preset",
     "description",
     "notes",
     "title",
@@ -934,7 +931,10 @@ EXAMPLES:
 
 pub fn print_group_help(group: &str) {
     let actions: &[(&str, &str)] = match group {
-        "init" => &[("", "Initialize handoff tracking (--project-name <name>)")],
+        "init" => &[(
+            "",
+            "Initialize handoff tracking (--project-name <name> [--preset beginner])",
+        )],
         "task" => &[
             ("list", "List tasks (--status-filter, --assignee-filter, --milestone-filter, --priority-filter, --label-filter)"),
             ("get", "Get task detail (--task-id <id>)"),
@@ -953,7 +953,10 @@ pub fn print_group_help(group: &str) {
         ],
         "config" => &[
             ("get", "Read project config"),
-            ("update", "Update config (--updates '{...}')"),
+            (
+                "update",
+                "Update config (--updates '{...}' | --preset beginner [--confirm])",
+            ),
         ],
         "memory" => &[
             ("save", "Save a memory (--text, --kind, --tags, --scope-paths, --force)"),
@@ -1092,6 +1095,26 @@ pub fn is_cli_command(first_arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--preset` names a preset; a value that looks like a literal must reach
+    /// the tool as text so the error can name it.
+    #[test]
+    fn preset_flag_stays_a_string_and_confirm_is_a_boolean() {
+        let args: Vec<String> = ["--preset", "true", "--confirm"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let parsed = parse_flags(&args, "handoff_update_config").unwrap();
+        assert_eq!(parsed, json!({ "preset": "true", "confirm": true }));
+        let args: Vec<String> = ["--project-name", "demo", "--preset", "beginner"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(
+            parse_flags(&args, "handoff_init").unwrap(),
+            json!({ "project_name": "demo", "preset": "beginner" })
+        );
+    }
 
     #[test]
     fn condition_values_stay_strings() {

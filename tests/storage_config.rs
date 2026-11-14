@@ -498,3 +498,43 @@ fn session_loop_profiles_match_the_workflow_profile_vocabulary() {
 
     assert_eq!(workflow_profiles, SESSION_LOOP_PROFILES);
 }
+
+// --- init with a preset (SPEC-ONB-010) ---
+
+/// A preset that is rejected must leave nothing behind: the config text is
+/// prepared before `.handoff/` is created.
+#[test]
+fn init_with_an_unknown_preset_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = handoff_mcp::storage::init_handoff_with_preset(dir.path(), "demo", "", Some("nope"))
+        .unwrap_err();
+    assert!(err.to_string().contains("beginner"), "{err}");
+    assert!(!dir.path().join(".handoff").exists());
+}
+
+#[test]
+fn init_with_the_beginner_preset_returns_what_it_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan =
+        handoff_mcp::storage::init_handoff_with_preset(dir.path(), "demo", "", Some("beginner"))
+            .unwrap()
+            .expect("a preset was applied");
+    assert_eq!(plan.preset, "beginner");
+    assert_eq!(plan.changes.len(), 9);
+    let written = std::fs::read_to_string(dir.path().join(".handoff/config.toml")).unwrap();
+    assert_eq!(written, plan.rendered);
+    assert!(dir.path().join(".handoff/.gitignore").exists());
+
+    let plain = tempfile::tempdir().unwrap();
+    assert!(
+        handoff_mcp::storage::init_handoff_with_preset(plain.path(), "demo", "", None)
+            .unwrap()
+            .is_none()
+    );
+    let other = tempfile::tempdir().unwrap();
+    handoff_mcp::storage::init_handoff(other.path(), "demo", "").unwrap();
+    assert_eq!(
+        std::fs::read(plain.path().join(".handoff/config.toml")).unwrap(),
+        std::fs::read(other.path().join(".handoff/config.toml")).unwrap()
+    );
+}

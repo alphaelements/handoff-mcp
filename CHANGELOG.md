@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `handoff-mcp setup` now prepares the whole `CLAUDE.md` the task-loop agents rely on: besides `Session Handoff` it adds the **Build & Test**, **Coding Rules**, **Project Structure** and **Documentation Contract** sections. Sections that already exist (matched by heading, case-insensitive) are never changed, existing content is kept byte for byte, and a second run changes nothing. Fields that could not be filled in are marked `TODO(handoff)`.
+- New `[commands]` section in `config.toml` (`install`, `build`, `test`, `lint`, `format`, `typecheck`, `smoke`, `audit`): the source of truth for the project's commands. `handoff-mcp setup` detects them from `package.json` scripts, `Cargo.toml` and `pyproject.toml` (pytest, ruff), writes the ones that have no value yet, and copies them into **Build & Test**. Other project layouts are not an error: write the commands by hand. `handoff_get_config` / `handoff_update_config` read and write the section (`commands.test`, ...); a command that is not a string is rejected.
+- `handoff-mcp setup --claude-md-scaffold`: add only the four project sections and the detected commands, without prompts and without touching hooks or `.mcp.json`.
+- `handoff-mcp setup --help`.
+- **Readiness check**: new MCP tool `handoff_doctor` and the same diagnosis in the terminal as `handoff-mcp setup --check`. It reports, check by check (`pass` / `fail` / `skip`, with a `next_step` on every failure), whether handoff is initialized, the MCP server is registered, `CLAUDE.md` has its project sections with no `TODO(handoff)` left, `[commands]` is defined, and the project's commands succeed. The MCP tool never runs a command: it returns `commands_to_run`, and judges the `results` the agent reports. `handoff-mcp setup --check --run` runs the commands itself (through `sh -c`, or `cmd /C` on Windows, with the `[onboarding] command_timeout_sec` limit, default 600 seconds); `--json` prints the same JSON the tool returns.
+- **Beginner preset**: `handoff_init(preset: "beginner")` (`handoff-mcp init --preset beginner`) starts a project with `trace.profile = "minimal"`, `trace.done_guard = "warn"`, `session_loop.profile = "standard"` and the new `[onboarding]` guidance switched on. `handoff_update_config(preset: "beginner")` (`handoff-mcp config update --preset beginner`) applies it to an existing project: when it would replace a value the project already set, nothing is written and the reply lists each change with its old and new value; `confirm: true` (`--confirm`) applies it. An unknown preset is an error and changes nothing.
+- New `[onboarding]` section in `config.toml`: `preset`, `preflight` (`off` / `check` / `run`), `next_step`, `smoke_check`, `release_guard` (`off` / `warn` / `block`), `security_min_nfr`. Every key is off by default; a project without the section behaves exactly as before and its `config.toml` is not rewritten. Values are validated when written through `handoff_update_config`.
 - **Elite profile** (`profile: 'elite'`): a single Fable-tier agent replaces the multi-agent pipeline in all five task-loop workflows (session, brainstorm, requirement, research, spec). Closer and verifier remain independent Sonnet agents. Five new agent definitions: `elite-developer`, `elite-investigator`, `elite-requirement-author`, `elite-researcher`, `elite-spec-author`.
 - New `elite_model` arg for session-execute (and all elite-enabled workflows): overrides the default Fable model for the elite agent without affecting other roles. `dev_model` is not read under elite.
 - `config.toml` `[session_loop] profile` key: persists the default pipeline profile (read by the session-loop skill via `handoff_get_config`). `args.profile` overrides it per invocation.
@@ -18,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resolveProfileFromConfig()` in profile.js: resolves the effective profile from config + args.
 - `elite-report.js`: parser for the elite-developer's structured report format (stage progress, timings, token usage).
 - 54 cross-profile backward-compatibility tests (`elite-compat.test.js`), 74 observability tests (`elite-observability.test.js`), and profile-copy parity tests across all workflows.
+
+### Changed
+
+- `handoff-mcp setup` rejects arguments it does not know instead of ignoring them (a misspelled flag used to run the full install).
+- `handoff-mcp setup --check` now also prints the readiness check and exits with code 1 when the project is not ready (it used to exit 0 whatever it found). The hook status lines are unchanged.
+
+### Fixed
+
+- `handoff_update_config`: updating one key of a section that had been written as a whole object (for example `updates: {"calendar": {...}}` followed by `updates: {"calendar.work_hours_per_day": 7}`) no longer drops the section's other keys.
 
 ## [0.47.4] — 2026-11-12
 

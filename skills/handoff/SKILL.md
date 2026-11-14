@@ -434,6 +434,7 @@ see the `handoff-docs` skill for the distinction. For V-model layer documents
 - **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`, `calendar.work_start_hour` (0-23), `calendar.work_end_hour` (1-24), `calendar.max_parallel_tasks` (>= 1). Work-hour keys are range-checked on write (start < end), including when `calendar` is set as a whole object. The same rules apply to raw `assignees.<key>.work_start_hour` / `work_end_hour` keys.
 - **Per-weekday hours**: `calendar.day_hours.fri` (number)
 - **Budget**: `effort_budget.total_hours`
+- **Readiness, commands and onboarding**: `handoff_doctor()` diagnoses whether the project is ready for agent-driven work (it never runs commands: run its `commands_to_run` yourself and report the `results`); `commands.<install|build|test|lint|format|typecheck|smoke|audit>` (shell command lines, the source of truth for the project's commands), `onboarding.*`, and the `beginner` preset (`handoff_init(preset: "beginner")` / `handoff_update_config(preset: "beginner")`) — see [references/onboarding.md](references/onboarding.md)
 - **Assignees**: `assignees.<key>.display_name`, `assignees.<key>.color`, `assignees.<key>.work_hours_per_day`, `assignees.<key>.closed_weekdays`, `assignees.<key>.work_start_hour`, `assignees.<key>.work_end_hour`
 - **Gantt view**: `gantt_view.sort`, `gantt_view.zoom`, `gantt_view.mode`, `gantt_view.group_by_milestone`, `gantt_view.show_workload`
 
