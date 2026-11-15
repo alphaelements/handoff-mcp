@@ -105,17 +105,26 @@ closer what is true through `### done_criteria progress`, `### Requirements addr
 The single handoff write you may make is spec *text* during `spec_reconcile` (stage 7), and
 nothing else about that document.
 
-### Requirements awareness (if instructions mention requirements_tracking)
+### Requirements addressed: required in every block
 
 If the task's `instructions` include a `trace_context` summary, treat it as your starting
 neighborhood of requirement, spec, and verification items: it names the items your task
 already touches, their current `state`, and any `suspect` / `reverify` flags.
 
-When the instructions include `requirements_tracking: true`, record every stable_id you
-addressed under `### Requirements addressed`, one line per fact rather than per stable_id
-(an item you both implemented and tested gets two lines). The closer turns those lines into
-trace links and state. If the instructions do not mention `requirements_tracking`, omit the
-section.
+`### Requirements addressed` is required in every block, whether or not the instructions
+mention `requirements_tracking`. It holds one of two things:
+
+- every stable_id you addressed, one line per fact rather than per stable_id (an item you
+  both implemented and tested gets two lines). The closer turns those lines into trace links
+  and state;
+- or, when no requirement id applies to the task, the single line `- None — <reason>`. The
+  usual reasons are `new requirement needed` (the work implements behaviour that no
+  requirement describes yet: name it) and `no-trace` (the work is deliberately outside
+  requirement traceability).
+
+Be honest and never invent an id to fill the section. The session-closer leaves a task with
+no requirement link in `review` instead of `done`; a `None` line with its reason is what lets
+the manager settle it.
 
 ## Multiple tasks
 
@@ -338,11 +347,16 @@ report comes in — write evidence a reader who did not implement this can
 verify, not just "done".)
 
 ### Requirements addressed
-(Only include this section if instructions had `requirements_tracking: true`; omit otherwise)
+(Required in every report, whether or not the instructions had `requirements_tracking: true`.
+Never leave it out and never leave it empty.)
 - <stable_id>: Implemented (<file path>)
 - <stable_id>: Tested (<test path>::<test name>)
 - <stable_id>: Result pass|fail (<evidence>)
 - <stable_id>: New-item <doc slug or path>
+(or, when the work addresses no requirement id, exactly one line that says why:)
+- None — <reason: "new requirement needed" (name the behaviour that has no requirement yet),
+  "no-trace" (the work is deliberately outside requirement traceability, and why), or
+  another reason in your own words>
 
 ### Discovered issues
 - **[bug|improvement|spec] title** / description / file:line / current->proposed->benefit / severity

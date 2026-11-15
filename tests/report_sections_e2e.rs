@@ -474,7 +474,11 @@ fn templates_action_lists_builtin_and_project_templates() {
         assert!(builtin.contains(&t.to_string()), "{builtin:?}");
     }
     assert!(!builtin.contains(&"ai_sections".to_string()), "{builtin:?}");
-    assert_eq!(names("partials"), vec!["ai_sections"], "{out}");
+    assert_eq!(
+        names("partials"),
+        vec!["ai_sections", "orphan_tasks"],
+        "{out}"
+    );
     let custom = out["custom"].as_array().unwrap();
     assert_eq!(custom.len(), 2, "{out}");
     let weekly = custom.iter().find(|c| c["name"] == "weekly").unwrap();

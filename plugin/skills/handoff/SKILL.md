@@ -140,6 +140,7 @@ missing `estimate_hours` is refused, costing a round trip.
 - [ ] `priority` — `low` / `medium` / `high`
 - [ ] `labels` — at least one, so the task is findable by filter
 - [ ] `assignee` — matches a key in `config.toml [assignees.<key>]`
+- [ ] `requirement_ids` — the requirement(s) the task implements, or the label `no-trace`; without either, a project with layer documents answers with `Info [REQUIREMENT_LINK_MISSING]` and a `handoff_trace_propose` hint ([references/requirement-links.md](references/requirement-links.md))
 
 A minimal accepted payload:
 
@@ -427,10 +428,9 @@ see the `handoff-docs` skill for the distinction. For V-model layer documents
 `handoff_get_config()` returns the whole `config.toml` as JSON.
 `handoff_update_config(updates: {"<dotted.key>": value, ...})` writes keys
 (up to 4 segments; arrays and objects are accepted):
-- **V-model**: `trace.profile`, `trace.done_guard`, `trace.auto_layer`,
-  `trace.id_prefixes.<layer>` — every key is listed in the `handoff-trace`
-  skill's `references/config.md`. `trace.*` values are not validated on
-  write; check with `handoff_trace_report()` afterwards.
+- **V-model**: `trace.profile`, `trace.done_guard`, `trace.orphan_guard`, `trace.auto_layer`,
+  `trace.id_prefixes.<layer>` — every key is listed in the `handoff-trace` skill's
+  `references/config.md`; check the result with `handoff_trace_report()` afterwards.
 - **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`, `calendar.work_start_hour` (0-23), `calendar.work_end_hour` (1-24), `calendar.max_parallel_tasks` (>= 1). Work-hour keys are range-checked on write (start < end), including when `calendar` is set as a whole object. The same rules apply to raw `assignees.<key>.work_start_hour` / `work_end_hour` keys.
 - **Per-weekday hours**: `calendar.day_hours.fri` (number)
 - **Budget**: `effort_budget.total_hours`

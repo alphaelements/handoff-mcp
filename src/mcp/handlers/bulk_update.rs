@@ -291,6 +291,30 @@ fn apply_single_update(
         }
     }
 
+    // Orphan guard (`[trace] orphan_guard`, REQ-TRC-002), same predicate and
+    // same `force` as `handoff_update_task`: `block` rejects this one update
+    // into `errors[]`, `warn` adds a `warnings[]` entry. A bulk update carries
+    // neither labels nor `requirement_ids`, so the stored task is judged.
+    let orphan_warning = if transitioning_to_guarded_status {
+        super::orphan_guard::check_entering(
+            handoff_dir,
+            force,
+            super::orphan_guard::Entering::StatusChange,
+            &super::orphan_guard::EnteringTask {
+                id: task_id,
+                title: &data.title,
+                status: new_status,
+                labels: &data.labels,
+                task_dir: Some(&task_dir),
+            },
+            crate::trace::orphan::has_requirement_link(&data.task_links),
+            // A bulk update adds no link.
+            |_docs| false,
+        )?
+    } else {
+        None
+    };
+
     // Guard the same invariant handoff_update_task enforces, or a bulk patch
     // becomes a way around it. The check is on the task as it would be written —
     // status and schedule already merged — not on the patch. Parent tasks (with
@@ -342,7 +366,7 @@ fn apply_single_update(
     let unknown_milestone =
         unknown_milestone_warnings(handoff_dir, requested_task_milestone(update));
 
-    let warnings: Vec<String> = [guard_warning, log_warning, frozen_warning]
+    let warnings: Vec<String> = [guard_warning, orphan_warning, log_warning, frozen_warning]
         .into_iter()
         .flatten()
         .chain(unknown_milestone)

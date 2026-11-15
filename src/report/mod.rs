@@ -11,6 +11,7 @@
 //! each report type's data collection lives in its own submodule
 //! ([`verification`], [`weekly`], [`inspection`], [`effort`], [`monthly`],
 //! [`milestone`], [`defect`], [`completion`], [`daily`], [`rollup`]) next to its built-in template.
+//! [`orphan`] supplies the "Orphan Tasks" section the periodic reports end with.
 
 pub mod charts;
 pub mod completion;
@@ -20,6 +21,7 @@ pub mod effort;
 pub mod inspection;
 pub mod milestone;
 pub mod monthly;
+pub mod orphan;
 pub mod period;
 pub mod rollup;
 pub mod sections;
@@ -63,6 +65,12 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     // Partial (not a report type): the optional `data.ai_*` sections every
     // report template includes right after its header block.
     ("ai_sections", include_str!("templates/ai_sections.md.hbs")),
+    // Partial (not a report type): the "Orphan Tasks" section the periodic
+    // report templates end with (see [`orphan`]).
+    (
+        orphan::PARTIAL,
+        include_str!("templates/orphan_tasks.md.hbs"),
+    ),
 ];
 
 /// Kind of report; selects the template that renders it.
@@ -380,6 +388,19 @@ fn signed_helper(
         }
         Some(Value::Number(n)) => out.write(&n.to_string())?,
         _ => out.write("-")?,
+    }
+    Ok(())
+}
+
+/// Appends `note` to the report data's `warnings` list (created when absent
+/// or null), which the templates render as their warnings section. A
+/// `warnings` of any other type is the caller's `data` mistake: an error
+/// rather than something to overwrite.
+pub(crate) fn push_data_warning(data: &mut Value, note: String) -> Result<()> {
+    match data.get_mut("warnings") {
+        None | Some(Value::Null) => data["warnings"] = json!([note]),
+        Some(Value::Array(warnings)) => warnings.push(Value::String(note)),
+        Some(_) => bail!("'data.warnings' must be an array"),
     }
     Ok(())
 }
@@ -799,7 +820,7 @@ mod tests {
         engine.load_custom_templates(tmp.path()).unwrap();
         let c = engine.catalog();
         assert_eq!(c.builtin.len(), ReportType::ALL.len());
-        assert_eq!(c.partials, vec!["ai_sections"]);
+        assert_eq!(c.partials, vec!["ai_sections", "orphan_tasks"]);
         assert_eq!(
             c.custom
                 .iter()
@@ -824,6 +845,117 @@ mod tests {
         );
         let engine = ReportEngine::new().unwrap();
         assert_eq!(engine.catalog().builtin.len(), ReportType::ALL.len());
+    }
+
+    // --- Orphan Tasks section (REQ-TRC-010, SPEC-TRC-009 / SPEC-TRC-010) ---
+
+    /// The line a built-in template includes the section with: its last one.
+    const ORPHAN_INCLUDE: &str = "{{> orphan_tasks}}\n";
+
+    fn builtin_source(name: &str) -> &'static str {
+        BUILTIN_TEMPLATES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, source)| *source)
+            .unwrap_or_else(|| panic!("no built-in template {name}"))
+    }
+
+    fn orphan_data() -> Value {
+        json!({
+            "count": 2,
+            "tasks": [
+                { "id": "t1", "title": "A | B", "status": "todo" },
+                { "id": "t2", "title": "C", "status": "done" },
+            ],
+        })
+    }
+
+    #[test]
+    fn exactly_the_templates_of_the_types_that_carry_the_orphan_section_include_it_last() {
+        for t in ReportType::ALL {
+            let source = builtin_source(t.template_name());
+            assert_eq!(
+                source.matches("{{> orphan_tasks}}").count(),
+                usize::from(orphan::applies_to(t)),
+                "{}",
+                t.as_str()
+            );
+            if orphan::applies_to(t) {
+                assert!(source.ends_with(ORPHAN_INCLUDE), "{}", t.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn the_orphan_section_is_the_last_one_and_lists_the_count_and_each_task() {
+        let engine = ReportEngine::new().unwrap();
+        for t in orphan::REPORT_TYPES {
+            let data = json!({ "orphan_tasks": orphan_data(), "warnings": ["w1"] });
+            let md = engine.generate(&meta(t), &data).unwrap();
+            assert!(
+                md.ends_with(
+                    "\n## Warnings\n\n- w1\n\n## Orphan Tasks\n\n2 task(s) have no \
+                     requirement link. Link each one with `requirement_ids`, or label it \
+                     `no-trace`.\n\n| ID | Title | Status |\n| --- | --- | --- |\n\
+                     | t1 | A \\| B | todo |\n| t2 | C | done |\n"
+                ),
+                "{}:\n{md}",
+                t.as_str()
+            );
+            assert_eq!(md.matches("## Orphan Tasks").count(), 1, "{}", t.as_str());
+        }
+    }
+
+    /// "Before" is the same template without its include line: with no
+    /// orphan data the two render the same bytes.
+    #[test]
+    fn a_report_without_orphan_data_renders_as_it_did_before_the_section_existed() {
+        let mut engine = ReportEngine::new().unwrap();
+        for t in orphan::REPORT_TYPES {
+            let before = builtin_source(t.template_name())
+                .strip_suffix(ORPHAN_INCLUDE)
+                .unwrap_or_else(|| panic!("{} does not end with the include", t.as_str()));
+            engine
+                .registry
+                .register_template_string("before", before)
+                .unwrap();
+            for data in [
+                json!({}),
+                json!({ "warnings": ["w1", "w2"] }),
+                json!({
+                    "summary": "S",
+                    "period": { "start": "2026-10-05", "end": "2026-10-11" },
+                    "completed": [{ "id": "t1", "title": "Done" }],
+                    "milestones": [{ "name": "m1", "date": "2026-12-01" }],
+                    "orphan_tasks": null,
+                }),
+            ] {
+                let mut m = meta(t);
+                let now = engine.generate(&m, &data).unwrap();
+                m.template = Some("before".into());
+                assert_eq!(now, engine.generate(&m, &data).unwrap(), "{}", t.as_str());
+                assert!(!now.contains("Orphan"), "{}:\n{now}", t.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn the_other_report_types_do_not_render_orphan_data() {
+        let engine = ReportEngine::new().unwrap();
+        let data = json!({ "orphan_tasks": orphan_data() });
+        for t in ReportType::ALL {
+            if orphan::applies_to(t) {
+                continue;
+            }
+            let md = engine.generate(&meta(t), &data).unwrap();
+            assert!(!md.contains("Orphan"), "{}:\n{md}", t.as_str());
+            assert_eq!(
+                md,
+                engine.generate(&meta(t), &json!({})).unwrap(),
+                "{}",
+                t.as_str()
+            );
+        }
     }
 
     #[test]

@@ -672,9 +672,9 @@ The workflow returns:
 | `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran. Under `elite` it is derived from each block's `#### review`, `#### fix_loop` and `### pendingFollowups`: APPROVE only if nothing is left open, with one finding per open item; same two extra fields |
 | `spec_prep_report` | object\|null | Stage 0 (Spec-Prep, `standard`/`full`/`elite`) result: `{ specs_generated[], scaffolds_created[], low_confidence_items[], checker_result{ verdict, issues[] }, error? }`. Low-confidence items, a failing checker, or a crash are added to `warnings` (never fails the session). `null` under `express` |
 | `spec_reconcile_report` | object\|null | Stage 3.5 (Spec-Reconcile, `standard`/`full`/`elite`) result: `{ mode: audit\|apply, reconciled[], contract_ambiguities[], trace_updates[], verification_impacts[], error? }`. Each `contract_ambiguity` is also appended to `pending_followups` (source `spec-reconciler`) and each `verification_impact` to `warnings`. `null` under `express` or when `passed: false` |
-| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, hours_logged, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, ops_failed[{ op, error }], unexecuted_ops[{ op, reason }], notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
-| `closer_failed_tasks` | string[] | Task ids whose close-out the closer reported as failed or incomplete (`ops_failed` / `unexecuted_ops` non-empty), session tasks missing from `closer_report.tasks_processed` (the closer reported no error but skipped them), or every session task when the closer itself failed (`closer_report.error`). A reported-failed/incomplete task has a `closer_failed:` entry in `warnings`; a skipped task has a `Closer did not report on task …` entry. A task whose `status_set` is `unchanged` (the closer could not process it) is always included. Also included: a task whose claimed `status_set` or `criteria_checked` the workflow could not confirm on disk — after the closer, a read-only `session-closer-verifier` reads every claimed task back (`handoff_get_task`) and the workflow compares status and checked criteria deterministically; a mismatch (`status expected done got todo`, `criterion index N claimed checked but unchecked on disk`) or a task/verifier that could not be read back (fail closed) gets a `closer_failed:` warning naming what differs. Criteria checked on disk but not claimed are not a mismatch. `time_log` is not verified here. Close these by hand; never trust their `status_set`. Empty when the closer ran clean or did not run |
-| `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
+| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, hours_logged, trace_updated, requirement_ids_linked, requirement_link_missing, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, ops_failed[{ op, error }], unexecuted_ops[{ op, reason }], notes }], warnings[], error? }`. `requirement_link_missing: true` = the closer left the task in `review` because it has no requirement link (see below). `null` under `express` or when `passed: false` |
+| `closer_failed_tasks` | string[] | Task ids whose close-out the closer reported as failed or incomplete (`ops_failed` / `unexecuted_ops` non-empty), session tasks missing from `closer_report.tasks_processed` (the closer reported no error but skipped them), or every session task when the closer itself failed (`closer_report.error`). A reported-failed/incomplete task has a `closer_failed:` entry in `warnings`; a skipped task has a `Closer did not report on task …` entry. A task whose `status_set` is `unchanged` (the closer could not process it) is always included. Also included: a task whose claimed `status_set` or `criteria_checked` the workflow could not confirm on disk — after the closer, a read-only `session-closer-verifier` reads every claimed task back (`handoff_get_task`) and the workflow compares status and checked criteria deterministically; a mismatch (`status expected done got todo`, `criterion index N claimed checked but unchecked on disk`) or a task/verifier that could not be read back (fail closed) gets a `closer_failed:` warning naming what differs. Criteria checked on disk but not claimed are not a mismatch. `time_log` is not verified here. Close these by hand; never trust their `status_set`. Not included: a task the closer left in `review` because it has no requirement link (`requirement_link_missing: true`), once the verifier has read `orphan: true` for it back from disk — that is a finished close-out, reported under `warnings`. Included: a missing-link claim the disk does not bear out (the task is not an orphan, or its `orphan` value could not be read back), and a task closed as `done` although it is an orphan on disk. Empty when the closer ran clean or did not run |
+| `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated. One kind of entry is not a failure: a `requirement_link_missing:` line names a task the closer closed as `review` on purpose because it has no requirement link (see "Tasks left in review for a missing requirement link") |
 | `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged. Under `elite` the `source` is `elite-developer` |
 | `elite_report` | string\|null | `elite` only (absent otherwise): the last elite-developer report as returned, before it was cut into `dev_reports`. Read it when a `dev_reports` entry is `null` |
 | `model` | string | `elite` only (absent otherwise): the model the elite-developer ran on (`elite_model`, default `fable`). Name it when you report what the session cost |
@@ -694,8 +694,8 @@ The workflow returns:
 
 > **The closer agent already performs most of this step.** Under `standard`/`full` the
 > workflow's Close stage runs `session-closer`, which checks off `met: true` done_criteria,
-> sets each task to `done` (fully verified) or `review`, and runs `trace_update` /
-> `requirement_ids` linking, and logs the developer-reported actual hours with `log_time` (`hours_logged`; do not log them again by hand). Read `closer_report` and **verify rather than repeat** it: the workflow already read every claimed task's status and checked criteria back from disk (a mismatch lands in `closer_failed_tasks`), so spot-check rather than re-verify everything. Do the
+> runs `trace_update` / `requirement_ids` linking, sets each task to `done` (fully verified
+> and linked to a requirement) or `review`, and logs the developer-reported actual hours with `log_time` (`hours_logged`; do not log them again by hand). Read `closer_report` and **verify rather than repeat** it: the workflow already read every claimed task's status and checked criteria back from disk (a mismatch lands in `closer_failed_tasks`), so spot-check rather than re-verify everything. Do the
 > manual procedure below only for what it did not cover: when `warnings` is non-empty or
 > `closer_report.error` is set, for any task listed in `closer_failed_tasks` (this includes a
 > task missing from `closer_report.tasks_processed`),
@@ -712,9 +712,12 @@ handoff_check_criterion(task_id, criterion_index, checked=true)
 
 Do this **before** branching on `passed`. Partial progress should not wait for a session-wide pass.
 
-#### Update requirement state from developer reports (if requirements_tracking was injected in step 2d)
+#### Update requirement state from developer reports
 
-If any `dev_reports` entry contains a `### Requirements addressed` section, apply it —
+Every developer report has a `### Requirements addressed` section. A section whose only
+line is `- None — <reason>` names no requirement: apply nothing for that task, and read the
+reason, because the task will need a requirement link before it can be `done` (see "Tasks
+left in review for a missing requirement link" below). Otherwise apply the section —
 this is the **only** place requirement state is written; developers report, they never
 call `handoff_doc_verify`/`handoff_trace_update` themselves (see session-developer's
 read-only rule). One `trace_update` call per task, one `trace_ingest` call per session —
@@ -790,15 +793,58 @@ instead of only in the guard's own warning text.
 Do this **before** marking tasks done, so a task closed in step 6 already reflects the
 requirement state its own report claimed.
 
+#### Tasks left in review for a missing requirement link
+
+The closer never marks a task `done` while it has no requirement link. It sets such a task
+to `review`, appends a `Requirement link missing: ...` entry to the task's notes, reports
+`requirement_link_missing: true` for it, and the workflow adds a `requirement_link_missing:`
+line to `warnings`. This is not a closer failure: the task is not in `closer_failed_tasks`,
+and nothing has to be repeated. Do not mark it `done` by hand to tidy up. Settle the link
+first, with the user:
+
+1. Read the task's `### Requirements addressed` line in `dev_reports`. `- None — new
+   requirement needed ...` and `- None — no-trace ...` say which way the developer thinks it
+   should go.
+2. Tell the user which tasks are waiting and why, then do one of:
+   - an existing requirement covers the work: `handoff_trace_propose(task_id="<id>")` lists
+     candidates; link with `handoff_update_task(task={ id, requirement_ids: [...] })`;
+   - the requirement is missing: add it first (the `handoff-requirements` skill; a new layer
+     item needs the user's confirmation), then link the task to it;
+   - the work is deliberately outside requirement traceability: add the label `no-trace`
+     (pass the labels the task already has too), with the user's agreement.
+3. Mark the task `done` once it is linked or labelled.
+
+The verdict is the server's, not yours: `handoff_get_task(task_id, include_orphan: true)`
+returns `orphan: true` for exactly these tasks, by the rule of the `task_orphan` lint rule.
+A task labelled `no-trace`, a task with a requirement link and a parent task whose subtasks
+are all accounted for get `orphan: false` and are closed as usual. In a project with no layer
+document every task gets `orphan: false`, so the close-out there is what it always was.
+
+With `[trace] orphan_guard = "block"` the project keeps an orphan out of `review` as well, so
+the closer cannot move it: the task is then listed in `closer_failed_tasks` (`status_set:
+unchanged`, the rejected call in `ops_failed`), its notes carry the same entry, and it is
+settled the same way.
+
+When you close tasks yourself (under `express`, on `passed: false`, or for a task in
+`closer_failed_tasks`), apply the same rule: read `orphan` first, and leave an orphan task in
+`review` with the note instead of marking it `done`.
+
 #### On success (passed: true, pending_followups empty)
 
 1. (done_criteria already checked off above)
 2. Mark tasks done: `handoff_update_task(task={ id, status: "done", notes_append: "..." })`
+   (not a task that is still an orphan: see "Tasks left in review for a missing requirement
+   link" above)
 3. **File discovered issues** (follow `_bug-report-protocol.md`):
    - Collect `### Discovered issues` from `dev_reports`, `integration_report`, `review_report`
    - Duplicate-check via `handoff_list_tasks`
    - Create via `handoff_update_task` (omit `id`): title `[bug]`/`[improvement]`/`[spec]`,
      `labels: ["found-during-loop", "<type>"]`, priority matching severity
+   - In a project with layer documents the creation answers with
+     `Info [REQUIREMENT_LINK_MISSING]`. When you know which requirement the issue concerns
+     (a bug belongs to the requirement it violates), pass `requirement_ids` on creation;
+     otherwise leave the link for planning — the task is listed by the `task_orphan` lint
+     rule until it has one
    - **Roadmap suggestion (advisory)**: if Step 2e found a plan document, tell the user for
      each newly created task: "New task `<id>` is not on the roadmap. Consider adding it to
      the plan document and re-running `handoff_auto_schedule`." Do **not** edit the plan

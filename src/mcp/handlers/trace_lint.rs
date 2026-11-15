@@ -36,10 +36,11 @@ use crate::storage::config::{read_config, TraceLintConfig};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::{read_doc_body, DocMetadata};
+use crate::storage::orphan_tasks::load_orphan_tasks_with_docs;
 use crate::trace::adapter::approval_str;
 use crate::trace::lint::{
-    evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
-    Severity,
+    builtin_rule_is_active, evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta,
+    LintContext, LintFinding, Severity, TASK_ORPHAN_RULE,
 };
 use crate::trace::quality::{
     classify_nfr_item, NfrCategory, QualityAspect, ALL_ASPECTS, ALL_NFR_CATEGORIES,
@@ -80,14 +81,22 @@ fn severity_str(s: Severity) -> &'static str {
 }
 
 fn finding_json(f: &LintFinding) -> Value {
-    json!({
+    let mut out = json!({
         "rule": f.rule,
         "severity": severity_str(f.severity),
         "item": f.item,
         "task": f.task,
         "doc": f.doc,
         "message": f.message,
-    })
+    });
+    // Task-scoped findings (`task_orphan`) describe the task itself. The
+    // keys are added only for them, so every other finding keeps its shape.
+    if let Some(detail) = &f.task_detail {
+        out["task_id"] = json!(f.task);
+        out["title"] = json!(detail.title);
+        out["suggested_action"] = json!(detail.suggested_action);
+    }
+    out
 }
 
 /// Renders `findings` as the `text` format (`format: "text"`, CLI-oriented,
@@ -291,6 +300,15 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         &layer_prefix_table(handoff)?,
     )?;
 
+    // The shared orphan predicate, over the whole task tree. Skipped when the
+    // rule cannot report anything, so a filtered run pays nothing for it.
+    let orphan_tasks =
+        if builtin_rule_is_active(TASK_ORPHAN_RULE, &trace_config, rules_filter.as_ref()) {
+            load_orphan_tasks_with_docs(handoff, &read_only.loaded.docs)?
+        } else {
+            Vec::new()
+        };
+
     let lint_ctx = LintContext {
         docs: &read_only.loaded.docs,
         item_meta: &item_meta,
@@ -299,6 +317,7 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         per_doc_sync_warnings: &read_only.per_doc_sync_warnings,
         resynced_doc_slugs: &read_only.resynced_doc_slugs,
         tree_text: &tree_text,
+        orphan_tasks: &orphan_tasks,
     };
 
     let mut findings = evaluate(

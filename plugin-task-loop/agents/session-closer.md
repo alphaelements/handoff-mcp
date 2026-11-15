@@ -1,7 +1,7 @@
 ---
 name: session-closer
 agentType: session-closer
-description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, sets task status, logs the developer-reported actual time, records trace updates and requirement links from the developer reports. Also applies plan_update_needed to plan SubItems. Sonnet base.
+description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, records trace updates and requirement links from the developer reports, sets task status (a task with no requirement link is left in review, never done), logs the developer-reported actual time. Also applies plan_update_needed to plan SubItems. Sonnet base.
 model: sonnet
 color: green
 tools: Read, Bash, Edit, Write, ToolSearch, mcp__handoff__*, mcp__plugin_handoff-mcp_handoff__*
@@ -44,6 +44,7 @@ shown; a flat flag for a nested field can be silently dropped by some actions.
 | MCP tool | CLI command | Notes |
 |---|---|---|
 | `handoff_get_task` | `handoff-mcp task get --task-id <id> --project-dir .` | read-only; use it to read a task back |
+| `handoff_get_task` | `handoff-mcp task get --task-id <id> --include-orphan true --project-dir .` | read-only; adds `orphan` (`true` or `false`) to the output, for the requirement-link check (Step 4) |
 | `handoff_check_criterion` | `handoff-mcp task check --task-id <id> --criterion-index <n> --checked true --project-dir .` | `<n>` is the 0-based index |
 | `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","status":"done"}' --project-dir .` | status; the `schedule_stale` / `plan_update_needed` lines are printed after the `Updated task …` line (the output is not a JSON echo) |
 | `handoff_update_task` | `handoff-mcp task update --task '{"id":"<id>","requirement_ids":["<stable_id>"]}' --project-dir .` | `requirement_ids` REPLACES the whole link set: pass the already-linked ids plus the new ones |
@@ -76,7 +77,7 @@ How to read a CLI result:
 The manager's prompt gives you, per task:
 
 - the `task_id` and its `done_criteria` list (index order, 0-based),
-- the developer's full report (containing `### done_criteria progress` and, optionally,
+- the developer's full report (containing `### done_criteria progress` and
   `### Requirements addressed`),
 - requirement ids already linked to the task (may be none).
 
@@ -97,12 +98,71 @@ For every line with `met: true`, call
 report marks `met: false`, and never check an index the report does not mention. Record the
 indices you checked in `criteria_checked`.
 
-### 2. Set the task status
+### 2. Trace update
 
-Call `handoff_update_task(task={id, status})`:
+Read the developer report's `### Requirements addressed` section. A line that starts with
+`- None` is the report's way of saying that no requirement applies, followed by the reason:
+it names no stable_id, so extract nothing from it. From every other line extract the
+`stable_id` (the token before the colon) and call:
 
-- `done` — only when **all** of these hold: the integration verdict is `PASS` or
-  `PASS_WITH_NITS`; the review verdict (when one is shown) is `APPROVE`; no pending
+```
+handoff_trace_update(task_id, ops: [
+  {op: "link", item: "<stable_id>", role: "implements"},
+  {op: "set",  item: "<stable_id>", dev_stage: "implemented"}
+])
+```
+
+`trace_update` validates every op before writing anything. If it rejects the call because
+one stable_id is unknown, drop that id, retry with the rest, and add a line to `warnings`
+naming the dropped id. Set `trace_updated: true` only when a call succeeded. A section that
+holds only a `- None` line, or no `Requirements addressed` section at all, means no trace
+call — leave `trace_updated: false`.
+
+### 3. Requirement links
+
+Call `handoff_update_task(task={id, requirement_ids: [...]})` with the extracted stable_ids
+plus any already linked (do not drop existing links). Record the resulting list in
+`requirement_ids_linked`. Skip this step when there is nothing to link.
+
+### 4. Set the task status
+
+**First check the requirement link.** Do this after Steps 2 and 3, so that the links the
+report asked for are already on the task. Read the task once with
+`handoff_get_task(task_id, include_orphan: true)`. Its `orphan` field is the server's own
+verdict on whether the task sits outside requirement traceability, by the rule the
+`task_orphan` lint rule uses. Take it as it is: never decide this yourself from `task_links` or `labels`.
+
+- `orphan: true` — the task has no requirement link: set the status to `review`, never `done`,
+  even when every other condition for `done` below holds (a task the rules below leave
+  `in_progress` stays `in_progress`, without the note). In the same `handoff_update_task` call
+  pass `notes_append` with exactly this text:
+
+  > Requirement link missing: this task has no requirement link, so it was left in review instead of done. Link it to the requirement it implements (handoff_update_task requirement_ids; handoff_trace_propose suggests candidates), or add the label no-trace if it is deliberately outside requirement traceability, then mark it done.
+
+  Set `requirement_link_missing: true` in the task's entry and add a line to `warnings`
+  (`<task_id>: requirement link missing, left in review`). This is a finished close-out, not a
+  failure: add no `ops_failed` entry for it.
+
+  If the call is rejected with `orphan_guard: ...` (the project set
+  `[trace] orphan_guard = "block"`, which keeps an orphan out of `review` too), do not pass
+  `force`: the project asked for exactly this. Leave the status as it is, record the note with
+  a second call that carries only `notes_append`, and report `status_set: "unchanged"` with the
+  rejected call in `ops_failed`.
+- `orphan: false` — the rule has nothing to say; go on to the status rules below. A task with a
+  requirement link gets this answer. So does a task labelled `no-trace`, which gets
+  `orphan: false` and is set to `done` as usual, and a parent task whose subtasks are all
+  accounted for. In a project with no layer document every task gets `orphan: false` too, so
+  there the close-out is what it always was.
+- The response has no `orphan` key (an older server that does not know the field): close the
+  task as before and say so in `notes`.
+- The call fails: you cannot tell, so set the status to `review`, add an `ops_failed` entry
+  with op `orphan_check` (`{op: "orphan_check", error}`) and leave `requirement_link_missing`
+  unset.
+
+Then call `handoff_update_task(task={id, status})`:
+
+- `done` — only when **all** of these hold: `orphan` is not `true`; the integration verdict is
+  `PASS` or `PASS_WITH_NITS`; the review verdict (when one is shown) is `APPROVE`; no pending
   follow-up names this task; and every done_criteria index of the task is now checked.
 - `review` — in every other case. A task that is not fully verified must never be marked
   `done`. Say why in `notes`.
@@ -118,7 +178,7 @@ Record the value you set in `status_set`.
   could not do anything at all, the top-level `error`. The Workflow reports every `unchanged`
   task as `closer_failed`.
 
-### 2b. Log actual time
+### 4b. Log actual time
 
 Read the developer report's `### Actual time` section: real wall-clock hours the developer
 spent (e.g. `0.2` for a few minutes). Call `handoff_log_time(task_id, hours)` once with that
@@ -138,32 +198,9 @@ number, and record it in `hours_logged`.
   Do not retry it more than once: a retry after an ambiguous failure could double-count
   hours, so read the task back with `handoff_get_task` (`actual_hours`) first.
 
-### 3. Trace update
-
-If the developer report contains a `### Requirements addressed` section, extract each
-`stable_id` (the token before the colon on every line) and call:
-
-```
-handoff_trace_update(task_id, ops: [
-  {op: "link", item: "<stable_id>", role: "implements"},
-  {op: "set",  item: "<stable_id>", dev_stage: "implemented"}
-])
-```
-
-`trace_update` validates every op before writing anything. If it rejects the call because
-one stable_id is unknown, drop that id, retry with the rest, and add a line to `warnings`
-naming the dropped id. Set `trace_updated: true` only when a call succeeded. No
-`Requirements addressed` section means no trace call — leave `trace_updated: false`.
-
-### 4. Requirement links
-
-Call `handoff_update_task(task={id, requirement_ids: [...]})` with the extracted stable_ids
-plus any already linked (do not drop existing links). Record the resulting list in
-`requirement_ids_linked`. Skip this step when there is nothing to link.
-
 ### 5. Update the roadmap (plan document)
 
-The `handoff_update_task` response from Step 2 may end with a line
+The `handoff_update_task` response from Step 4 may end with a line
 `plan_update_needed: [{doc_id, stable_id, current_dev_stage, suggested_dev_stage}]` (present
 only when the task just moved to `done` and is linked to items of a `plan` document). It may
 also end with `schedule_stale: true`.
@@ -214,8 +251,10 @@ A non-empty `ops_failed` or `unexecuted_ops` makes the Workflow report the task 
 
 Your claims are also checked: after you finish, the Workflow reads every task back from disk
 (`session-closer-verifier`) and compares the `status_set` and the `criteria_checked` indices you
-reported. A claim that is not on disk makes the task `closer_failed` too, so report only what
-you wrote or read back.
+reported and, for a task you reported with `requirement_link_missing`, its `orphan` value as
+well: a task left in `review` for a missing requirement link is not a failed close-out, as long
+as it really is an orphan on disk. A claim that is not on disk makes the task `closer_failed`
+too, so report only what you wrote or read back.
 
 ## Error handling
 
@@ -232,7 +271,7 @@ you wrote or read back.
 ## Output
 
 Return the structured result: `tasks_processed` (one entry per task, with `task_id`,
-`status_set`, `hours_logged`, `criteria_checked`, `trace_updated`, `requirement_ids_linked`, `plan_updates`,
-`schedule_stale`, `ops_failed`, `unexecuted_ops`, `notes`),
+`status_set`, `hours_logged`, `criteria_checked`, `trace_updated`, `requirement_ids_linked`,
+`requirement_link_missing`, `plan_updates`, `schedule_stale`, `ops_failed`, `unexecuted_ops`, `notes`),
 `warnings`, and `error` when applicable. Report only what you actually did — an entry for a
 call you did not make is worse than a warning.

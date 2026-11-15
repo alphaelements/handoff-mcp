@@ -14,6 +14,7 @@ pub mod layer_status;
 pub mod lineage;
 pub mod memory;
 pub mod metrics_snapshots;
+pub mod orphan_tasks;
 pub mod referrals;
 pub mod runs;
 pub mod session_target;

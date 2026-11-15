@@ -135,6 +135,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let mut tasks_created: u32 = 0;
     let mut top_level_count: u32 = 0;
     let mut nested_count: u32 = 0;
+    let mut created_top_level_ids: Vec<String> = Vec::new();
 
     if let Some(tasks) = arguments.get("tasks").and_then(|v| v.as_array()) {
         // Validate the whole payload before creating anything. Import writes many
@@ -174,6 +175,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             tasks_created += count;
             top_level_count += 1;
             nested_count += count - 1;
+            created_top_level_ids.push(task_id);
         }
     }
 
@@ -351,6 +353,21 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     for warning in unknown_milestone_warnings(handoff, milestones) {
         msg.push_str("\n  ");
         msg.push_str(&warning);
+    }
+
+    // Requirement-link guidance (REQ-TRC-003): an import cannot link its
+    // tasks, so it names the ones that ended up as orphans, in one line for
+    // the whole import. The tasks are already written, so a failure to work
+    // the list out is reported instead of failing the import.
+    match super::creation_guidance::summary_for_import(handoff, &created_top_level_ids) {
+        Ok(Some(line)) => {
+            msg.push_str("\n  ");
+            msg.push_str(&line);
+        }
+        Ok(None) => {}
+        Err(e) => msg.push_str(&format!(
+            "\n  Warning: requirement-link guidance check failed: {e:#}"
+        )),
     }
 
     Ok(msg)

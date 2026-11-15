@@ -94,7 +94,20 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let trace = load_task_trace_view(handoff, task_id, &data.task_links)?;
 
-    let result = serde_json::json!({
+    // Opt-in like `dependents`, and for the same reason: answering it can
+    // mean reading every document and the task's subtree, which the plain
+    // read must never pay for. The key is added only when asked for, so the
+    // default response stays what it always was.
+    let orphan = match arguments.get(INCLUDE_ORPHAN) {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(
+            stored_task_is_orphan(handoff, &task_dir, &data, &status)
+                .map_err(|e| anyhow::anyhow!("orphan check failed for task {task_id}: {e:#}"))?,
+        ),
+        Some(_) => anyhow::bail!("'{INCLUDE_ORPHAN}' must be a boolean"),
+    };
+
+    let mut result = serde_json::json!({
         "id": data.id,
         "title": data.title,
         "status": status,
@@ -116,6 +129,38 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "scope_paths": data.scope_paths,
         "trace": trace,
     });
+    if let Some(orphan) = orphan {
+        result["orphan"] = Value::Bool(orphan);
+    }
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
+}
+
+/// Argument that asks `handoff_get_task` for the `orphan` field.
+const INCLUDE_ORPHAN: &str = "include_orphan";
+
+/// Whether the stored task is an orphan: the shared predicate
+/// (`crate::trace::orphan`, the one the `task_orphan` lint rule, the orphan
+/// guard and the reports use) applied to the task as it is on disk, with its
+/// subtree and the scope guard. Read-only.
+fn stored_task_is_orphan(
+    handoff: &std::path::Path,
+    task_dir: &std::path::Path,
+    data: &crate::storage::tasks::TaskData,
+    status: &str,
+) -> Result<bool> {
+    crate::storage::orphan_tasks::task_is_orphan(
+        handoff,
+        crate::trace::orphan::TaskFacts {
+            id: data.id.clone(),
+            title: data.title.clone(),
+            status: status.to_string(),
+            labels: data.labels.clone(),
+            has_requirement_link: crate::trace::orphan::has_requirement_link(&data.task_links),
+            children: Vec::new(),
+        },
+        Some(task_dir),
+        // Nothing is pending: the task is judged as stored.
+        |_docs| false,
+    )
 }

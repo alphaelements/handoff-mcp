@@ -6,7 +6,7 @@ use super::config_crud::validate_work_hours_table;
 use super::HandlerContext;
 use crate::storage::config::{
     ensure_table_like, read_config, render_config, CommandsConfig, Config, OnboardingConfig,
-    ReleaseConfig, DONE_GUARD_MODES, ONBOARDING_PRESETS,
+    ReleaseConfig, DONE_GUARD_MODES, ONBOARDING_PRESETS, ORPHAN_GUARD_MODES,
 };
 use crate::storage::config_preset::plan_preset;
 use crate::storage::docs::layer::LayerRegistry;
@@ -681,9 +681,36 @@ fn validate_session_loop(rendered: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Dotted key of `[trace] orphan_guard` (SPEC-TRC-003).
+const ORPHAN_GUARD_KEY: &str = "trace.orphan_guard";
+
+/// Rejects a config text whose `[trace] orphan_guard` is not one of
+/// [`ORPHAN_GUARD_MODES`]. Looks at the raw value, so a value of the wrong
+/// type (a boolean, a number, a table) gets the same message naming the
+/// accepted modes as a misspelled one. An absent key is the default.
+fn validate_orphan_guard(rendered: &str) -> Result<()> {
+    let expected = ORPHAN_GUARD_MODES.join("/");
+    let root: toml::Value = toml::from_str(rendered).map_err(|e| {
+        anyhow::anyhow!("invalid {ORPHAN_GUARD_KEY}: {e} (expected one of {expected})")
+    })?;
+    let Some(value) = root.get("trace").and_then(|t| t.get("orphan_guard")) else {
+        return Ok(());
+    };
+    match value.as_str() {
+        Some(mode) if ORPHAN_GUARD_MODES.contains(&mode) => Ok(()),
+        Some(mode) => {
+            anyhow::bail!("invalid {ORPHAN_GUARD_KEY} '{mode}': expected one of {expected}")
+        }
+        None => anyhow::bail!(
+            "invalid {ORPHAN_GUARD_KEY} {value}: expected one of {expected} (a string)"
+        ),
+    }
+}
+
 /// Rejects (before anything is written) an update that sets `trace.profile`,
-/// `trace.layers` or `trace.done_guard` to a value the readers would not
-/// honor: `done_guard` must be one of [`DONE_GUARD_MODES`]; `profile` must be
+/// `trace.layers`, `trace.done_guard` or `trace.orphan_guard` to a value the
+/// readers would not honor: `done_guard` must be one of [`DONE_GUARD_MODES`]
+/// and `orphan_guard` one of [`ORPHAN_GUARD_MODES`]; `profile` must be
 /// empty ("auto"), a built-in profile or a `[trace.profiles.<name>]` entry in
 /// the resulting config; every `layers` entry must be a built-in layer or a
 /// valid `[[trace.layer]]` entry. Only the keys being written are checked, so
@@ -692,14 +719,22 @@ fn validate_trace_scalar_keys<'a>(
     keys: impl Iterator<Item = &'a str>,
     rendered: &str,
 ) -> Result<()> {
-    let (mut profile, mut layers, mut done_guard) = (false, false, false);
+    let (mut profile, mut layers, mut done_guard, mut orphan_guard) = (false, false, false, false);
     for key in keys {
         match key {
             "trace.profile" => profile = true,
             "trace.layers" => layers = true,
             k if k == "trace.done_guard" || k.starts_with("trace.done_guard.") => done_guard = true,
+            // A deeper key (`trace.orphan_guard.x`) turns the value into a
+            // table, which is not a mode either.
+            k if k == ORPHAN_GUARD_KEY || k.starts_with("trace.orphan_guard.") => {
+                orphan_guard = true
+            }
             _ => {}
         }
+    }
+    if orphan_guard {
+        validate_orphan_guard(rendered)?;
     }
     if !(profile || layers || done_guard) {
         return Ok(());

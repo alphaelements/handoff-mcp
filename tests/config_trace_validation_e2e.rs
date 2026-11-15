@@ -1,5 +1,6 @@
-//! E2E: `handoff_update_config` validates `trace.profile`, `trace.layers` and
-//! `trace.done_guard` before writing them (t-vfix.19). An invalid value must be
+//! E2E: `handoff_update_config` validates `trace.profile`, `trace.layers`,
+//! `trace.done_guard` and `trace.orphan_guard` before writing them (t-vfix.19,
+//! SPEC-TRC-003). An invalid value must be
 //! rejected and must leave `config.toml` untouched; valid values keep working.
 
 use serde_json::{json, Value};
@@ -251,4 +252,110 @@ fn mixed_typed_and_raw_batch_applies_both_when_valid() {
         cfg.contains("RENAMED") && cfg.contains("done_guard = \"block\""),
         "{cfg}"
     );
+}
+
+// --- trace.orphan_guard (REQ-TRC-002, SPEC-TRC-003) ---
+
+fn get_config(pd: &str) -> Value {
+    let resp = call_tool("handoff_get_config", json!({ "project_dir": pd }));
+    assert!(!is_error(&resp), "{}", text(&resp));
+    serde_json::from_str(&text(&resp)).expect("handoff_get_config answers JSON")
+}
+
+#[test]
+fn orphan_guard_modes_are_written_and_read_back() {
+    let (_d, pd) = setup();
+    // Not set: the key is absent and the default (`warn`) applies.
+    assert_eq!(get_config(&pd)["trace"]["orphan_guard"], Value::Null);
+
+    for mode in ["off", "warn", "block"] {
+        let resp = update(&pd, json!({ "trace.orphan_guard": mode }));
+        assert!(!is_error(&resp), "{mode}: {}", text(&resp));
+        assert_eq!(get_config(&pd)["trace"]["orphan_guard"], mode);
+        assert!(config_text(&pd).contains(&format!("orphan_guard = \"{mode}\"")));
+    }
+}
+
+#[test]
+fn invalid_orphan_guard_is_rejected_with_the_allowed_values() {
+    let (_d, pd) = setup();
+    for bad in [
+        json!("strict"),
+        json!("error"),
+        json!(""),
+        json!(true),
+        json!(3),
+        json!(["warn"]),
+    ] {
+        let before = config_text(&pd);
+        let resp = update(&pd, json!({ "trace.orphan_guard": bad }));
+        assert!(is_error(&resp), "{bad} must be rejected: {}", text(&resp));
+        let message = text(&resp);
+        assert!(message.contains("trace.orphan_guard"), "{bad}: {message}");
+        assert!(message.contains("off/warn/block"), "{bad}: {message}");
+        assert_eq!(
+            before,
+            config_text(&pd),
+            "{bad}: a rejected update must not write"
+        );
+    }
+}
+
+/// `orphan_guard` is a plain mode, not a table: a deeper key is rejected too.
+#[test]
+fn orphan_guard_sub_key_is_rejected() {
+    let (_d, pd) = setup();
+    assert_rejected(
+        &pd,
+        json!({ "trace.orphan_guard.mode": "block" }),
+        "off/warn/block",
+    );
+}
+
+#[test]
+fn orphan_guard_update_leaves_the_other_trace_keys_alone() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "trace.done_guard": "block", "trace.profile": "standard" }),
+    );
+    assert!(!is_error(&resp), "{}", text(&resp));
+
+    let resp = update(&pd, json!({ "trace.orphan_guard": "off" }));
+    assert!(!is_error(&resp), "{}", text(&resp));
+    let trace = get_config(&pd)["trace"].clone();
+    assert_eq!(trace["done_guard"], "block");
+    assert_eq!(trace["profile"], "standard");
+    assert_eq!(trace["orphan_guard"], "off");
+
+    // And the other way round: done_guard does not touch orphan_guard.
+    let resp = update(&pd, json!({ "trace.done_guard": "warn" }));
+    assert!(!is_error(&resp), "{}", text(&resp));
+    assert_eq!(get_config(&pd)["trace"]["orphan_guard"], "off");
+}
+
+#[test]
+fn a_config_without_orphan_guard_is_resaved_without_it() {
+    let (_d, pd) = setup();
+    let resp = update(&pd, json!({ "trace.done_guard": "block" }));
+    assert!(!is_error(&resp), "{}", text(&resp));
+    // A typed key re-renders the whole file through the config struct.
+    let resp = update(&pd, json!({ "project.description": "resaved" }));
+    assert!(!is_error(&resp), "{}", text(&resp));
+
+    let cfg = config_text(&pd);
+    assert!(cfg.contains("resaved"), "{cfg}");
+    assert!(cfg.contains("done_guard = \"block\""), "{cfg}");
+    assert!(!cfg.contains("orphan_guard"), "{cfg}");
+}
+
+#[test]
+fn an_invalid_orphan_guard_in_a_batch_writes_nothing() {
+    let (_d, pd) = setup();
+    assert_rejected(
+        &pd,
+        json!({ "trace.done_guard": "block", "trace.orphan_guard": "nope" }),
+        "trace.orphan_guard",
+    );
+    assert!(!config_text(&pd).contains("done_guard"));
 }

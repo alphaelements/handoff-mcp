@@ -191,6 +191,7 @@ fn trace_config_keys() -> Vec<&'static str> {
         layer: _,
         profile: _,
         done_guard: _,
+        orphan_guard: _,
         profiles: _,
         lint: _,
         auto_layer: _,
@@ -243,6 +244,7 @@ fn trace_config_keys() -> Vec<&'static str> {
         "[[trace.layer]]",
         "profile",
         "done_guard",
+        "orphan_guard",
         "[trace.profiles.",
         "[trace.lint.rules]",
         "[[trace.lint.require]]",
@@ -288,6 +290,55 @@ fn every_trace_config_key_is_documented() {
         "[trace] config keys missing from {}: {missing:?}",
         path.display()
     );
+}
+
+/// Every built-in `trace_lint` rule has a row in the rule reference, so a
+/// rule added to the registry cannot ship undocumented.
+#[test]
+fn every_builtin_lint_rule_is_documented() {
+    let path = skills_dir().join("handoff-trace/references/lint-rules.md");
+    let body =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} must exist: {e}", path.display()));
+    let missing: Vec<_> = handoff_mcp::trace::lint::builtin_rule_ids()
+        .filter(|id| !body.contains(&format!("| `{id}` |")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "built-in lint rules with no table row in {}: {missing:?}",
+        path.display()
+    );
+}
+
+/// The README names the orphan-task rule next to the lint entry point, and
+/// the rule reference says what its findings carry and how to exclude a task.
+#[test]
+fn task_orphan_rule_is_listed_in_the_readme_and_the_rule_reference() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .expect("README.md");
+    assert!(
+        readme.contains("| `task_orphan` | warning |"),
+        "README rule table"
+    );
+    assert!(
+        readme.contains("`no-trace`"),
+        "README names the exclusion label"
+    );
+
+    let reference = fs::read_to_string(skills_dir().join("handoff-trace/references/lint-rules.md"))
+        .expect("lint-rules.md");
+    let row = reference
+        .lines()
+        .find(|l| l.starts_with("| `task_orphan` | warning |"))
+        .expect("task_orphan row with its default severity");
+    for needle in ["`skipped`", "`no-trace`", "parent", "requirement_ids"] {
+        assert!(
+            row.contains(needle),
+            "task_orphan row lacks {needle}: {row}"
+        );
+    }
+    for field in ["`task_id`", "`title`", "`suggested_action`"] {
+        assert!(reference.contains(field), "rule reference lacks {field}");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1008,6 +1008,14 @@ pub struct TraceConfig {
     /// that also carries the `check_*` switches. See [`DoneGuardConfig`].
     #[serde(default, skip_serializing_if = "DoneGuardConfig::is_default")]
     pub done_guard: DoneGuardConfig,
+    /// `[trace] orphan_guard` (REQ-TRC-002): what a `review`/`done`
+    /// transition of an orphan task (no requirement link, see
+    /// `crate::trace::orphan`) does. One of [`ORPHAN_GUARD_MODES`]; unset
+    /// means [`DEFAULT_ORPHAN_GUARD_MODE`]. Stored as written — read it
+    /// through [`TraceConfig::orphan_guard_mode`]. Independent of
+    /// `done_guard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_guard: Option<String>,
     /// `[trace.profiles.<name>]` project-defined profiles (wiki/260 §2.1).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub profiles: HashMap<String, TraceProfileConfig>,
@@ -1115,6 +1123,12 @@ pub const DEFAULT_PLAN_LAYER: &str = "detailed_spec";
 
 /// Accepted `[trace] done_guard` values.
 pub const DONE_GUARD_MODES: &[&str] = &["off", "warn", "block"];
+
+/// Accepted `[trace] orphan_guard` values.
+pub const ORPHAN_GUARD_MODES: &[&str] = &["off", "warn", "block"];
+
+/// `[trace] orphan_guard` when the key is not set.
+pub const DEFAULT_ORPHAN_GUARD_MODE: &str = "warn";
 
 /// `[trace] done_guard` (wiki/260 §3.4, wiki/430 §3.6).
 ///
@@ -1367,12 +1381,24 @@ where
 }
 
 impl TraceConfig {
+    /// The effective `[trace] orphan_guard` mode. Any value other than one
+    /// of [`ORPHAN_GUARD_MODES`] (a typo in a hand-edited file, a future
+    /// mode) reads as the default — never silently stricter, never silently
+    /// disabled, the same fail-safe as `done_guard`.
+    pub fn orphan_guard_mode(&self) -> &str {
+        match self.orphan_guard.as_deref() {
+            Some(mode) if ORPHAN_GUARD_MODES.contains(&mode) => mode,
+            _ => DEFAULT_ORPHAN_GUARD_MODE,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
             && self.id_prefixes.is_empty()
             && self.layer.is_empty()
             && self.profile.is_none()
             && self.done_guard.is_default()
+            && self.orphan_guard.is_none()
             && self.profiles.is_empty()
             && self.lint.is_empty()
             && !self.auto_layer
@@ -2353,6 +2379,62 @@ done_guard = "error"
             .contains("done_guard = \"block\""));
         let cfg = parse_config("[project]\nname = \"t\"\n");
         assert!(!render_config(&cfg).unwrap().contains("done_guard"));
+    }
+
+    // -- [trace] orphan_guard (REQ-TRC-002, SPEC-TRC-003) --
+
+    fn trace_of(toml_str: &str) -> TraceConfig {
+        parse_config(&format!("[project]\nname = \"t\"\n{toml_str}")).trace
+    }
+
+    #[test]
+    fn orphan_guard_defaults_to_warn_and_keeps_an_empty_trace_empty() {
+        let trace = trace_of("");
+        assert_eq!(trace.orphan_guard, None);
+        assert_eq!(trace.orphan_guard_mode(), "warn");
+        assert!(trace.is_empty());
+        // A config without the key is rendered without it.
+        let cfg = parse_config("[project]\nname = \"t\"\n[trace]\nprofile = \"standard\"\n");
+        assert!(!render_config(&cfg).unwrap().contains("orphan_guard"));
+    }
+
+    #[test]
+    fn orphan_guard_reads_each_mode_and_round_trips() {
+        for mode in ORPHAN_GUARD_MODES {
+            let src = format!("[trace]\norphan_guard = \"{mode}\"\n");
+            let trace = trace_of(&src);
+            assert_eq!(trace.orphan_guard_mode(), *mode);
+            assert!(!trace.is_empty(), "{mode}: an explicit value is a setting");
+            let cfg = parse_config(&format!("[project]\nname = \"t\"\n{src}"));
+            let rendered = render_config(&cfg).unwrap();
+            assert!(
+                rendered.contains(&format!("orphan_guard = \"{mode}\"")),
+                "{rendered}"
+            );
+            assert_eq!(parse_config(&rendered).trace.orphan_guard_mode(), *mode);
+        }
+        assert_eq!(ORPHAN_GUARD_MODES, &["off", "warn", "block"]);
+    }
+
+    /// A hand-edited value the guard does not know reads as `warn`: never
+    /// silently stricter, never silently disabled. It is kept as written.
+    #[test]
+    fn orphan_guard_unknown_value_falls_back_to_warn() {
+        let trace = trace_of("[trace]\norphan_guard = \"strict\"\n");
+        assert_eq!(trace.orphan_guard.as_deref(), Some("strict"));
+        assert_eq!(trace.orphan_guard_mode(), "warn");
+    }
+
+    #[test]
+    fn orphan_guard_and_done_guard_are_independent() {
+        let trace = trace_of("[trace]\ndone_guard = \"block\"\norphan_guard = \"off\"\n");
+        assert_eq!(trace.done_guard.mode, "block");
+        assert_eq!(trace.orphan_guard_mode(), "off");
+
+        let trace = trace_of("[trace]\ndone_guard = \"off\"\n");
+        assert_eq!(trace.orphan_guard_mode(), "warn");
+        let trace = trace_of("[trace]\norphan_guard = \"block\"\n");
+        assert_eq!(trace.done_guard.mode, "warn");
     }
 
     #[test]

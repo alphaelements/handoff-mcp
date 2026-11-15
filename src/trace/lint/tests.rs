@@ -50,6 +50,7 @@ fn empty_ctx() -> LintContext<'static> {
         per_doc_sync_warnings: WARNINGS,
         resynced_doc_slugs: RESYNCED.get_or_init(HashSet::new),
         tree_text: TREE_TEXT.get_or_init(HashMap::new),
+        orphan_tasks: &[],
     }
 }
 
@@ -407,6 +408,7 @@ fn frontmatter_invalid_reports_every_unreadable_document() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -444,6 +446,7 @@ fn task_ids_drift_finding_comes_from_the_supplied_drift_list() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -483,6 +486,7 @@ fn task_ids_drift_finding_reports_document_level_drift() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -544,6 +548,7 @@ fn unsynced_body_reports_every_resynced_doc_slug() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -589,6 +594,7 @@ fn id_like_heading_and_unlabeled_acceptance_and_invalid_waiver_come_from_per_doc
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -643,6 +649,7 @@ fn attribute_after_body_comes_from_per_doc_sync_warnings() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -681,6 +688,7 @@ fn attribute_after_body_can_be_turned_off() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config
@@ -751,6 +759,7 @@ fn require_rule_flags_an_item_matching_when_but_not_satisfying_need() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config.require.push(TraceLintRequireRule {
@@ -814,6 +823,7 @@ fn require_rule_is_satisfied_once_the_item_has_a_verifier() {
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config.require.push(TraceLintRequireRule {
@@ -871,6 +881,7 @@ fn evaluate_with_approval_when(approval: &str, when_values: &[&str]) -> Vec<Lint
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
         tree_text: &HashMap::new(),
+        orphan_tasks: &[],
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config.require.push(TraceLintRequireRule {
@@ -1059,6 +1070,7 @@ fn ctx_with_titles(titles: &[(&str, &str)]) -> LintContext<'static> {
         per_doc_sync_warnings: WARNINGS,
         resynced_doc_slugs: RESYNCED.get_or_init(HashSet::new),
         tree_text: TREE_TEXT.get_or_init(HashMap::new),
+        orphan_tasks: &[],
     }
 }
 
@@ -1334,6 +1346,7 @@ fn tree_ctx(text: Vec<(&str, ItemTreeText)>) -> LintContext<'static> {
     let leaked: &'static HashMap<String, ItemTreeText> = Box::leak(Box::new(map));
     LintContext {
         tree_text: leaked,
+        orphan_tasks: &[],
         ..empty_ctx()
     }
 }
@@ -2160,6 +2173,7 @@ fn lint_low_confidence(
     let ctx = LintContext {
         item_meta: &item_meta,
         tree_text: &tree_text,
+        orphan_tasks: &[],
         ..empty_ctx()
     };
     let config = crate::storage::config::TraceLintConfig::default();
@@ -2265,6 +2279,7 @@ fn low_confidence_spec_severity_is_overridable_and_can_be_switched_off() {
     .collect();
     let ctx = LintContext {
         tree_text: &tree_text,
+        orphan_tasks: &[],
         ..empty_ctx()
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
@@ -2423,4 +2438,179 @@ fn own_needs_listing_a_non_pair_right_layer_is_still_required() {
 
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].message.contains("no verifying system_test item"));
+}
+
+// --- task_orphan (REQ-TRC-001, SPEC-TRC-001) ---
+
+fn orphan(id: &str, title: &str, status: &str) -> crate::trace::orphan::OrphanTask {
+    crate::trace::orphan::OrphanTask {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: status.to_string(),
+    }
+}
+
+/// Lints an empty graph whose only input is `orphans`.
+fn lint_orphans(
+    orphans: &[crate::trace::orphan::OrphanTask],
+    config: &crate::storage::config::TraceLintConfig,
+    rules: Option<&[&str]>,
+) -> Vec<LintFinding> {
+    let input = TraceInput::default();
+    let graph = TraceGraph::build(&input);
+    let ctx = LintContext {
+        orphan_tasks: orphans,
+        ..empty_ctx()
+    };
+    let filter: Option<HashSet<String>> =
+        rules.map(|ids| ids.iter().map(|id| id.to_string()).collect());
+    evaluate(&graph, &input, &ctx, config, filter.as_ref())
+}
+
+#[test]
+fn task_orphan_reports_each_orphan_task_as_a_warning_with_its_title_and_suggested_action() {
+    let config = crate::storage::config::TraceLintConfig::default();
+    let findings = lint_orphans(&[orphan("t7", "Write the parser", "todo")], &config, None);
+
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let f = &findings[0];
+    assert_eq!(f.rule, "task_orphan");
+    assert_eq!(f.severity, Severity::Warning);
+    assert_eq!(f.task.as_deref(), Some("t7"));
+    assert_eq!(f.item, None);
+    assert_eq!(f.doc, None);
+    assert!(
+        f.message.contains("t7") && f.message.contains("no requirement link"),
+        "{}",
+        f.message
+    );
+    assert_eq!(
+        f.task_detail,
+        Some(TaskFindingDetail {
+            title: "Write the parser".to_string(),
+            suggested_action: crate::trace::orphan::suggested_action("t7"),
+        })
+    );
+}
+
+#[test]
+fn task_orphan_keeps_the_natural_task_order_of_its_input() {
+    let config = crate::storage::config::TraceLintConfig::default();
+    let orphans = [
+        orphan("t2", "B", "todo"),
+        orphan("t2.9", "C", "done"),
+        orphan("t2.10", "D", "review"),
+        orphan("t10", "E", "todo"),
+    ];
+    let tasks: Vec<_> = lint_orphans(&orphans, &config, None)
+        .into_iter()
+        .filter_map(|f| f.task)
+        .collect();
+    assert_eq!(tasks, vec!["t2", "t2.9", "t2.10", "t10"]);
+}
+
+#[test]
+fn task_orphan_is_silent_without_orphan_tasks_and_leaves_other_rules_alone() {
+    let child = crate::trace::types::TraceItemInput {
+        refines: vec!["REQ-999".to_string()],
+        ..item("SPEC-001")
+    };
+    let input = TraceInput {
+        items: vec![child],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let without = evaluate(&graph, &input, &empty_ctx(), &config, None);
+    assert!(without.iter().all(|f| f.rule != "task_orphan"));
+    assert!(without.iter().all(|f| f.task_detail.is_none()));
+
+    let orphans = [orphan("t1", "A", "todo")];
+    let ctx = LintContext {
+        orphan_tasks: &orphans,
+        ..empty_ctx()
+    };
+    let with: Vec<LintFinding> = evaluate(&graph, &input, &ctx, &config, None)
+        .into_iter()
+        .filter(|f| f.rule != "task_orphan")
+        .collect();
+    assert_eq!(with, without);
+}
+
+#[test]
+fn task_orphan_severity_is_overridable_and_off_disables_it() {
+    let orphans = [orphan("t1", "A", "todo")];
+    let mut config = crate::storage::config::TraceLintConfig::default();
+
+    for (value, expected) in [
+        ("error", Severity::Error),
+        ("warning", Severity::Warning),
+        ("info", Severity::Info),
+    ] {
+        config
+            .rules
+            .insert("task_orphan".to_string(), value.to_string());
+        let findings = lint_orphans(&orphans, &config, None);
+        assert_eq!(findings.len(), 1, "{value}");
+        assert_eq!(findings[0].severity, expected, "{value}");
+    }
+
+    config
+        .rules
+        .insert("task_orphan".to_string(), "off".to_string());
+    assert!(lint_orphans(&orphans, &config, None).is_empty());
+    assert!(validate_lint_config(&config).is_ok());
+}
+
+#[test]
+fn task_orphan_obeys_the_rules_filter() {
+    let orphans = [orphan("t1", "A", "todo")];
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let only = lint_orphans(&orphans, &config, Some(&["task_orphan"]));
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0].rule, "task_orphan");
+
+    let other = lint_orphans(&orphans, &config, Some(&["unverified"]));
+    assert!(other.is_empty(), "{other:?}");
+}
+
+#[test]
+fn task_orphan_is_a_known_builtin_rule_id() {
+    let config = crate::storage::config::TraceLintConfig::default();
+    assert!(is_known_rule_id("task_orphan", &config));
+}
+
+#[test]
+fn builtin_rule_is_active_follows_the_filter_and_the_off_switch() {
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    let only_orphan: HashSet<String> = ["task_orphan".to_string()].into();
+    let only_other: HashSet<String> = ["unverified".to_string()].into();
+
+    assert!(builtin_rule_is_active("task_orphan", &config, None));
+    assert!(builtin_rule_is_active(
+        "task_orphan",
+        &config,
+        Some(&only_orphan)
+    ));
+    assert!(!builtin_rule_is_active(
+        "task_orphan",
+        &config,
+        Some(&only_other)
+    ));
+
+    config
+        .rules
+        .insert("task_orphan".to_string(), "info".to_string());
+    assert!(builtin_rule_is_active("task_orphan", &config, None));
+    config
+        .rules
+        .insert("task_orphan".to_string(), "off".to_string());
+    assert!(!builtin_rule_is_active("task_orphan", &config, None));
+    assert!(!builtin_rule_is_active(
+        "task_orphan",
+        &config,
+        Some(&only_orphan)
+    ));
 }

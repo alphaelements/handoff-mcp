@@ -631,7 +631,7 @@ For a subtask, rename the directory inside its parent's directory the same way.
 | Tool | Purpose |
 |------|---------|
 | `handoff_list_tasks` | List tasks with filters (status, assignee, milestone, priority, label) |
-| `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.) |
+| `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.); `include_orphan: true` adds `orphan` (whether the task has no requirement link, by the `task_orphan` rule) |
 | `handoff_update_task` | Create, update, or move tasks; supports `notes_append` for safe incremental notes and `requirement_ids` for linking to requirement SubItems |
 | `handoff_check_criterion` | Toggle a single done_criteria item by index |
 | `handoff_log_time` | Log hours worked — adds to `actual_hours`, deducts from `remaining_hours` |
@@ -841,6 +841,54 @@ roll up their leaves' verification and progress; `handoff_trace_tree` (CLI
 `trace tree`) shows the nested view, and lint reports structural and
 missing-label problems.
 
+**Orphan tasks.** Once a project has a layer document, every task is expected
+to trace back to a requirement. `handoff_trace_lint` reports a task with no
+requirement link as a `task_orphan` warning, with its `task_id`, `title` and a
+`suggested_action`: link it with `handoff_update_task(task: {id,
+requirement_ids: [...]})`, or add the label `no-trace` when it is deliberately
+outside traceability. A `skipped` task, a `no-trace` task, and a parent task
+whose leaves are all linked, `no-trace` or `skipped` are not reported. Switch
+the rule off with `[trace.lint.rules] task_orphan = "off"`.
+
+| Lint rule | Default | Reports |
+|-----------|---------|---------|
+| `task_orphan` | warning | a task with no requirement link (see above) |
+| `task_unlinked` | warning | a task that links a layer document but none of its items |
+
+The full rule table is in the `handoff-trace` skill (`references/lint-rules.md`).
+
+`[trace] orphan_guard` decides what happens when such a task is moved to
+`review` or `done` with `handoff_update_task` or `handoff_bulk_update_tasks`:
+
+| `orphan_guard` | Effect |
+|----------------|--------|
+| `warn` (default) | the change applies and the response carries a `Warning [ORPHAN_TASK]: ...` line |
+| `block` | the call is rejected and nothing is changed, unless `force: true` is passed |
+| `off` | no check; the response is the same as without the guard |
+
+It uses the same rule as `task_orphan`, so a `no-trace` task, a parent traced
+through its children, and every task of a project without a layer document are
+never affected. Set it with `handoff_update_config(updates: {"trace.orphan_guard": "block"})`;
+any other value is rejected.
+
+`handoff_get_task(task_id, include_orphan: true)` answers the same question for
+one task: its response then carries `orphan: true` or `false`. The task-loop
+plugin's session-closer uses it: a task that still has no requirement link at
+the end of a `/session-loop` session is closed as `review` instead of `done`,
+with a `Requirement link missing: ...` note, and every developer report says in
+its `### Requirements addressed` section which requirements the work addressed,
+or why none applies.
+
+The periodic reports of `handoff_report` (`daily`, `weekly`, `monthly`,
+`quarterly`, `yearly`) end with an **Orphan Tasks** section: how many such
+tasks the project has, and the id, title and status of each. It lists the
+tasks `task_orphan` reports, as they are when the report is generated. With no
+orphan task the section is left out altogether, so those reports are unchanged.
+The other report types (`verification`, `inspection`, `effort`, `milestone`,
+`defect`, `completion`) never carry it. A project template gets the section
+with `{{> orphan_tasks}}`; pass `data: {"orphan_tasks": null}` to leave it out
+of one report.
+
 Full guide: the **`handoff-trace`** skill (overview, setup, workflow, and
 references for every trace tool, config key and lint rule, plus a runnable
 end-to-end walkthrough) and the **`handoff-requirements`** skill (how to write
@@ -1001,6 +1049,7 @@ mode = "compare"           # plan, actual, compare
 
 [trace]
 profile = "standard"
+orphan_guard = "warn"      # off, warn, block: a task with no requirement link entering review/done
 # See `handoff-trace` skill for layers/done_guard/id_prefixes/custom profiles.
 
 [commands]                 # Project commands; any shell command line. All keys optional.
@@ -1304,6 +1353,14 @@ from the **AI-effort hours** used in scheduling and metrics:
 - A task milestone (`schedule.milestone`) that has no `[milestones.<name>]`
   definition in `config.toml` is accepted with an `UNKNOWN_MILESTONE` warning.
   Check the spelling, or define the milestone with `handoff_add_milestone`.
+- In a project with at least one V-model layer document, creating a task
+  without `requirement_ids` is accepted, and `handoff_update_task` ends its
+  response with two information lines: `Info [REQUIREMENT_LINK_MISSING]` (link
+  the task to a requirement, or add the missing requirement) and
+  `Info [TRACE_PROPOSE]` (`handoff_trace_propose(task_id)` lists candidates).
+  They are not added when an existing task is updated, or when the new task
+  carries `requirement_ids` or the label `no-trace`. `handoff_import_context`
+  reports the imported tasks without a link in one such line.
 
 Both keys are set with `handoff_update_config` (for example
 `settings.schedule_stale_notice`) and must be booleans.

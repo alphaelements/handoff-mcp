@@ -71,7 +71,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             handoff,
             &done_guard,
             force,
-        );
+        )
+        .map(|msg| with_creation_guidance(handoff, existing_id, task_val, msg));
     }
 
     let title = task_val
@@ -89,8 +90,43 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         &done_guard,
         force,
     )
-    .map(|(_new_id, msg)| msg)
+    .map(|(new_id, msg)| with_creation_guidance(handoff, &new_id, task_val, msg))
 }
+
+/// Appends the requirement-link guidance (REQ-TRC-003 / REQ-TRC-004) to the
+/// response of a `handoff_update_task` call that created task `task_id`.
+/// Applied here, at the tool's own entry point, and not inside
+/// [`handle_create`]: that function is shared with `handoff_trace_tasks`,
+/// whose generated tasks must not get the hint.
+fn with_creation_guidance(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    mut msg: String,
+) -> String {
+    let labels = extract_string_array(task_val, "labels");
+    let lines = super::creation_guidance::lines_for_created_task(
+        handoff_dir,
+        &super::creation_guidance::CreatedTask {
+            id: task_id,
+            title: task_val.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            status: task_val
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_NEW_TASK_STATUS),
+            labels: &labels,
+            names_requirement_ids: !extract_string_array(task_val, "requirement_ids").is_empty(),
+        },
+    );
+    for line in lines {
+        msg.push('\n');
+        msg.push_str(&line);
+    }
+    msg
+}
+
+/// Status of a task created without one.
+const DEFAULT_NEW_TASK_STATUS: &str = "todo";
 
 /// Applies `task.requirement_ids` (t330.1) right after a brand-new task has
 /// been written to disk, for both creation paths (`handle_create` and
@@ -643,6 +679,46 @@ fn check_create_done_guard_blockers(
     Ok(findings.and_then(|f| done_guard_blocker_message(task_id_for_check, &f)))
 }
 
+/// The orphan guard (`[trace] orphan_guard`, REQ-TRC-002) for a task about to
+/// be created: consulted only when it is created directly in `review`/`done`,
+/// before anything is written. The task does not exist yet, so its
+/// requirement links are the ones `task_val.requirement_ids` resolves to and
+/// it has no children. Returns the `warn`-mode line to append to the
+/// response; `block` returns the rejection as an error.
+fn check_create_orphan_guard(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    data: &TaskData,
+    status: &str,
+    task_val: &Value,
+    force: bool,
+) -> Result<Option<String>> {
+    if !super::orphan_guard::is_guarded_status(status) {
+        return Ok(None);
+    }
+    let to_add = extract_string_array(task_val, "requirement_ids");
+    let mut discard_msg = String::new();
+    let roles = extract_requirement_roles(task_val, &mut discard_msg);
+    super::orphan_guard::check_entering(
+        handoff_dir,
+        force,
+        super::orphan_guard::Entering::Creation,
+        &super::orphan_guard::EnteringTask {
+            id: task_id,
+            title: &data.title,
+            status,
+            labels: &data.labels,
+            task_dir: None,
+        },
+        // A task that does not exist yet keeps no link.
+        false,
+        |docs| {
+            !crate::mcp::handlers::docs::preview_added_requirement_links(docs, &to_add, &roles)
+                .is_empty()
+        },
+    )
+}
+
 /// M2-16 (wiki/260-vmodel-m2-design.md §4.9, FR-605): `pub(super)` (rather
 /// than private) and returns `(new_id, msg)` instead of just `msg` — this is
 /// `handoff_update_task`'s own task-creation path, shared verbatim with
@@ -685,7 +761,7 @@ pub(super) fn handle_create(
     let status = task_val
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or("todo");
+        .unwrap_or(DEFAULT_NEW_TASK_STATUS);
 
     if !is_valid_status(status) {
         anyhow::bail!("Invalid status: {status}");
@@ -759,6 +835,10 @@ pub(super) fn handle_create(
         }
     }
 
+    // Orphan guard: same gate, same "nothing left behind on rejection" rule.
+    let orphan_warning =
+        check_create_orphan_guard(handoff_dir, &new_id, &data, status, task_val, force)?;
+
     // Create the directory only once every validation has passed. A rejected
     // create must leave nothing behind: an orphan dir would burn the task ID,
     // because `next_top_level_id` counts directories, not task files.
@@ -780,6 +860,9 @@ pub(super) fn handle_create(
         data.schedule.as_ref(),
         &mut msg,
     );
+    if let Some(warning) = orphan_warning {
+        msg.push_str(&format!("\n{warning}"));
+    }
 
     if status != "todo" && status != "blocked" {
         let task_data = read_task(&task_dir)?
@@ -825,7 +908,7 @@ fn handle_upsert_create(
     let status = task_val
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or("todo");
+        .unwrap_or(DEFAULT_NEW_TASK_STATUS);
 
     if !is_valid_status(status) {
         anyhow::bail!("Invalid status: {status}");
@@ -895,6 +978,10 @@ fn handle_upsert_create(
         }
     }
 
+    // Orphan guard: same gate as `handle_create`.
+    let orphan_warning =
+        check_create_orphan_guard(handoff_dir, task_id, &data, status, task_val, force)?;
+
     // Create the directory only once every validation has passed, so a rejected
     // upsert-create leaves no orphan dir shadowing the requested ID.
     create_task_dir_all(&task_dir, task_id)?;
@@ -914,6 +1001,9 @@ fn handle_upsert_create(
         data.schedule.as_ref(),
         &mut msg,
     );
+    if let Some(warning) = orphan_warning {
+        msg.push_str(&format!("\n{warning}"));
+    }
 
     if status != "todo" && status != "blocked" {
         let task_data = read_task(&task_dir)?
@@ -1391,6 +1481,47 @@ fn handle_update_locked(
         }
     }
 
+    // Orphan guard (`[trace] orphan_guard`, REQ-TRC-002): judged before any
+    // write, on the task as this call would leave it — `data.labels` already
+    // carries this call's labels, and the link set is the post-diff one.
+    // `block` rejects here with nothing changed; `warn` yields the line
+    // appended to the response below.
+    let orphan_warning = if transitioning_to_guarded_status {
+        let mut discard_msg = String::new();
+        let diff = compute_requirement_diff(task_val, &data.task_links, &mut discard_msg);
+        super::orphan_guard::check_entering(
+            handoff_dir,
+            force,
+            super::orphan_guard::Entering::StatusChange,
+            &super::orphan_guard::EnteringTask {
+                id: task_id,
+                title: &data.title,
+                status: new_status,
+                labels: &data.labels,
+                task_dir: Some(task_dir),
+            },
+            // Links the task keeps: the stored ones minus what this call
+            // removes (no document is needed to know that).
+            crate::trace::orphan::has_requirement_link(&match &diff {
+                Some(diff) => effective_requirement_links_after_diff(&data.task_links, diff, &[]),
+                None => data.task_links.clone(),
+            }),
+            // Links this call adds: only ids that resolve.
+            |docs| {
+                diff.as_ref().is_some_and(|diff| {
+                    !crate::mcp::handlers::docs::preview_added_requirement_links(
+                        docs,
+                        &diff.to_add,
+                        &diff.roles,
+                    )
+                    .is_empty()
+                })
+            },
+        )?
+    } else {
+        None
+    };
+
     if new_status == "done" && current_status != "done" {
         validate_done_transition(task_dir, &data)?;
         data.completed_at = Some(Utc::now().to_rfc3339());
@@ -1495,6 +1626,9 @@ fn handle_update_locked(
         &mut msg,
     );
     if let Some(warning) = advisory_warning {
+        msg.push_str(&format!("\n{warning}"));
+    }
+    if let Some(warning) = orphan_warning {
         msg.push_str(&format!("\n{warning}"));
     }
 

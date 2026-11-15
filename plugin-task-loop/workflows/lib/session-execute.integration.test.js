@@ -3263,3 +3263,195 @@ test('an unknown trace_profile throws instead of silently downgrading', async ()
     /unknown trace_profile "huge"/,
   );
 });
+
+// ============================================================
+// Close stage: the requirement-link rule (REQ-TRC-020, SPEC-TRC-012)
+// ============================================================
+// The closer leaves a task with no requirement link in `review` and reports
+// `requirement_link_missing: true`. That is a finished close-out, not a closer
+// failure, as long as the verifier reads `orphan: true` back from disk.
+const MISSING_LINK_CLOSER = {
+  tasks_processed: [
+    { task_id: 't1', status_set: 'review', criteria_checked: [0], requirement_link_missing: true },
+  ],
+};
+const disk = (status, orphan) => ({
+  tasks: [{ task_id: 't1', status, checked_indices: [0], ...(orphan === undefined ? {} : { orphan }) }],
+});
+const linkWarnings = (r) => r.warnings.filter((w) => /^requirement_link_missing: /.test(w));
+
+test('a task left in review for a missing requirement link is not a closer failure, and warnings name it', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { closerResult: MISSING_LINK_CLOSER, diskState: disk('review', true) },
+  );
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.closer_failed_tasks, [], 'SPEC-TRC-012 AC1');
+  assert.ok(!r.warnings.some((w) => /closer_failed/.test(w)), JSON.stringify(r.warnings));
+  assert.deepEqual(linkWarnings(r), [
+    'requirement_link_missing: task t1 has no requirement link, so the closer left it in review instead of done '
+      + '(not a closer failure). Link it with requirement_ids, or label it no-trace, then mark it done.',
+  ]);
+  assert.equal(r.closer_report.tasks_processed[0].requirement_link_missing, true);
+});
+
+test('a linked task left in review as "missing a link" is a closer failure, as before (SPEC-TRC-012 AC2)', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { closerResult: MISSING_LINK_CLOSER, diskState: disk('review', false) },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  const failed = r.warnings.filter((w) => /^closer_failed:/.test(w));
+  assert.equal(failed.length, 1);
+  assert.match(failed[0], /left in review for a missing requirement link, but the task is not an orphan on disk/);
+  assert.deepEqual(linkWarnings(r), [], 'a failed close-out is not also reported as an intentional review');
+});
+
+test('a missing-link claim the verifier could not confirm fails closed', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { closerResult: MISSING_LINK_CLOSER, diskState: disk('review', undefined) },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.ok(r.warnings.some((w) => /closer_failed/.test(w) && /no orphan value/.test(w)));
+  assert.deepEqual(linkWarnings(r), []);
+});
+
+test('a task closed as done although it is an orphan on disk is a closer failure', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'done', criteria_checked: [0] }] },
+      diskState: disk('done', true),
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.ok(r.warnings.some((w) => /closer_failed/.test(w) && /no requirement link on disk/.test(w)));
+});
+
+test('a task left in review for another reason is not reported as missing a requirement link', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: { tasks_processed: [{ task_id: 't1', status_set: 'review', criteria_checked: [0] }] },
+      diskState: disk('review', false),
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, []);
+  assert.deepEqual(linkWarnings(r), []);
+});
+
+test('only the orphan task of a session is left in review; the linked one closes as done', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: { tasks_processed: [
+        { task_id: 't1', status_set: 'done', criteria_checked: [0] },
+        { task_id: 't2', status_set: 'review', criteria_checked: [0], requirement_link_missing: true },
+      ] },
+      diskState: { tasks: [
+        { task_id: 't1', status: 'done', checked_indices: [0], orphan: false },
+        { task_id: 't2', status: 'review', checked_indices: [0], orphan: true },
+      ] },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, []);
+  assert.equal(linkWarnings(r).length, 1);
+  assert.match(linkWarnings(r)[0], /^requirement_link_missing: task t2 /);
+});
+
+test('a missing-link task whose close-out failed for another reason is closer_failed only', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: { tasks_processed: [{
+        task_id: 't1', status_set: 'review', requirement_link_missing: true,
+        ops_failed: [{ op: 'log_time', error: 'boom' }],
+      }] },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, ['t1']);
+  assert.deepEqual(linkWarnings(r), []);
+});
+
+test('the requirement-link rule reads the same under elite and full', async () => {
+  for (const profile of ['elite', 'full']) {
+    const ok = await runWorkflow(
+      { ...baseArgs(), profile },
+      { closerResult: MISSING_LINK_CLOSER, diskState: disk('review', true) },
+    );
+    assert.deepEqual(ok.closer_failed_tasks, [], profile);
+    assert.equal(linkWarnings(ok).length, 1, profile);
+    const bad = await runWorkflow(
+      { ...baseArgs(), profile },
+      { closerResult: MISSING_LINK_CLOSER, diskState: disk('review', false) },
+    );
+    assert.deepEqual(bad.closer_failed_tasks, ['t1'], profile);
+  }
+});
+
+test('the closer and verifier prompts carry the requirement-link rule', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const closer = promptFor(r, 'closer');
+  assert.match(closer, /handoff_get_task\(task_id, include_orphan: true\)/);
+  assert.match(closer, /orphan: true/);
+  assert.match(closer, /never `done`/);
+  assert.match(closer, /notes_append/);
+  assert.match(closer, /Requirement link missing: this task has no requirement link, so it was left in review instead of done\./);
+  assert.match(closer, /requirement_link_missing/);
+  assert.match(closer, /- None/);
+  const verifier = promptFor(r, 'closer-verifier');
+  assert.match(verifier, /include_orphan: true/);
+  assert.match(verifier, /--include-orphan true/);
+  assert.match(verifier, /orphan/);
+});
+
+test('the closer and verifier schemas expose the optional requirement-link fields', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const closerItem = optsFor(r, 'closer').schema.properties.tasks_processed.items;
+  assert.equal(closerItem.properties.requirement_link_missing.type, 'boolean');
+  assert.ok(!closerItem.required.includes('requirement_link_missing'));
+  const verifierItem = optsFor(r, 'closer-verifier').schema.properties.tasks.items;
+  assert.equal(verifierItem.properties.orphan.type, 'boolean');
+  assert.ok(!verifierItem.required.includes('orphan'), 'an older server has no orphan value to report');
+});
+
+// REQ-TRC-021: the elite prompt asks for the section in every block.
+test('the elite prompt requires a Requirements addressed section in every block, tracked or not', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite' });
+  const p = promptFor(r, 'elite-developer');
+  assert.doesNotMatch(p, /Requirements addressed` when tracked/);
+  assert.match(p, /`### Requirements addressed` is required in every block/);
+  assert.match(p, /- None — <reason>/);
+  assert.match(p, /new requirement needed/);
+  assert.match(p, /no-trace/);
+});
+
+test('a dev report with the no-requirement line is cut and handed to the closer like any other', async () => {
+  const report = eliteReportFor(['t1']).replace(
+    /### Requirements addressed\n(?:- .*\n)+/,
+    '### Requirements addressed\n- None — new requirement needed: the export format has no requirement yet\n',
+  );
+  assert.match(report, /- None — new requirement needed/);
+  const r = await runWorkflow({ ...baseArgs(), profile: 'elite' }, { eliteReport: () => report });
+  assert.equal(r.passed, true);
+  assert.equal(r.dev_reports.length, 1);
+  assert.match(r.dev_reports[0], /### Requirements addressed\n- None — new requirement needed/);
+  assert.match(r.dev_reports[0], /### done_criteria progress/);
+  assert.match(promptFor(r, 'closer'), /- None — new requirement needed: the export format has no requirement yet/);
+});
+
+test('a missing-link entry for a task that is not part of the session is not reported', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    {
+      closerResult: { tasks_processed: [
+        { task_id: 't1', status_set: 'done', criteria_checked: [0] },
+        { task_id: 'tX', status_set: 'review', requirement_link_missing: true },
+      ] },
+      diskState: { tasks: [{ task_id: 't1', status: 'done', checked_indices: [0], orphan: false }] },
+    },
+  );
+  assert.deepEqual(r.closer_failed_tasks, []);
+  assert.deepEqual(linkWarnings(r), [], 'tX was never verified, so nothing is claimed about it');
+});

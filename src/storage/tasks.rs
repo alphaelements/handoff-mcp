@@ -229,6 +229,11 @@ pub struct TaskIndex {
     /// `list_tasks` / `load_context` JSON payloads byte-identical.
     #[serde(skip)]
     pub task_links: Vec<TaskLink>,
+    /// Mirrored from `TaskData.labels` for the orphan-task check
+    /// (`crate::trace::orphan`, the `no-trace` label). `serde(skip)` keeps
+    /// the `list_tasks` / `load_context` JSON payloads byte-identical.
+    #[serde(skip)]
+    pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -565,6 +570,8 @@ struct TaskIndexFields {
     lock: Option<TaskLock>,
     #[serde(default)]
     task_links: Vec<TaskLink>,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 // -- t370.13 process-wide `TaskIndexFields` read cache (wiki/240-
@@ -1772,6 +1779,39 @@ pub fn build_task_index(
     Ok((tree, summary))
 }
 
+/// The read-only index of the tasks nested under the task in `task_dir`
+/// (its children and their descendants), never truncated. Empty for a leaf
+/// task and for a directory that holds no task. Same read-only contract as
+/// [`build_task_index`]: no lease reclaim, no write.
+pub fn build_task_children_index(task_dir: &Path) -> Result<Vec<TaskIndex>> {
+    let child_entries = sorted_dir_entries(task_dir)?;
+    let mut children = Vec::new();
+    let mut summary = TaskSummary {
+        total: 0,
+        by_status: std::collections::BTreeMap::new(),
+        total_estimate_hours: None,
+        total_actual_hours: None,
+        completion_rate: None,
+        overdue_count: 0,
+    };
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    build_index_recursive(
+        child_entries,
+        task_dir,
+        &mut children,
+        &mut summary,
+        &mut 0,
+        u32::MAX,
+        &mut 0.0,
+        &mut 0.0,
+        &mut false,
+        &mut Vec::new(),
+        &today,
+        false,
+    )?;
+    Ok(children)
+}
+
 fn build_task_index_impl(
     tasks_dir: &Path,
     done_task_limit: u32,
@@ -1989,6 +2029,7 @@ fn build_index_recursive(
             priority: data.priority,
             lock,
             task_links: data.task_links,
+            labels: data.labels,
             children,
         });
     }

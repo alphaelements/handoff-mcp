@@ -22,11 +22,12 @@ use crate::report::store::{self, RenderOptions};
 use crate::report::trace_diagram::{self, TraceDiagram};
 use crate::report::verification::{build_verification_data, VerificationInputs};
 use crate::report::{
-    charts, completion, daily, defect, effort, milestone, monthly, rollup, weekly,
+    charts, completion, daily, defect, effort, milestone, monthly, orphan, rollup, weekly,
 };
 use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::docs::pdf::template::CoverMeta;
+use crate::storage::orphan_tasks::load_orphan_tasks;
 use crate::storage::runs;
 use crate::storage::tasks::{collect_all_tasks, find_task_dir_by_id, task_status_only};
 use crate::storage::test_runs::find_test_run;
@@ -300,6 +301,7 @@ fn generate(
         ReportType::Inspection => inspection_data(ctx, &scope, data)?,
         _ => data,
     };
+    let data = with_orphan_tasks(ctx, report_type, data)?;
     let data = if inserts.charts {
         with_charts(ctx, report_type, &scope, data)?
     } else {
@@ -393,17 +395,31 @@ fn with_trace_diagram(
             data["trace_diagram"] = Value::String(graph.trim_end().to_string());
         }
         TraceDiagram::Empty => {}
-        TraceDiagram::TooLarge { nodes } => {
-            let note = json!(format!(
+        TraceDiagram::TooLarge { nodes } => crate::report::push_data_warning(
+            &mut data,
+            format!(
                 "The traceability diagram was left out: {nodes} items exceed the limit of {} (narrow scope.layers / scope.items)",
                 trace_diagram::MAX_NODES
-            ));
-            match data.get_mut("warnings") {
-                None | Some(Value::Null) => data["warnings"] = json!([note]),
-                Some(Value::Array(warnings)) => warnings.push(note),
-                Some(_) => bail!("'data.warnings' must be an array"),
-            }
-        }
+            ),
+        )?,
+    }
+    Ok(data)
+}
+
+/// Adds the orphan-task list (see [`orphan`]) to `data.orphan_tasks` of the
+/// periodic reports: the tasks the shared orphan predicate reports, the same
+/// set as the `task_orphan` lint rule. The key stays absent when there is no
+/// orphan, so such a report is unchanged. An `orphan_tasks` key the caller
+/// passed in `data` is left alone, so a caller can supply or suppress the
+/// section themselves. A check that fails is reported in `data.warnings`
+/// instead of failing the report or passing for "no orphan".
+fn with_orphan_tasks(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    mut data: Value,
+) -> Result<Value> {
+    if orphan::needs_collection(report_type, &data) {
+        orphan::apply(&mut data, load_orphan_tasks(&ctx.handoff_dir))?;
     }
     Ok(data)
 }

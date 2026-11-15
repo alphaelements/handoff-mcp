@@ -55,6 +55,25 @@ what you write.
 **Do NOT call any state-modifying handoff tools** (`handoff_save_context`, `handoff_update_task`,
 `handoff_update_session`, `handoff_memory_save`, etc.). State management is the manager's job.
 
+### Requirements addressed: required in every report
+
+`### Requirements addressed` is required in every report (see Return format), whether or not
+the project tracks requirements. It holds one of two things:
+
+- the ids of the requirement, spec and verification items (stable_ids) your work addressed,
+  one line per fact. Take them from the task's `instructions` (the `trace_context` summary,
+  the requirement ids the manager names) and, when tracking is on, from
+  `handoff_doc_req_list` (below);
+- or, when no requirement id applies, the single line `- None — <reason>`. The usual reasons
+  are `new requirement needed` (the work implements behaviour that no requirement describes
+  yet: name it, so the manager can add the requirement and link the task) and `no-trace` (the
+  work is deliberately outside requirement traceability, such as housekeeping). In a project
+  with no requirement documents at all, say that.
+
+Be honest and never invent an id to fill the section. The session-closer leaves a task with
+no requirement link in `review` instead of `done`; a `None` line with its reason is what lets
+the manager settle it.
+
 ### Requirements awareness (if instructions mention requirements_tracking)
 
 If the task's `instructions` includes a `trace_context` summary (from
@@ -91,9 +110,10 @@ line-by-line the way a pre-M2 project did. Do NOT call `handoff_doc_verify`,
 are state-modifying operations handled by the manager, even when you already ran the test
 that produced the "Result" line yourself.
 
-If the manager's `instructions` do not mention `requirements_tracking`, skip this
-section entirely — do not call `handoff_doc_req_list` and do not add a
-`### Requirements addressed` section to your report.
+If the manager's `instructions` do not mention `requirements_tracking`, do not call
+`handoff_doc_req_list`. The `### Requirements addressed` section of your report is still
+required (see above): list the ids your instructions name that you addressed, or write the
+`- None — <reason>` line.
 
 ## Rework handling
 
@@ -169,9 +189,9 @@ Run the project's quality gates as documented in `CLAUDE.md`:
 - [ ] No error swallowed into a default (`unwrap_or_default()`, `catch {}`, `let _ =`,
       `?? 0`) unless you can state, in the code, why that default is correct
 - [ ] Security check (escaping, input validation, no secrets exposed)
-- [ ] If `requirements_tracking: true` was present in instructions, the report's
-      `### Requirements addressed` section lists every stable_id you touched, one line per
-      fact (Implemented / Tested / Result / New-item) — otherwise this item does not apply
+- [ ] The report has a `### Requirements addressed` section: every stable_id you touched, one
+      line per fact (Implemented / Tested / Result / New-item), or the single line
+      `- None — <reason>` when no requirement id applies. It is never left out or empty
 
 **Format, lint, and type check are yours under every profile** — they are cheap and they read
 your diff, not the tree.
@@ -235,11 +255,16 @@ below). Other developers in this session are still working; the tree is not yet 
 - Where this code is called from (file:line), or "not yet wired — <why>"
 
 ### Requirements addressed
-(Only include this section if instructions had `requirements_tracking: true`; omit otherwise)
+(Required in every report, whether or not the instructions had `requirements_tracking: true`.
+Never leave it out and never leave it empty.)
 - <stable_id>: Implemented (<file path>)
 - <stable_id>: Tested (<test path>::<test name>)
 - <stable_id>: Result pass|fail (<evidence>)
 - <stable_id>: New-item <doc slug or path>
+(or, when the work addresses no requirement id, exactly one line that says why:)
+- None — <reason: "new requirement needed" (name the behaviour that has no requirement yet),
+  "no-trace" (the work is deliberately outside requirement traceability, and why), or
+  another reason in your own words>
 
 ### Actual time
 - <hours> (real wall-clock hours spent on this assignment, e.g. 0.2 for a few minutes;
