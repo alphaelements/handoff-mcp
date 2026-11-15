@@ -31,6 +31,12 @@ pub fn run(args: &[String]) -> i32 {
     // invent an agent for it (`handoff_load_context` would otherwise register
     // a new one per call).
     crate::mcp::router::mark_cli_process();
+    // `release-check <milestone>` takes a positional argument and has its own
+    // exit-code contract (and, with `--run`, executes the project's commands),
+    // so it does not go through the generic flag-to-tool mapping.
+    if args.first().map(String::as_str) == Some(RELEASE_CHECK_COMMAND) {
+        return crate::release::cli::run(&args[1..]);
+    }
     let is_trace = args.first().map(String::as_str) == Some("trace");
     let action = args.get(1).map(String::as_str);
     let is_trace_lint = is_trace && action == Some("lint");
@@ -65,6 +71,9 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 }
+
+/// The `release-check` command (see [`crate::release::cli`]).
+const RELEASE_CHECK_COMMAND: &str = "release-check";
 
 /// Whether a `trace update` response carries a `failed` op. The handler
 /// answers `Ok` with `{"applied": [...], "failed": {...}}` for both a
@@ -323,6 +332,9 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
 
         // dashboard
         ("dashboard", "") => "handoff_dashboard",
+
+        // next step
+        ("next-step", "") => "handoff_next_step",
 
         // timer
         ("timer", "start") => "handoff_timer_start",
@@ -879,6 +891,13 @@ pub const GROUPS: &[(&str, &str)] = &[
     ),
     ("assignee", "Team members (list, add, update, remove)"),
     ("milestone", "Milestones (list, add, update, remove)"),
+    (
+        RELEASE_CHECK_COMMAND,
+        // No trailing parenthesized list: this command takes a milestone, not
+        // one of several actions, and `--help` readers (and the help tests)
+        // take such a list for the group's actions.
+        "Pre-release check of a milestone: <milestone> [--run] [--confirm <ids>]",
+    ),
     ("calendar", "Calendar settings (update)"),
     ("labels", "Project labels (update)"),
     ("project", "Project lifecycle (start)"),
@@ -886,6 +905,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("capacity", "Work capacity"),
     ("schedule", "Auto-scheduler"),
     ("dashboard", "Cross-project dashboard"),
+    ("next-step", "Recommended next step for the project"),
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "doc",
@@ -930,6 +950,10 @@ EXAMPLES:
 }
 
 pub fn print_group_help(group: &str) {
+    if group == RELEASE_CHECK_COMMAND {
+        println!("{}", crate::release::cli::USAGE);
+        return;
+    }
     let actions: &[(&str, &str)] = match group {
         "init" => &[(
             "",
@@ -980,7 +1004,7 @@ pub fn print_group_help(group: &str) {
         "milestone" => &[
             ("list", "List milestones"),
             ("add", "Add milestone (--name, --date, --description)"),
-            ("update", "Update milestone (--name, --date, --description)"),
+            ("update", "Update milestone (--name, --date, --description, --status, --force; a move to `released` consults the release check when [onboarding] release_guard is warn or block)"),
             ("remove", "Remove milestone (--name)"),
         ],
         "calendar" => &[
@@ -1006,6 +1030,10 @@ pub fn print_group_help(group: &str) {
         "dashboard" => &[
             ("", "Show cross-project dashboard (--scan-dirs, --include-completed)"),
         ],
+        "next-step" => &[(
+            "",
+            "Print the project's state and the one operation to do next, as JSON {state, action, facts}",
+        )],
         "timer" => &[
             ("start", "Start timer for task (--task-id)"),
             ("stop", "Stop timer for task (--task-id)"),

@@ -6,8 +6,9 @@ use serde_json::Value;
 
 pub mod doctor;
 mod infer;
-mod runner;
+pub(crate) mod runner;
 mod scaffold;
+pub mod secrets;
 
 const HOOK_SERVER: &str = "handoff";
 const HOOK_TOOL_QUERY: &str = "handoff_memory_query";
@@ -546,26 +547,7 @@ fn diagnose_current_project(run_commands: bool) -> Result<doctor::DoctorReport> 
     }
 
     let pending = request(&[], false)?.commands_to_run;
-    let results: Vec<doctor::CommandResult> = pending
-        .iter()
-        .map(|pending| {
-            // Progress goes to stderr so that `--json` output stays pure.
-            eprintln!("  running {}: {}", pending.id, pending.command);
-            let execution = runner::run_command(
-                &pending.command,
-                &project_dir,
-                std::time::Duration::from_secs(pending.timeout_sec),
-            );
-            doctor::CommandResult {
-                id: pending.id.to_string(),
-                command: pending.command.clone(),
-                exit_code: execution.exit_code,
-                duration_ms: Some(execution.duration_ms),
-                output_tail: Some(execution.output_tail),
-                error: execution.error,
-            }
-        })
-        .collect();
+    let results = runner::run_pending(&pending, &project_dir);
     request(&results, true)
 }
 

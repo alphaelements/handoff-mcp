@@ -139,6 +139,11 @@ pub struct Config {
     /// section existed parsing and re-serializing unchanged.
     #[serde(default, skip_serializing_if = "OnboardingConfig::is_empty")]
     pub onboarding: OnboardingConfig,
+    /// Pre-release checks: `[release]` (SPEC-ONB-040). `serde(default)` +
+    /// `skip_serializing_if` keep every config.toml written before this
+    /// section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "ReleaseConfig::is_empty")]
+    pub release: ReleaseConfig,
 }
 
 /// Keys of the `[commands]` section, in the order they are listed to users.
@@ -233,6 +238,24 @@ pub const DEFAULT_COMMAND_TIMEOUT_SEC: u64 = 600;
 /// The value every `[onboarding]` mode key reads as when it is unset.
 const ONBOARDING_MODE_OFF: &str = "off";
 
+/// File names that usually hold secrets (SPEC-ONB-050), matched against the
+/// files Git tracks unless `[onboarding] secret_file_patterns` replaces the
+/// list. `*` stands for any run of characters and `?` for one.
+pub const DEFAULT_SECRET_FILE_PATTERNS: &[&str] = &[
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json",
+    "secrets.*",
+];
+
+/// File names that match a secrets pattern but are templates meant to be
+/// committed. They are never reported, whatever the patterns are.
+pub const SECRET_FILE_EXCLUSIONS: &[&str] = &[".env.example", ".env.sample", ".env.template"];
+
 /// `[onboarding]` section (SPEC-ONB-010, SPEC-ONB-091): switches for the
 /// guidance and checks aimed at first-time users.
 ///
@@ -272,6 +295,10 @@ pub struct OnboardingConfig {
     /// (default [`DEFAULT_COMMAND_TIMEOUT_SEC`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_timeout_sec: Option<u64>,
+    /// File-name patterns of secrets files, replacing
+    /// [`DEFAULT_SECRET_FILE_PATTERNS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_file_patterns: Option<Vec<String>>,
     /// Keys this version does not know. They are kept so that rewriting
     /// config.toml never drops a setting a newer handoff-mcp wrote; nothing
     /// here reads them.
@@ -321,6 +348,21 @@ impl OnboardingConfig {
             .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SEC)
     }
 
+    /// The file-name patterns the secrets check matches: the configured
+    /// list, or [`DEFAULT_SECRET_FILE_PATTERNS`] when none is configured. A
+    /// blank entry matches nothing and is left out. An explicitly empty list
+    /// stays empty: the project asked for no patterns.
+    pub fn secret_file_patterns(&self) -> Vec<&str> {
+        match &self.secret_file_patterns {
+            Some(patterns) => patterns
+                .iter()
+                .map(|pattern| pattern.trim())
+                .filter(|pattern| !pattern.is_empty())
+                .collect(),
+            None => DEFAULT_SECRET_FILE_PATTERNS.to_vec(),
+        }
+    }
+
     /// Rejects a value the readers would not honor. An empty string is what a
     /// `null` update writes and means "unset", so it passes.
     pub fn validate(&self) -> Result<(), String> {
@@ -345,6 +387,72 @@ impl OnboardingConfig {
                 "invalid onboarding.command_timeout_sec 0: expected a number of seconds >= 1"
                     .to_string(),
             );
+        }
+        if self
+            .secret_file_patterns
+            .iter()
+            .flatten()
+            .any(|pattern| pattern.trim().is_empty())
+        {
+            return Err(
+                "invalid onboarding.secret_file_patterns: a pattern is blank. Give file-name \
+                 patterns such as \".env\" or \"*.pem\", or an empty list for none"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[release]` section (SPEC-ONB-040): what the pre-release check of a
+/// milestone asks for beyond what it can judge from the project's data.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseConfig {
+    /// Names of the items a person confirms before a release
+    /// (`docs_updated`, ...). Each becomes the check `manual:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_checks: Option<Vec<String>>,
+    /// Keys this version does not know. They are kept so that rewriting
+    /// config.toml never drops a setting a newer handoff-mcp wrote; nothing
+    /// here reads them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl ReleaseConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// The manual check names in the order they are configured, each once. A
+    /// blank entry names nothing and is left out.
+    pub fn manual_checks(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for name in self.manual_checks.iter().flatten().map(|name| name.trim()) {
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Rejects a list the readers would silently reduce.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for name in self.manual_checks.iter().flatten().map(|name| name.trim()) {
+            if name.is_empty() {
+                return Err(
+                    "invalid release.manual_checks: a name is blank. Give names such as \
+                     \"docs_updated\""
+                        .to_string(),
+                );
+            }
+            if seen.contains(&name) {
+                return Err(format!(
+                    "invalid release.manual_checks: '{name}' is listed more than once"
+                ));
+            }
+            seen.push(name);
         }
         Ok(())
     }
@@ -698,6 +806,10 @@ pub const MILESTONE_DEFAULT_STATUS: &str = "planning";
 
 /// Status that gates new task assignment with a warning.
 pub const MILESTONE_FROZEN_STATUS: &str = "frozen";
+
+/// Status of a milestone that shipped. Moving a milestone to it is what the
+/// release guard (`[onboarding] release_guard`) checks.
+pub const MILESTONE_RELEASED_STATUS: &str = "released";
 
 impl MilestoneConfig {
     /// The effective lifecycle status (`planning` when unset).
@@ -1427,6 +1539,7 @@ impl Config {
             session_loop: SessionLoopConfig::default(),
             commands: CommandsConfig::default(),
             onboarding: OnboardingConfig::default(),
+            release: ReleaseConfig::default(),
         }
     }
 }
@@ -2929,5 +3042,110 @@ pair = "usability_test"
             ));
             assert!(parsed.is_err(), "{bad}");
         }
+    }
+
+    // --- [onboarding] secret_file_patterns (SPEC-ONB-050) ---
+
+    #[test]
+    fn secret_file_patterns_default_to_the_documented_list() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert_eq!(
+            cfg.onboarding.secret_file_patterns(),
+            [
+                ".env",
+                ".env.*",
+                "*.pem",
+                "*.key",
+                "id_rsa",
+                "id_ed25519",
+                "credentials.json",
+                "secrets.*"
+            ]
+        );
+        assert_eq!(
+            SECRET_FILE_EXCLUSIONS,
+            [".env.example", ".env.sample", ".env.template"]
+        );
+        assert!(cfg.onboarding.is_empty());
+    }
+
+    #[test]
+    fn secret_file_patterns_are_read_and_round_trip() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = [\"*.tfstate\", \" token.txt \"]\n",
+        );
+        assert_eq!(
+            cfg.onboarding.secret_file_patterns(),
+            ["*.tfstate", "token.txt"]
+        );
+        assert!(cfg.onboarding.validate().is_ok());
+        let rendered = render_config(&cfg).unwrap();
+        assert_eq!(parse_config(&rendered).onboarding, cfg.onboarding);
+
+        // An explicit empty list is kept as written: it means "no patterns".
+        let none =
+            parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = []\n");
+        assert!(none.onboarding.secret_file_patterns().is_empty());
+        assert!(render_config(&none)
+            .unwrap()
+            .contains("secret_file_patterns = []"));
+    }
+
+    #[test]
+    fn a_blank_secret_file_pattern_is_invalid() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = [\".env\", \"  \"]\n",
+        );
+        let err = cfg.onboarding.validate().unwrap_err();
+        assert!(err.contains("onboarding.secret_file_patterns"), "{err}");
+        // Read leniently: the blank entry matches nothing and is dropped.
+        assert_eq!(cfg.onboarding.secret_file_patterns(), [".env"]);
+
+        let parsed = toml::from_str::<Config>(
+            "[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = \".env\"\n",
+        );
+        assert!(parsed.is_err(), "a string is not a list of patterns");
+    }
+
+    // --- [release] manual_checks (SPEC-ONB-040) ---
+
+    #[test]
+    fn release_section_absent_means_no_manual_checks() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert!(cfg.release.is_empty());
+        assert!(cfg.release.manual_checks().is_empty());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(!rendered.contains("release"), "{rendered}");
+    }
+
+    #[test]
+    fn release_manual_checks_are_read_in_order_and_round_trip() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[release]\nmanual_checks = [\"docs_updated\", \" changelog \", \"docs_updated\", \"\"]\nfuture_key = 1\n",
+        );
+        assert_eq!(cfg.release.manual_checks(), ["docs_updated", "changelog"]);
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("[release]"), "{rendered}");
+        assert!(
+            rendered.contains("future_key = 1"),
+            "a key this version does not know survives a rewrite: {rendered}"
+        );
+        assert_eq!(parse_config(&rendered).release, cfg.release);
+    }
+
+    #[test]
+    fn release_validate_rejects_blank_and_duplicate_names() {
+        for (body, expected) in [
+            ("manual_checks = [\"a\", \" \"]", "blank"),
+            ("manual_checks = [\"a\", \"a\"]", "more than once"),
+        ] {
+            let cfg = parse_config(&format!("[project]\nname = \"x\"\n\n[release]\n{body}\n"));
+            let err = cfg.release.validate().unwrap_err();
+            assert!(err.contains("release.manual_checks"), "{err}");
+            assert!(err.contains(expected), "{err}");
+        }
+        let ok =
+            parse_config("[project]\nname = \"x\"\n\n[release]\nmanual_checks = [\"a\", \"b\"]\n");
+        assert!(ok.release.validate().is_ok());
     }
 }

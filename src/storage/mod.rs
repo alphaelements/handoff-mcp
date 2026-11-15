@@ -8,6 +8,7 @@ pub mod deltas;
 pub mod docs;
 pub mod events;
 pub mod git;
+pub mod git_index;
 pub mod gitignore;
 pub mod layer_status;
 pub mod lineage;

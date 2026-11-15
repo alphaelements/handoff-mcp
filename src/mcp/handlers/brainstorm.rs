@@ -1104,6 +1104,41 @@ fn load_state(handoff: &Path, id: &str) -> Result<BrainstormState> {
         .with_context(|| format!("Failed to parse brainstorm state: {}", path.display()))
 }
 
+/// How many brainstorm sessions of the project are finalized, that is, have
+/// a settled report. Reads the state files and nothing else; a state file
+/// that cannot be read or parsed is an error, since it may be the finalized
+/// one.
+pub(crate) fn finalized_count(handoff: &Path) -> Result<usize> {
+    #[derive(Deserialize)]
+    struct Status {
+        status: Phase,
+    }
+    let dir = brainstorm_dir(handoff);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to read brainstorm dir: {}", dir.display()))
+        }
+    };
+    let mut finalized = 0;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read brainstorm state: {}", path.display()))?;
+        let state: Status = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse brainstorm state: {}", path.display()))?;
+        if state.status == Phase::Finalized {
+            finalized += 1;
+        }
+    }
+    Ok(finalized)
+}
+
 fn save_state(handoff: &Path, state: &BrainstormState) -> Result<()> {
     let dir = brainstorm_dir(handoff);
     std::fs::create_dir_all(&dir)

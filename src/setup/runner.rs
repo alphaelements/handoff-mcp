@@ -1,10 +1,12 @@
-//! Runs `[commands]` for `handoff-mcp setup --check --run` (SPEC-ONB-002,
+//! Runs `[commands]` for `handoff-mcp setup --check --run` and
+//! `handoff-mcp release-check --run` (SPEC-ONB-002, SPEC-ONB-040,
 //! SPEC-ONB-093).
 //!
 //! This is the only place in handoff-mcp that executes a command taken from
 //! `config.toml`, and it is reachable only from the CLI a user types. The MCP
-//! server never calls into this module: `handoff_doctor` returns the commands
-//! and judges the results an agent reports (see `doctor`).
+//! server never calls into this module: `handoff_doctor` and
+//! `handoff_release_check` return the commands and judge the results an agent
+//! reports (see `doctor`).
 //!
 //! A command is a shell command line, so it runs through the platform's
 //! shell (`sh -c` on Unix, `cmd /C` on Windows) in the project directory.
@@ -15,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::doctor::OUTPUT_TAIL_MAX_LINES;
+use super::doctor::{CommandResult, CommandToRun, OUTPUT_TAIL_MAX_LINES};
 
 /// How often a running command is checked for completion.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -38,6 +40,31 @@ pub(crate) struct Execution {
     /// Why there is no exit code: the command did not start, timed out, or
     /// was ended by a signal.
     pub error: Option<String>,
+}
+
+/// Runs every command in `pending`, in order and whatever the earlier ones
+/// did, and returns their results in the form the checks judge. Each command
+/// is announced on stderr, so that JSON printed to stdout stays pure.
+pub(crate) fn run_pending(pending: &[CommandToRun], project_dir: &Path) -> Vec<CommandResult> {
+    pending
+        .iter()
+        .map(|pending| {
+            eprintln!("  running {}: {}", pending.id, pending.command);
+            let execution = run_command(
+                &pending.command,
+                project_dir,
+                Duration::from_secs(pending.timeout_sec),
+            );
+            CommandResult {
+                id: pending.id.to_string(),
+                command: pending.command.clone(),
+                exit_code: execution.exit_code,
+                duration_ms: Some(execution.duration_ms),
+                output_tail: Some(execution.output_tail),
+                error: execution.error,
+            }
+        })
+        .collect()
 }
 
 /// Runs `command` through the shell in `project_dir`, stopping it (and what

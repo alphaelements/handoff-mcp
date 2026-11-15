@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 
 use super::types::ToolDefinition;
+use crate::release::check::COMMAND_ITEMS as RELEASE_COMMAND_ITEMS;
 use crate::setup::doctor::{
     CHECK_IDS as DOCTOR_CHECK_IDS, COMMAND_CHECKS as DOCTOR_COMMAND_CHECKS,
 };
@@ -499,7 +500,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doctor".to_string(),
-            description: "Diagnose whether the project is ready for agent-driven work: handoff initialized, MCP server registered, CLAUDE.md sections present and filled in (no `TODO(handoff)` left), `[commands]` defined, and whether the project's commands succeed. Works on a project that is not initialized yet. Read-only. This tool never runs a command and never starts a process: it returns the commands in `commands_to_run` [{id, command, timeout_sec}]; run each one yourself from the project root through the shell, stopping it after timeout_sec, then call again with `results` and the tool judges them. Returns JSON {ready, checks: [{id, status, detail, next_step?, command?, exit_code?, duration_ms?, source?}], commands_to_run, warnings}. status is pass / fail / skip / manual; skip means the check was not carried out (no result given, or nothing defined) and is never a pass. Every fail carries next_step. ready is true when nothing failed (a skip does not lower it), except that once results are reported a project without `[commands] test` is not ready. A result whose `command` differs from the current `[commands]` value is not used and fails the check. The same diagnosis is available in a terminal as `handoff-mcp setup --check` (add `--run` to let the CLI run the commands, `--json` for this JSON).".to_string(),
+            description: "Diagnose whether the project is ready for agent-driven work: handoff initialized, MCP server registered, CLAUDE.md sections present and filled in (no `TODO(handoff)` left), `[commands]` defined, whether the project's commands succeed, whether Git tracks a file that usually holds secrets (`secrets_untracked`: `.env`, `*.pem`, `*.key`, ... matched by file name against the Git index; file contents are not scanned; skip outside a Git repository) and whether the dependency audit passes (`dependencies_audited`: the result of `[commands] audit`, handed out and judged like the other commands). Works on a project that is not initialized yet. Read-only. This tool never runs a command and never starts a process: it returns the commands in `commands_to_run` [{id, command, timeout_sec}]; run each one yourself from the project root through the shell, stopping it after timeout_sec, then call again with `results` and the tool judges them. Returns JSON {ready, checks: [{id, status, detail, next_step?, command?, exit_code?, duration_ms?, source?}], commands_to_run, warnings}. status is pass / fail / skip / manual; skip means the check was not carried out (no result given, or nothing defined) and is never a pass. Every fail carries next_step. ready is true when nothing failed (a skip does not lower it), except that once results are reported a project without `[commands] test` is not ready. A result whose `command` differs from the current `[commands]` value is not used and fails the check. The same diagnosis is available in a terminal as `handoff-mcp setup --check` (add `--run` to let the CLI run the commands, `--json` for this JSON).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -546,6 +547,77 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             },
                             "required": ["id", "command"]
                         }
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_release_check".to_string(),
+            description: "Pre-release check of a milestone: is everything it promised done, verified and safe to ship? Returns JSON {milestone, ok, items: [{id, status, detail, refs?, source?, checked_at?}], commands_to_run: [{id, command, timeout_sec}]}. Items, in order: tasks_done (every leaf task of the milestone is done or skipped; refs = the unfinished task ids; a subtask without a milestone of its own belongs to its parent's), no_open_bugs (no open task labelled `bug`), requirements_verified (every requirement-layer item planned for the milestone is `passing`; refs = the others; skip when the milestone has none), tests_pass / smoke_pass / dependencies_audited (the results of `[commands] test` / `smoke` / `audit`), secrets_untracked (Git tracks no file whose name matches `[onboarding] secret_file_patterns`; file contents are not scanned; skip outside a Git repository) and one manual:<name> per entry of `[release] manual_checks`. status is pass / fail / skip / manual. ok is true only when every item is pass: a skip (not carried out) or a manual (waiting for a person) keeps it false. This tool never runs a command and never starts a process: run each entry of commands_to_run yourself from the project root through the shell, stopping it after timeout_sec, then call again with `results`. A call without `results` reports the command items as skip and never falls back on an earlier result. A result whose `command` differs from the current `[commands]` value is not used and fails the item. Pass `confirm: [\"manual:<name>\"]` once a person has confirmed a manual item; it stays confirmed for that milestone. Results and confirmations passed in are recorded in .handoff/release/<milestone>.json (per command: status, exit code, source, time); a call with neither writes nothing. An unknown milestone is an error. The same check is available in a terminal as `handoff-mcp release-check <milestone>` (add `--run` to let the CLI run the commands).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "milestone": {
+                        "type": "string",
+                        "description": "Name of the milestone to check (a `[milestones.<name>]` entry)."
+                    },
+                    "results": {
+                        "type": "array",
+                        "description": "Results of the commands from `commands_to_run` that you ran. Omit on the first call.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "enum": RELEASE_COMMAND_ITEMS.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                                    "description": "The `id` from commands_to_run."
+                                },
+                                "command": {
+                                    "type": "string",
+                                    "description": "The command line you ran, exactly as commands_to_run gave it."
+                                },
+                                "exit_code": {
+                                    "type": "integer",
+                                    "description": "The command's exit code. Required unless `error` is given."
+                                },
+                                "duration_ms": {
+                                    "type": "integer",
+                                    "description": "How long the command ran, in milliseconds."
+                                },
+                                "output_tail": {
+                                    "type": "string",
+                                    "description": "The last lines of the command's output (about 20 lines)."
+                                },
+                                "error": {
+                                    "type": "string",
+                                    "description": "Why there is no exit code: the command could not be started, or it was stopped after timeout_sec (for example 'timed out after 600s'). Leave it out when the command ran to completion: a result with an `error` fails, and an empty `error` is rejected."
+                                }
+                            },
+                            "required": ["id", "command"]
+                        }
+                    },
+                    "confirm": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ids of manual items a person has confirmed, e.g. [\"manual:docs_updated\"]. Each must be a `manual:<name>` of `[release] manual_checks`."
+                    }
+                },
+                "required": ["milestone"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_next_step".to_string(),
+            description: "Tell which state the project is in and the one operation to do next. Returns JSON {state, action: {title, command, reason}, facts}. The states are checked in this order and the first that applies is returned: not_initialized (no .handoff/ -> handoff_init), not_ready (handoff_doctor without results is not ready -> what its first failed check says to do), review_pending (a task is in review -> confirm it), in_progress (a task is in progress, or a session is active -> resume it), no_brainstorm (no finalized brainstorm report and no requirement item -> /brainstorm-loop), no_requirements (the requirement layer has no item -> /requirement-loop), ready_tasks (a todo task whose dependencies are all done or skipped -> /session-loop), release_ready (no unfinished task and a milestone that is neither released nor cancelled -> handoff_release_check), all_done (none of the above -> plan what comes next, or, when unfinished tasks remain that cannot start, clear what blocks them). action.command is a slash command, a tool call or a sentence to act on. facts holds the counts the decision looked at (doctor: {ready, failed}, tasks: {total, by_status, unfinished, ready}, active_sessions, brainstorm_reports, requirement_items, milestones: {total, unreleased}); a group the decision did not need is left out. Read-only: it writes nothing, runs no command and starts no process, and it works on a project that is not initialized yet. With `[onboarding] next_step = true`, handoff_load_context carries the same answer as its `next_step` key. This is not handoff_trace_next, which recommends the next verification item of the trace graph. The same answer is available in a terminal as `handoff-mcp next-step`.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
                     }
                 }
             }),
@@ -1224,7 +1296,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_update_milestone".to_string(),
-            description: "Update an existing [milestones.<name>] entry. Pass null to clear a field. A status change must move forward along planning -> active -> frozen -> released (cancelled is allowed from any status); a backward move, or leaving cancelled, is rejected unless force is true.".to_string(),
+            description: "Update an existing [milestones.<name>] entry. Pass null to clear a field. A status change must move forward along planning -> active -> frozen -> released (cancelled is allowed from any status); a backward move, or leaving cancelled, is rejected unless force is true. Release guard: when `[onboarding] release_guard` is `warn` or `block`, moving a milestone to `released` consults its pre-release check (the items of handoff_release_check) without running any command: tasks_done, no_open_bugs, requirements_verified, secrets_untracked and manual:* are judged on the spot, while tests_pass, smoke_pass and dependencies_audited are read from the last result recorded by handoff_release_check (no record, or a record for a command that has since changed, counts as not verified). `warn` releases the milestone and appends one `Warning: release check: <id> [<status>] <detail>` line per item that did not pass; `block` rejects the call with the same list and changes nothing, unless force is true. Both say when each recorded command result was judged, since a record may be out of date: run handoff_release_check and report fresh results first. With release_guard `off` (the default) nothing is checked and the reply is unchanged.".to_string(),
             input_schema: milestone_write_schema(),
         },
         ToolDefinition {
@@ -2618,7 +2690,7 @@ fn milestone_write_schema() -> Value {
             "status": { "type": "string", "enum": ["planning", "active", "completed", "frozen", "released", "cancelled"], "description": "Lifecycle status (default planning). Adding a task to a frozen milestone warns." },
             "order": { "type": "integer", "description": "Display order for handoff_list_milestones; lower first." },
             "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Names of milestones this one depends on." },
-            "force": { "type": "boolean", "description": "handoff_update_milestone only: allow a backward status transition." }
+            "force": { "type": "boolean", "description": "handoff_update_milestone only: allow a backward status transition, and release a milestone although `[onboarding] release_guard = \"block\"` found items that did not pass (they are then reported as warnings)." }
         },
         "required": ["name"]
     })

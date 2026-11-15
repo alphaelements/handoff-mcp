@@ -11,10 +11,12 @@ use super::config_crud::{
     config_path, ensure_subtable, ensure_table, load_doc, require_str, save_doc, set_opt_i64,
     set_opt_str, set_string_array,
 };
+use super::release_check::check_against_record;
 use super::HandlerContext;
+use crate::release::guard::{judge, GuardMode, Verdict};
 use crate::storage::config::{
     is_forward_milestone_transition, read_config_lenient, MILESTONE_DEFAULT_STATUS,
-    MILESTONE_FROZEN_STATUS, MILESTONE_STATUSES,
+    MILESTONE_FROZEN_STATUS, MILESTONE_RELEASED_STATUS, MILESTONE_STATUSES,
 };
 
 /// handoff_list_milestones — return every `[milestones.*]` entry, ordered by
@@ -86,7 +88,8 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
 /// handoff_update_milestone — patch an existing `[milestones.<name>]` entry.
 /// A `status` change must follow the lifecycle (see
-/// `is_forward_milestone_transition`) unless `force` is true.
+/// `is_forward_milestone_transition`) unless `force` is true. A move to
+/// `released` is also put to the release guard (see [`release_guard_warnings`]).
 pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let path = config_path(ctx)?;
     let name = require_str(arguments, "name")?;
@@ -102,6 +105,7 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     };
 
     let fields = ValidatedFields::parse(arguments)?;
+    let mut release_warnings = Vec::new();
     if let Some(target) = fields.status {
         let force = arguments
             .get("force")
@@ -115,16 +119,51 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                  from any status). Pass force: true to override."
             );
         }
+        if target == MILESTONE_RELEASED_STATUS && current != MILESTONE_RELEASED_STATUS {
+            release_warnings = release_guard_warnings(ctx, &doc, name, force)?;
+        }
     }
 
     let milestones = ensure_table(&mut doc, "milestones")?;
     let mut msg = format!("Updated milestone '{name}'");
     append_dependency_warnings(&mut msg, name, &fields.depends_on, milestones);
+    for warning in &release_warnings {
+        msg.push_str(&format!("\nWarning: {warning}"));
+    }
     let sub = ensure_subtable(&mut doc, "milestones", name)?;
     fields.apply(sub, arguments);
 
     save_doc(&path, &doc)?;
     Ok(msg)
+}
+
+/// The release guard (SPEC-ONB-041), asked when milestone `name` is about to
+/// become `released`. With `[onboarding] release_guard` off (the default)
+/// nothing is read and nothing is returned, so the reply is what it has
+/// always been. Otherwise the milestone's pre-release check is read with the
+/// command items answered from the record (no command is run, nothing is
+/// written): `warn` returns a line for everything that did not pass, `block`
+/// fails the call instead unless `force` is set.
+fn release_guard_warnings(
+    ctx: &HandlerContext,
+    doc: &toml_edit::DocumentMut,
+    name: &str,
+    force: bool,
+) -> Result<Vec<String>> {
+    let setting = doc
+        .get("onboarding")
+        .and_then(|section| section.get("release_guard"))
+        .and_then(|value| value.as_str());
+    let mode = GuardMode::from_setting(setting);
+    if mode == GuardMode::Off {
+        return Ok(Vec::new());
+    }
+    let check = check_against_record(&ctx.project_dir, &ctx.handoff_dir, name)
+        .map_err(|e| format!("{e:#}"));
+    match judge(mode, force, name, check.as_ref().map_err(String::as_str)) {
+        Verdict::Release { warnings } => Ok(warnings),
+        Verdict::Refuse { message } => anyhow::bail!(message),
+    }
 }
 
 /// handoff_remove_milestone — delete a `[milestones.<name>]` entry.

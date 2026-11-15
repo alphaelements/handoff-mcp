@@ -15,7 +15,13 @@
 //!
 //! That is why the handoff directory is located here by reading files only,
 //! instead of through `storage::resolve_handoff_dir` (which asks `git` about
-//! worktrees), and why a diagnosis writes nothing.
+//! worktrees), why the tracked files of the `secrets_untracked` check
+//! (SPEC-ONB-050) are read from the Git index file instead of asked of `git`,
+//! and why a diagnosis writes nothing.
+//!
+//! The judging of a reported command result ([`judge_command`],
+//! [`validate_results`]) is shared with the pre-release check
+//! (`crate::release`), so both tools read a result the same way.
 
 use std::path::{Path, PathBuf};
 
@@ -24,8 +30,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::scaffold::{missing_sections, SCAFFOLD_SECTIONS, TODO_MARKER};
+use super::secrets::{check_secrets_untracked, SECRETS_UNTRACKED};
 use crate::storage::config::{
     read_config, CommandsConfig, Config, COMMAND_KEYS, DEFAULT_COMMAND_TIMEOUT_SEC,
+    DEFAULT_SECRET_FILE_PATTERNS,
 };
 
 /// Name the handoff MCP server is registered under by `handoff-mcp setup` and
@@ -48,13 +56,22 @@ const SHELL_EXIT_NOT_FOUND: i64 = 127;
 /// Id of the check that reports whether `[commands]` defines what a run needs.
 const COMMANDS_DEFINED: &str = "commands_defined";
 
+/// Id of the check that judges the result of `[commands] audit`
+/// (SPEC-ONB-050).
+pub const DEPENDENCIES_AUDITED: &str = "dependencies_audited";
+
+/// `[commands]` key of the dependency audit. Its output is quoted even when
+/// the command succeeds: what an audit tool prints on success (advisories it
+/// was told to ignore, how many packages it looked at) is the evidence.
+const AUDIT_COMMAND_KEY: &str = "audit";
+
 const DEFINE_TEST_NEXT_STEP: &str = "Define the test command: \
     `handoff_update_config(updates: {\"commands.test\": \"<your test command>\"})`.";
 
 /// Outcome of one check. `skip` means the check was not carried out (nothing
 /// to judge, or no result was given); it is never counted as a pass.
 /// `manual` means a person has to confirm the item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Pass,
@@ -64,7 +81,7 @@ pub enum CheckStatus {
 }
 
 /// Who ran a command whose result was judged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResultSource {
     /// The `handoff-mcp` CLI ran it.
@@ -163,16 +180,20 @@ pub const CHECK_IDS: &[&str] = &[
     "cmd_lint",
     "cmd_typecheck",
     "smoke_defined",
+    SECRETS_UNTRACKED,
+    DEPENDENCIES_AUDITED,
 ];
 
 /// Checks that judge a command's result, with their `[commands]` key.
-/// `format` is not among them: a formatter rewrites files.
+/// `format` is not among them (a formatter rewrites files), nor is `smoke`
+/// (the session loop runs it at its own step).
 pub const COMMAND_CHECKS: &[(&str, &str)] = &[
     ("cmd_install", "install"),
     ("cmd_build", "build"),
     ("cmd_test", "test"),
     ("cmd_lint", "lint"),
     ("cmd_typecheck", "typecheck"),
+    (DEPENDENCIES_AUDITED, AUDIT_COMMAND_KEY),
 ];
 
 /// Longest output tail quoted in a check's `detail`.
@@ -214,7 +235,7 @@ fn primary_checkout(project_dir: &Path) -> Option<PathBuf> {
 /// a [`Check`] in the report.
 pub fn diagnose(request: &DoctorRequest<'_>) -> Result<DoctorReport> {
     let selected = selected_checks(request.checks)?;
-    validate_results(request.results, &selected)?;
+    validate_results(request.results, COMMAND_CHECKS, Some(&selected))?;
 
     let mut warnings = Vec::new();
     let config = load_config(request.project_dir);
@@ -222,6 +243,12 @@ pub fn diagnose(request: &DoctorRequest<'_>) -> Result<DoctorReport> {
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     let commands = config.as_ref().ok().map(|config| &config.commands);
+    // The secrets check does not need an initialized project: without a
+    // readable config the default patterns apply.
+    let secret_patterns = config.as_ref().map_or_else(
+        |_| DEFAULT_SECRET_FILE_PATTERNS.to_vec(),
+        |config| config.onboarding.secret_file_patterns(),
+    );
     let test_undefined = commands.is_none_or(|commands| commands.get("test").is_none());
     // Without a readable config there are no commands, so the fallback is
     // never handed out; it only keeps the value total.
@@ -246,13 +273,14 @@ pub fn diagnose(request: &DoctorRequest<'_>) -> Result<DoctorReport> {
             "claude_md_todo" => check_todo(claude_md.as_deref()),
             COMMANDS_DEFINED => check_commands_defined(commands, run_without_test),
             "smoke_defined" => check_smoke_defined(commands),
+            SECRETS_UNTRACKED => check_secrets_untracked(request.project_dir, &secret_patterns),
             command_check => {
                 let key = command_key(command_check)
                     .ok_or_else(|| anyhow::anyhow!("no check named '{command_check}'"))?;
                 let configured = commands.and_then(|commands| commands.get(key));
                 let reported = request.results.iter().find(|r| r.id == command_check);
                 let (check, waiting) =
-                    check_command(command_check, key, configured, reported, request.source);
+                    judge_command(command_check, key, configured, reported, request.source);
                 if waiting {
                     if let Some(command) = configured {
                         commands_to_run.push(CommandToRun {
@@ -325,24 +353,30 @@ fn command_key(check_id: &str) -> Option<&'static str> {
 }
 
 /// Rejects results that cannot be judged, so a caller's mistake is never
-/// mistaken for a finding about the project.
-fn validate_results(results: &[CommandResult], selected: &[&'static str]) -> Result<()> {
+/// mistaken for a finding about the project. `command_checks` are the checks
+/// (with their `[commands]` key) the calling tool accepts results for;
+/// `selected`, when given, are the checks this call was limited to.
+pub(crate) fn validate_results(
+    results: &[CommandResult],
+    command_checks: &[(&str, &str)],
+    selected: Option<&[&'static str]>,
+) -> Result<()> {
     let command_ids = || {
-        COMMAND_CHECKS
+        command_checks
             .iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>()
             .join(", ")
     };
     for (index, result) in results.iter().enumerate() {
-        if command_key(&result.id).is_none() {
+        if !command_checks.iter().any(|(id, _)| *id == result.id) {
             anyhow::bail!(
                 "results[{index}]: '{}' is not a command check. Results are accepted for: {}",
                 result.id,
                 command_ids()
             );
         }
-        if !selected.contains(&result.id.as_str()) {
+        if selected.is_some_and(|selected| !selected.contains(&result.id.as_str())) {
             anyhow::bail!(
                 "results[{index}]: '{}' is not among the requested `checks`",
                 result.id
@@ -393,24 +427,40 @@ fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn base_check(id: &'static str, status: CheckStatus, detail: impl Into<String>) -> Check {
-    Check {
-        id,
-        status,
-        detail: detail.into(),
-        next_step: None,
-        command: None,
-        exit_code: None,
-        duration_ms: None,
-        source: None,
+impl Check {
+    /// A check with nothing but its outcome.
+    pub fn new(id: &'static str, status: CheckStatus, detail: impl Into<String>) -> Self {
+        Self {
+            id,
+            status,
+            detail: detail.into(),
+            next_step: None,
+            command: None,
+            exit_code: None,
+            duration_ms: None,
+            source: None,
+        }
+    }
+
+    /// A failed check; a failure always says what to do about it.
+    pub fn failed(
+        id: &'static str,
+        detail: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            next_step: Some(next_step.into()),
+            ..Self::new(id, CheckStatus::Fail, detail)
+        }
     }
 }
 
+fn base_check(id: &'static str, status: CheckStatus, detail: impl Into<String>) -> Check {
+    Check::new(id, status, detail)
+}
+
 fn failed(id: &'static str, detail: impl Into<String>, next_step: impl Into<String>) -> Check {
-    Check {
-        next_step: Some(next_step.into()),
-        ..base_check(id, CheckStatus::Fail, detail)
-    }
+    Check::failed(id, detail, next_step)
 }
 
 fn check_initialized(config: &std::result::Result<Config, String>) -> Check {
@@ -684,9 +734,11 @@ fn check_smoke_defined(commands: Option<&CommandsConfig>) -> Check {
     }
 }
 
-/// Judges one command check. The second value says whether the command is
-/// still waiting to be run (no usable result was given for it).
-fn check_command(
+/// Judges one command check: `id` is the check, `key` its `[commands]` key,
+/// `configured` the command the config names right now and `reported` the
+/// result that was given for it, if any. The second value says whether the
+/// command is still waiting to be run (no usable result was given for it).
+pub(crate) fn judge_command(
     id: &'static str,
     key: &str,
     configured: Option<&str>,
@@ -755,7 +807,15 @@ fn check_command(
     // `validate_results` guarantees an exit code when there is no error.
     let exit_code = result.exit_code.unwrap_or_default();
     let check = if exit_code == 0 {
-        base_check(id, CheckStatus::Pass, "exit code 0")
+        let output = result
+            .output_tail
+            .as_deref()
+            .filter(|_| key == AUDIT_COMMAND_KEY);
+        base_check(
+            id,
+            CheckStatus::Pass,
+            with_output_tail("exit code 0".to_string(), output),
+        )
     } else {
         let meaning = match exit_code {
             SHELL_EXIT_NOT_EXECUTABLE => " (not executable)",
@@ -1846,14 +1906,310 @@ mod tests {
         }
     }
 
+    // --- the two SPEC-ONB-050 checks ---
+
+    /// Runs `git` to build a fixture repository. Only tests start `git`.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git must be installed to run these tests");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // SPEC-ONB-002: all 13 checks, in the documented order.
+    #[test]
+    fn the_report_has_the_thirteen_documented_checks_in_order() {
+        assert_eq!(
+            CHECK_IDS,
+            [
+                "handoff_initialized",
+                "mcp_registered",
+                "claude_md_sections",
+                "claude_md_todo",
+                "commands_defined",
+                "cmd_install",
+                "cmd_build",
+                "cmd_test",
+                "cmd_lint",
+                "cmd_typecheck",
+                "smoke_defined",
+                "secrets_untracked",
+                "dependencies_audited",
+            ]
+        );
+        let report = Project::empty().diagnose();
+        assert_eq!(
+            report.checks.iter().map(|c| c.id).collect::<Vec<_>>(),
+            CHECK_IDS
+        );
+    }
+
+    // SPEC-ONB-050 AC4
+    #[test]
+    fn secrets_are_skipped_outside_git_and_that_does_not_lower_ready() {
+        let project = Project::ready("test = \"true\"\n");
+        project.write(".env", "TOKEN=x\n");
+        let report = project.diagnose();
+        let secrets = check(&report, "secrets_untracked");
+        assert_eq!(secrets.status, CheckStatus::Skip);
+        assert!(
+            secrets.detail.contains("not in a Git repository"),
+            "{}",
+            secrets.detail
+        );
+        assert!(report.ready, "{report:?}");
+    }
+
+    // SPEC-ONB-050 AC1, AC2, AC3
+    #[test]
+    fn a_tracked_env_file_fails_and_an_ignored_one_passes() {
+        let project = Project::ready("test = \"true\"\n");
+        git(&project.dir, &["init", "-q"]);
+        project.write(".env", "TOKEN=x\n");
+        project.write(".env.example", "TOKEN=\n");
+        project.write(".gitignore", ".env\n");
+        git(
+            &project.dir,
+            &["add", ".gitignore", ".env.example", "CLAUDE.md"],
+        );
+
+        // Ignored and untracked; only the template is tracked.
+        let clean = project.diagnose();
+        let secrets = check(&clean, "secrets_untracked");
+        assert_eq!(secrets.status, CheckStatus::Pass, "{}", secrets.detail);
+        assert!(
+            secrets.detail.contains("contents were not scanned"),
+            "{}",
+            secrets.detail
+        );
+        assert!(clean.ready, "{clean:?}");
+
+        // Tracked despite the ignore rule.
+        git(&project.dir, &["add", "-f", ".env"]);
+        let leaking = project.diagnose();
+        let secrets = check(&leaking, "secrets_untracked");
+        assert_eq!(secrets.status, CheckStatus::Fail);
+        assert!(secrets.detail.contains("`.env`"), "{}", secrets.detail);
+        assert!(
+            !secrets.detail.contains(".env.example"),
+            "{}",
+            secrets.detail
+        );
+        assert!(secrets.next_step.is_some());
+        assert!(!leaking.ready, "a tracked secrets file is not ready");
+        assert_eq!(failed_ids(&leaking), vec!["secrets_untracked"]);
+    }
+
+    // SPEC-ONB-050 AC7
+    #[test]
+    fn configured_secret_file_patterns_replace_the_defaults() {
+        let project = Project::empty();
+        project.write_config(
+            "[project]\nname = \"demo\"\n\n[onboarding]\nsecret_file_patterns = [\"*.tfstate\"]\n",
+        );
+        git(&project.dir, &["init", "-q"]);
+        project.write(".env", "x");
+        git(&project.dir, &["add", ".env"]);
+        assert_eq!(
+            status(&project.diagnose(), "secrets_untracked"),
+            CheckStatus::Pass,
+            "`.env` is not among the configured patterns"
+        );
+        project.write("infra/prod.tfstate", "x");
+        git(&project.dir, &["add", "infra"]);
+        let report = project.diagnose();
+        let secrets = check(&report, "secrets_untracked");
+        assert_eq!(secrets.status, CheckStatus::Fail);
+        assert!(
+            secrets.detail.contains("`infra/prod.tfstate`"),
+            "{}",
+            secrets.detail
+        );
+    }
+
+    /// Without a readable config the default patterns still apply: the check
+    /// does not depend on the project being initialized.
+    #[test]
+    fn secrets_are_checked_in_a_project_that_is_not_initialized() {
+        let project = Project::empty();
+        git(&project.dir, &["init", "-q"]);
+        project.write("deploy.pem", "x");
+        git(&project.dir, &["add", "deploy.pem"]);
+        let report = project.diagnose();
+        assert_eq!(status(&report, "secrets_untracked"), CheckStatus::Fail);
+    }
+
+    // SPEC-ONB-050 AC5
+    #[test]
+    fn an_undefined_audit_command_is_skipped_never_passed() {
+        let project = Project::ready("test = \"true\"\n");
+        let report = project.diagnose();
+        let audit = check(&report, "dependencies_audited");
+        assert_eq!(audit.status, CheckStatus::Skip);
+        assert!(audit.detail.contains("not defined"), "{}", audit.detail);
+        assert!(
+            report
+                .commands_to_run
+                .iter()
+                .all(|c| c.id != "dependencies_audited"),
+            "an undefined command is not handed out"
+        );
+        assert!(report.ready);
+    }
+
+    /// The audit command is handed to the caller like every other command,
+    /// and judged only from a result the caller reports.
+    #[test]
+    fn a_defined_audit_command_is_handed_out_and_skipped_until_a_result_arrives() {
+        let project = Project::ready("test = \"true\"\naudit = \"npm audit\"\n");
+        let report = project.diagnose();
+        let audit = check(&report, "dependencies_audited");
+        assert_eq!(audit.status, CheckStatus::Skip);
+        assert_eq!(audit.command.as_deref(), Some("npm audit"));
+        assert_eq!(audit.source, None);
+        assert_eq!(
+            report.commands_to_run,
+            vec![
+                CommandToRun {
+                    id: "cmd_test",
+                    command: "true".to_string(),
+                    timeout_sec: 600
+                },
+                CommandToRun {
+                    id: "dependencies_audited",
+                    command: "npm audit".to_string(),
+                    timeout_sec: 600
+                },
+            ]
+        );
+    }
+
+    // SPEC-ONB-050 AC6
+    #[test]
+    fn a_reported_audit_failure_fails_the_check_and_quotes_the_output() {
+        let project = Project::ready("test = \"true\"\naudit = \"npm audit\"\n");
+        let mut failing = result("dependencies_audited", "npm audit", 1);
+        failing.output_tail = Some("3 high severity vulnerabilities\n".to_string());
+        let report = project.diagnose_with(&[result("cmd_test", "true", 0), failing]);
+        let audit = check(&report, "dependencies_audited");
+        assert_eq!(audit.status, CheckStatus::Fail);
+        assert_eq!(audit.exit_code, Some(1));
+        assert_eq!(audit.source, Some(ResultSource::Reported));
+        assert!(
+            audit.detail.contains("3 high severity vulnerabilities"),
+            "{}",
+            audit.detail
+        );
+        assert!(audit.next_step.is_some());
+        assert!(!report.ready);
+        assert!(report.commands_to_run.is_empty());
+    }
+
+    /// A passing audit still shows what the tool printed: the advisories it
+    /// was told to ignore are in there.
+    #[test]
+    fn a_reported_audit_success_passes_and_keeps_a_bounded_output_tail() {
+        let project = Project::ready("test = \"true\"\naudit = \"npm audit\"\n");
+        let mut passing = result("dependencies_audited", "npm audit", 0);
+        passing.output_tail = Some(
+            (1..=30)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let report = project.diagnose_with(&[result("cmd_test", "true", 0), passing]);
+        let audit = check(&report, "dependencies_audited");
+        assert_eq!(audit.status, CheckStatus::Pass);
+        assert!(audit.detail.starts_with("exit code 0"), "{}", audit.detail);
+        assert!(audit.detail.contains("line 30"), "{}", audit.detail);
+        assert!(audit.detail.contains("line 11"), "{}", audit.detail);
+        assert!(
+            !audit.detail.contains("line 10\n"),
+            "at most {OUTPUT_TAIL_MAX_LINES} lines: {}",
+            audit.detail
+        );
+        assert!(report.ready, "{report:?}");
+
+        // The other command checks stay terse on success.
+        assert_eq!(check(&report, "cmd_test").detail, "exit code 0");
+    }
+
+    #[test]
+    fn an_audit_result_for_another_command_is_not_used() {
+        let project = Project::ready("test = \"true\"\naudit = \"npm audit\"\n");
+        let report = project.diagnose_with(&[
+            result("cmd_test", "true", 0),
+            result("dependencies_audited", "true", 0),
+        ]);
+        let audit = check(&report, "dependencies_audited");
+        assert_eq!(audit.status, CheckStatus::Fail);
+        assert!(audit.detail.contains("does not match"), "{}", audit.detail);
+        assert_eq!(audit.source, None);
+        assert_eq!(
+            report
+                .commands_to_run
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec!["dependencies_audited"],
+            "the command is handed out again"
+        );
+    }
+
+    #[test]
+    fn a_diagnosis_of_a_git_repository_changes_nothing_on_disk() {
+        let project = Project::ready("test = \"true\"\naudit = \"touch audited\"\n");
+        git(&project.dir, &["init", "-q"]);
+        project.write(".env", "x");
+        git(&project.dir, &["add", "."]);
+        let snapshot = |dir: &Path| {
+            let mut files = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(current) = stack.pop() {
+                for entry in std::fs::read_dir(&current).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                        files.push((path.clone(), std::fs::read(&path).unwrap(), modified));
+                    }
+                }
+            }
+            files.sort();
+            files
+        };
+        let before = snapshot(project.root.path());
+        project.diagnose();
+        project.diagnose_with(&[
+            result("cmd_test", "true", 0),
+            result("dependencies_audited", "touch audited", 0),
+        ]);
+        assert_eq!(snapshot(project.root.path()), before);
+        assert!(!project.dir.join("audited").exists());
+    }
+
     // --- never starts a process (SPEC-ONB-002 AC6) ---
 
-    /// The diagnosis and its MCP handler must stay free of anything that can
-    /// start a process, and of the CLI's command runner. The real-binary
-    /// tripwire test shows the behavior; this keeps the code from growing a
-    /// path the tripwire's scenarios do not happen to reach.
+    /// The diagnosis, the pre-release check, the release guard, the next
+    /// step and their MCP handlers must stay free of anything that can start
+    /// a process, and of the CLI's command runner. The real-binary tripwire tests show the behavior; this keeps
+    /// the code from growing a path the tripwires' scenarios do not happen to
+    /// reach. (`release/cli.rs` is not listed: the CLI is the one place that
+    /// runs commands.)
     #[test]
-    fn the_diagnosis_and_its_handler_cannot_start_a_process() {
+    fn the_checks_and_their_handlers_cannot_start_a_process() {
         let production = |source: &'static str| {
             source
                 .split("#[cfg(test)]")
@@ -1866,11 +2222,48 @@ mod tests {
         };
         for (file, source) in [
             ("setup/doctor.rs", production(include_str!("doctor.rs"))),
+            ("setup/secrets.rs", production(include_str!("secrets.rs"))),
+            (
+                "storage/git_index.rs",
+                production(include_str!("../storage/git_index.rs")),
+            ),
+            (
+                "release/check.rs",
+                production(include_str!("../release/check.rs")),
+            ),
+            (
+                "release/record.rs",
+                production(include_str!("../release/record.rs")),
+            ),
+            (
+                "release/guard.rs",
+                production(include_str!("../release/guard.rs")),
+            ),
             (
                 "mcp/handlers/doctor.rs",
                 production(include_str!("../mcp/handlers/doctor.rs")),
             ),
+            (
+                "mcp/handlers/release_check.rs",
+                production(include_str!("../mcp/handlers/release_check.rs")),
+            ),
+            // Releasing a milestone consults the pre-release check
+            // (SPEC-ONB-041) and must not run anything either.
+            (
+                "mcp/handlers/milestones.rs",
+                production(include_str!("../mcp/handlers/milestones.rs")),
+            ),
+            // `handoff_next_step` (SPEC-ONB-011, SPEC-ONB-091).
+            (
+                "context/next_step.rs",
+                production(include_str!("../context/next_step.rs")),
+            ),
+            (
+                "mcp/handlers/next_step.rs",
+                production(include_str!("../mcp/handlers/next_step.rs")),
+            ),
         ] {
+            assert!(!source.trim().is_empty(), "{file}: nothing was scanned");
             for forbidden in [
                 "process::",
                 "std::process",
@@ -1881,7 +2274,11 @@ mod tests {
                 "ensure_handoff_exists",
                 "detect_worktree",
                 "storage::handoff_dir",
-                "storage::git",
+                // The helpers that ask the `git` binary (`storage::git_index`
+                // reads the index file instead and is allowed).
+                "storage::git::",
+                "storage::git;",
+                "capture_git_state",
             ] {
                 assert!(
                     !source.contains(forbidden),

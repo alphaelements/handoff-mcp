@@ -16,12 +16,15 @@ use serde_json::{json, Value};
 
 const FILLED_CLAUDE_MD: &str = "# Demo\n\n## Session Handoff\n\nx\n\n## Build & Test\n\n- test: `true`\n\n## Coding Rules\n\nr\n\n## Project Structure\n\ns\n\n## Documentation Contract\n\nd\n";
 
-const COMMAND_CHECK_IDS: [&str; 5] = [
+/// Every check a result is accepted for: the `cmd_*` checks and the
+/// dependency audit (SPEC-ONB-050), which is handed out and judged like them.
+const RESULT_CHECK_IDS: [&str; 6] = [
     "cmd_install",
     "cmd_build",
     "cmd_test",
     "cmd_lint",
     "cmd_typecheck",
+    "dependencies_audited",
 ];
 
 /// A temporary project with its own `HOME`.
@@ -284,7 +287,7 @@ fn the_tool_is_listed_with_its_arguments() {
     ] {
         assert!(result["properties"][field].is_object(), "{field}");
     }
-    assert_eq!(result["properties"]["id"]["enum"], json!(COMMAND_CHECK_IDS));
+    assert_eq!(result["properties"]["id"]["enum"], json!(RESULT_CHECK_IDS));
     let description = tool["description"].as_str().unwrap();
     assert!(
         description.contains("commands_to_run") && description.contains("never"),
@@ -374,7 +377,7 @@ fn ac4_without_results_every_command_check_is_skipped_and_handed_back() {
     let mut server = sandbox.server();
     let report = server.diagnose(json!({}));
 
-    for id in COMMAND_CHECK_IDS {
+    for id in RESULT_CHECK_IDS {
         assert_eq!(status(&report, id), "skip", "{id}");
         assert!(check(&report, id).get("source").is_none(), "{id}");
     }
@@ -393,8 +396,9 @@ fn ac4_without_results_every_command_check_is_skipped_and_handed_back() {
             { "id": "cmd_install", "command": "npm ci", "timeout_sec": 600 },
             { "id": "cmd_build", "command": "npm run build", "timeout_sec": 600 },
             { "id": "cmd_test", "command": "npm run test", "timeout_sec": 600 },
+            { "id": "dependencies_audited", "command": "npm audit", "timeout_sec": 600 },
         ]),
-        "defined commands only; format, smoke and audit are not run by the diagnosis"
+        "defined commands only; format and smoke are not run by the diagnosis"
     );
     assert_eq!(report["ready"], json!(true), "a skip does not lower ready");
 }
@@ -699,7 +703,7 @@ fn ac6_the_tool_starts_no_process() {
     let spawned_before = std::fs::read_to_string(&log).unwrap_or_default();
 
     let without = server.diagnose(json!({}));
-    assert_eq!(ids(&without["commands_to_run"]).len(), 5, "{without}");
+    assert_eq!(ids(&without["commands_to_run"]).len(), 6, "{without}");
     let with = server.diagnose(json!({
         "results": [
             { "id": "cmd_install", "command": "handoff-tripwire install", "exit_code": 0 },
@@ -707,10 +711,12 @@ fn ac6_the_tool_starts_no_process() {
             { "id": "cmd_test", "command": configured, "exit_code": 1 },
             { "id": "cmd_lint", "command": "something else", "exit_code": 0 },
             { "id": "cmd_typecheck", "command": configured, "error": "timed out after 600s" },
+            { "id": "dependencies_audited", "command": configured, "exit_code": 0 },
         ]
     }));
     assert_eq!(status(&with, "cmd_build"), "pass");
     assert_eq!(status(&with, "cmd_test"), "fail");
+    assert_eq!(status(&with, "dependencies_audited"), "pass");
     server.diagnose(json!({ "checks": ["cmd_test"] }));
     let _ = server.doctor(json!({ "checks": ["nope"] }));
     server.project = bare.clone();
@@ -789,13 +795,18 @@ fn ac7_check_run_json_equals_the_tool_given_the_same_results() {
     assert_eq!(check(&from_cli, "cmd_test")["exit_code"], json!(3));
     assert_eq!(status(&from_cli, "cmd_lint"), "fail");
     assert_eq!(status(&from_cli, "cmd_typecheck"), "skip");
+    assert_eq!(status(&from_cli, "dependencies_audited"), "pass");
     assert!(from_cli["commands_to_run"].as_array().unwrap().is_empty());
-    for name in ["formatted", "smoked", "audited"] {
+    for name in ["formatted", "smoked"] {
         assert!(
             !sandbox.project.join(name).exists(),
-            "`{name}`: only install/build/test/lint/typecheck are run"
+            "`{name}`: only install/build/test/lint/typecheck/audit are run"
         );
     }
+    assert!(
+        sandbox.project.join("audited").exists(),
+        "the audit command is run with the others (SPEC-ONB-050)"
+    );
 
     // Hand the same results to the tool.
     let results: Vec<Value> = from_cli["checks"]
@@ -811,7 +822,7 @@ fn ac7_check_run_json_equals_the_tool_given_the_same_results() {
             })
         })
         .collect();
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), 5);
     let from_tool = sandbox.server().diagnose(json!({ "results": results }));
 
     // SPEC-ONB-092 AC4: only the source differs.

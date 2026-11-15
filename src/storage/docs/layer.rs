@@ -50,11 +50,14 @@ pub struct LayerDef {
     pub default_id_prefixes: &'static [&'static str],
 }
 
+/// Id of the built-in layer whose items are the project's requirements.
+pub const REQUIREMENT_LAYER: &str = "requirement";
+
 /// The 6 built-in layers, in the fixed order wiki/220 §2.1's table lists
 /// them (left side top-to-bottom, then right side top-to-bottom).
 pub const BUILTIN_LAYERS: &[LayerDef] = &[
     LayerDef {
-        id: "requirement",
+        id: REQUIREMENT_LAYER,
         display_name: "要件",
         side: LayerSide::Left,
         level: 1,

@@ -628,14 +628,16 @@ For a subtask, rename the directory inside its parent's directory the same way.
 |------|---------|
 | `handoff_get_config` | Read project configuration (full TOML as JSON) |
 | `handoff_update_config` | Update config: settings, calendar, assignees, effort budget, gantt view, commands, onboarding; or apply a preset (`preset: "beginner"`) |
-| `handoff_doctor` | Diagnose whether the project is ready for agent-driven work (handoff initialized, MCP registered, `CLAUDE.md` sections filled in, `[commands]` defined and succeeding). Never runs commands: returns `commands_to_run` and judges the `results` you report. See [Readiness check](#readiness-check) |
+| `handoff_next_step` | Tell which of nine states the project is in (`not_initialized` ... `all_done`) and the one operation to do next. Read-only. Not `handoff_trace_next`, which lists verification items. See [Next step](#next-step) |
+| `handoff_doctor` | Diagnose whether the project is ready for agent-driven work (handoff initialized, MCP registered, `CLAUDE.md` sections filled in, `[commands]` defined and succeeding, no secrets file tracked by Git, dependency audit passing). Never runs commands: returns `commands_to_run` and judges the `results` you report. See [Readiness check](#readiness-check) |
+| `handoff_release_check` | Pre-release check of a milestone: tasks done, no open bugs, requirements verified, tests / smoke / dependency audit passing, no secrets file tracked by Git, and the items a person confirms. Never runs commands: returns `commands_to_run`, judges the `results` you report and records them with the confirmations. See [Release check](#release-check) |
 | `handoff_list_assignees` | List team members with task counts and effort stats |
 | `handoff_add_assignee` | Add a team member (`[assignees.<key>]`) |
 | `handoff_update_assignee` | Update a team member's fields (partial; null clears a field) |
 | `handoff_remove_assignee` | Remove a team member and unassign them from every task |
 | `handoff_list_milestones` | List milestones (`[milestones.*]`) |
 | `handoff_add_milestone` | Add a milestone (date, color, description) |
-| `handoff_update_milestone` | Update a milestone (partial) |
+| `handoff_update_milestone` | Update a milestone (partial). With `[onboarding] release_guard`, a move to `released` consults the release check (see [Release guard](#release-guard)) |
 | `handoff_remove_milestone` | Remove a milestone |
 | `handoff_update_calendar` | Patch the project `[calendar]` (work hours, closed days, `day_hours`, schedule_mode) |
 | `handoff_update_labels` | Set the project-level label vocabulary |
@@ -983,6 +985,9 @@ format = "npm run format"
 typecheck = "npm run typecheck"
 smoke = "./scripts/smoke.sh"   # One command that shows the app still starts and works
 audit = "npm audit"            # Dependency audit
+
+[release]                  # Pre-release check (see Release check)
+manual_checks = ["docs_updated", "store_listing"]   # Items a person confirms: manual:<name>
 ```
 
 `[commands]` is the source of truth for the project's commands; `handoff-mcp setup`
@@ -991,6 +996,38 @@ fills it from the project's manifests (see
 never runs these commands itself.
 
 All configuration sections can be updated via `handoff_update_config` with dot-notation keys (e.g., `"calendar.work_hours_per_day": 7`).
+
+### Next step
+
+`handoff_next_step()` (MCP) and `handoff-mcp next-step` (terminal) answer "what
+should happen next in this project?" with the project's state and **one**
+recommended operation: `{state, action: {title, command, reason}, facts}`.
+
+The states are checked in this order, and the first that applies is returned:
+
+| # | State | Applies when | Recommended operation |
+|---|-------|--------------|-----------------------|
+| 1 | `not_initialized` | the project has no `.handoff/` | `handoff_init` |
+| 2 | `not_ready` | the [readiness check](#readiness-check) (without results) is not ready | what its first failed check says to do |
+| 3 | `review_pending` | a task is in `review` | confirm that task (`handoff_get_task`) |
+| 4 | `in_progress` | a task is `in_progress`, or a session is active | resume it |
+| 5 | `no_brainstorm` | no finalized brainstorm report and no requirement item | `/brainstorm-loop` |
+| 6 | `no_requirements` | the requirement layer has no item | `/requirement-loop` |
+| 7 | `ready_tasks` | a `todo` task whose dependencies are all done or skipped | `/session-loop` |
+| 8 | `release_ready` | no unfinished task, and a milestone that is neither released nor cancelled | `handoff_release_check` (see [Release check](#release-check)) |
+| 9 | `all_done` | none of the above | plan what comes next (`/brainstorm-loop`); when unfinished tasks remain that cannot start, clear what blocks them |
+
+- `action.command` is a slash command, a tool call or a sentence to act on.
+- `facts` holds the counts the decision looked at (`doctor`, `tasks`,
+  `active_sessions`, `brainstorm_reports`, `requirement_items`, `milestones`). A
+  group the decision did not need is left out.
+- The tool is read-only: it writes nothing, runs no command and starts no
+  process. It works on a project that is not initialized yet.
+- With `[onboarding] next_step = true`, `handoff_load_context` carries the same
+  answer as its `next_step` key. Without the setting the key is absent and the
+  response is unchanged.
+- `handoff_trace_next` is a different tool: it lists the verification items of
+  the trace graph that still need attention.
 
 ### Readiness check
 
@@ -1006,6 +1043,8 @@ diagnosis of whether the project is ready for the task loop:
 | `commands_defined` | `[commands]` defines at least one command |
 | `cmd_install` / `cmd_build` / `cmd_test` / `cmd_lint` / `cmd_typecheck` | that command ran with exit code 0 |
 | `smoke_defined` | `[commands] smoke` is defined (`skip`, never a failure, when it is not) |
+| `secrets_untracked` | Git tracks no file whose name matches a secrets pattern (`skip` outside a Git repository). See [Secrets files and the dependency audit](#secrets-files-and-the-dependency-audit) |
+| `dependencies_audited` | `[commands] audit` ran with exit code 0 (`skip` when it is not defined or no result was given) |
 
 Each check is `pass`, `fail` or `skip` (`manual`, a person has to confirm, is
 part of the same vocabulary for the release check). `skip` means the check was
@@ -1025,13 +1064,116 @@ Commands are only run when you ask for it, and never by the MCP server:
 - **`handoff-mcp setup --check --run`** runs the commands itself, in the project
   directory, through the shell (`sh -c`; `cmd /C` on Windows), and judges the
   results (`source: "executed"`). A command that cannot be found, or that runs
-  longer than `[onboarding] command_timeout_sec` (default 600), fails. `format`,
-  `smoke` and `audit` are not run.
+  longer than `[onboarding] command_timeout_sec` (default 600), fails. It runs
+  `install`, `build`, `test`, `lint`, `typecheck` and `audit`; `format` and
+  `smoke` are not run.
 - Once commands were run, a project without `[commands] test` is not ready.
 
 `handoff-mcp setup --check` prints the hook status followed by the diagnosis;
 add `--json` to print only the JSON that `handoff_doctor` returns. The exit code
 is 0 when the project is ready and 1 when it is not.
+
+#### Secrets files and the dependency audit
+
+Two checks are shared by the readiness check and the
+[release check](#release-check):
+
+- **`secrets_untracked`** fails when Git tracks a file whose name matches one
+  of `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`,
+  `credentials.json` or `secrets.*`, in any directory. `.env.example`,
+  `.env.sample` and `.env.template` are never reported. The `detail` lists the
+  matching paths.
+  - Only **file names** are matched. File contents are not scanned, so a `pass`
+    does not mean the repository holds no secret.
+  - The list of tracked files is read from the Git index file; `git` is not
+    started. Outside a Git repository, or when the index cannot be read
+    completely (a split or sparse index), the check is `skip`.
+  - A project in a subdirectory of a larger repository is checked for its own
+    files.
+  - Replace the patterns with `[onboarding] secret_file_patterns = ["*.tfstate", ...]`.
+    `*` matches any run of characters and `?` one; letter case is ignored. A
+    pattern without `/` applies to the file name in every directory, one with
+    `/` to the whole path. An empty list switches the check to `skip`.
+- **`dependencies_audited`** judges the result of `[commands] audit` (for
+  example `npm audit` or `cargo audit`), handed out in `commands_to_run` and
+  judged like the other commands. Its `detail` quotes the end of the command's
+  output (up to 20 lines). It is `skip` when the command is not defined or no
+  result was given, never a pass.
+
+### Release check
+
+`handoff_release_check(milestone)` (MCP) and
+`handoff-mcp release-check <milestone>` (terminal) answer one question before a
+milestone ships: is everything it promised done, verified and safe to release?
+
+| Item | Passes when |
+|------|-------------|
+| `tasks_done` | every leaf task of the milestone is `done` or `skipped` (`refs` lists the others). A subtask without a milestone of its own belongs to its parent's |
+| `no_open_bugs` | no task of the milestone labelled `bug` is still open |
+| `requirements_verified` | every requirement-layer item planned for the milestone is `passing` (`refs` lists the others; `skip` when the milestone has no requirement) |
+| `tests_pass` / `smoke_pass` | `[commands] test` / `smoke` ran with exit code 0 |
+| `secrets_untracked` / `dependencies_audited` | see [Secrets files and the dependency audit](#secrets-files-and-the-dependency-audit) |
+| `manual:<name>` | a person confirmed it; one item per entry of `[release] manual_checks` (`manual` until then) |
+
+The answer is `{milestone, ok, items: [{id, status, detail, refs?, source?,
+checked_at?}], commands_to_run}`. **`ok` is true only when every item is
+`pass`**: an item that was skipped (not carried out) or still waits for a person
+keeps it false, so a project without a smoke command, an audit command or
+requirements for the milestone does not get `ok: true`.
+
+As with the readiness check, the MCP tool never runs a command:
+
+1. `handoff_release_check(milestone: "v1.0")` reports the command items as
+   `skip` and lists the defined commands in `commands_to_run`.
+2. The agent runs them and calls again with `results` (the same shape as for
+   `handoff_doctor`, with the ids `tests_pass`, `smoke_pass`,
+   `dependencies_audited`).
+3. When a person has confirmed a manual item, pass
+   `confirm: ["manual:docs_updated"]`. It stays confirmed for that milestone.
+
+Results and confirmations passed in are recorded in
+`.handoff/release/<milestone>.json` (per command: status, exit code, who ran it,
+when). A call with neither writes nothing. A call without `results` never falls
+back on a recorded result: those items are `skip` again, so an old run cannot
+make today's check pass. An unknown milestone is an error.
+
+In a terminal:
+
+```bash
+handoff-mcp release-check v1.0                                 # print the check as JSON
+handoff-mcp release-check v1.0 --run                           # also run test / smoke / audit and judge them
+handoff-mcp release-check v1.0 --confirm manual:docs_updated   # record a confirmation
+```
+
+The exit code is 0 when the check is `ok`, 1 when it is not, and 2 when it could
+not be carried out (a usage error, an unknown milestone).
+
+#### Release guard
+
+`[onboarding] release_guard` puts the release check in front of the moment a
+milestone becomes `released`
+(`handoff_update_milestone(name, status: "released")`,
+`handoff-mcp milestone update --name <name> --status released`):
+
+| `release_guard` | When an item of the check is not `pass` |
+|-----------------|------------------------------------------|
+| `off` (default) | Nothing is checked. The reply is the same as without the setting |
+| `warn` | The milestone is released, and the reply lists the items: one `Warning: release check: <id> [<status>] <detail>` line each |
+| `block` | The call is rejected with the same list and nothing changes. `force: true` releases anyway, with the items as warnings |
+
+Releasing a milestone never runs a command. The items that follow from the
+project's data (`tasks_done`, `no_open_bugs`, `requirements_verified`,
+`secrets_untracked`, `manual:<name>`) are judged on the spot. The command items
+(`tests_pass`, `smoke_pass`, `dependencies_audited`) are read from the last
+result recorded in `.handoff/release/<milestone>.json`; without a record, or
+when `[commands]` has changed since, the item counts as not verified (`skip`).
+Because a record may be out of date, the warnings and the error say when each
+recorded result was judged. Run the release check and report fresh results
+before releasing.
+
+When every item passes, the reply carries no release warning. Only the move to
+`released` is guarded: other status changes, and edits to a milestone that is
+already released, are not.
 
 ### Beginner preset and `[onboarding]`
 
@@ -1044,15 +1186,17 @@ behave exactly as before.
 [onboarding]
 preset = "beginner"        # Name of the preset that was applied
 preflight = "run"          # "off" (default) | "check" | "run": readiness check before a session is planned
-next_step = true           # Add the recommended next step to handoff_load_context (default false)
+next_step = true           # handoff_load_context carries the answer of handoff_next_step as `next_step` (default false; see Next step)
 smoke_check = true         # Run [commands] smoke before implementation starts (default false)
-release_guard = "warn"     # "off" (default) | "warn" | "block": pre-release check when a milestone is released
+release_guard = "warn"     # "off" (default) | "warn" | "block": consult the release check when a milestone is released (see Release guard)
 security_min_nfr = true    # Require a decision on the minimum security requirements (default false)
-command_timeout_sec = 600  # Seconds a [commands] command may run in the readiness check (default 600)
+command_timeout_sec = 600  # Seconds a [commands] command may run in the readiness and release checks (default 600)
+secret_file_patterns = [".env", "*.pem"]   # Replaces the default secrets patterns (see Readiness check)
 ```
 
 handoff-mcp stores and validates these values; the task-loop commands read them
-to decide which checks to run.
+to decide which checks to run (`next_step` and `release_guard` are applied by
+handoff-mcp itself).
 
 The **`beginner` preset** sets everything for one person building a first
 application, in one step:
@@ -1366,8 +1510,9 @@ handoff-mcp dashboard
 ```
 
 **Available groups:** `init`, `task`, `session`, `config`, `memory`,
-`referral`, `assignee`, `milestone`, `calendar`, `labels`, `project`,
-`metrics`, `capacity`, `schedule`, `dashboard`, `timer`, `trace`.
+`referral`, `assignee`, `milestone`, `release-check`, `calendar`, `labels`,
+`project`, `metrics`, `capacity`, `schedule`, `dashboard`, `next-step`,
+`timer`, `trace`.
 
 Run `handoff-mcp --help` to see all groups, or `handoff-mcp <group> --help`
 for actions within a group. See the

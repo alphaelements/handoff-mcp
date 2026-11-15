@@ -35,10 +35,12 @@ pub mod memory;
 pub mod merge_sessions;
 pub mod metrics;
 pub mod milestones;
+pub mod next_step;
 pub mod overview;
 pub(crate) mod plan_links;
 pub mod refer;
 pub mod referrals;
+pub mod release_check;
 pub mod report;
 pub mod save_context;
 pub mod task_checklist;
@@ -108,9 +110,13 @@ const TOOLS_USABLE_BEFORE_INIT: &[&str] = &["handoff_init", "handoff_load_contex
 
 /// Tools that find the project's `.handoff/` themselves, by reading files
 /// only. The dispatch layers must not resolve it for them: the usual
-/// resolution asks `git` about worktrees, and `handoff_doctor` guarantees
-/// that it starts no process.
-const SELF_LOCATING_TOOLS: &[&str] = &["handoff_doctor"];
+/// resolution asks `git` about worktrees, and these tools guarantee that
+/// they start no process.
+const SELF_LOCATING_TOOLS: &[&str] = &[
+    "handoff_doctor",
+    "handoff_release_check",
+    "handoff_next_step",
+];
 
 /// The `.handoff/` path a tool call is given as `HandlerContext::handoff_dir`,
 /// shared by the MCP and CLI dispatch layers. Every tool except the ones
@@ -158,6 +164,8 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_get_config" => config::handle_get(ctx, arguments),
         "handoff_update_config" => config::handle_update(ctx, arguments),
         "handoff_doctor" => doctor::handle(ctx, arguments),
+        "handoff_release_check" => release_check::handle(ctx, arguments),
+        "handoff_next_step" => next_step::handle(ctx, arguments),
         "handoff_get_task" => get_task::handle(ctx, arguments),
         "handoff_check_criterion" => check_criterion::handle(ctx, arguments),
         "handoff_import_context" => import_context::handle(ctx, arguments),

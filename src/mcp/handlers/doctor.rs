@@ -49,7 +49,9 @@ fn parse_checks(value: Option<&Value>) -> Result<Option<Vec<String>>> {
     }
 }
 
-fn parse_results(value: Option<&Value>) -> Result<Vec<CommandResult>> {
+/// Parses the `results` argument `handoff_doctor` and `handoff_release_check`
+/// share.
+pub(super) fn parse_results(value: Option<&Value>) -> Result<Vec<CommandResult>> {
     match value {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => items

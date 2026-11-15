@@ -184,6 +184,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_get_config",
     // Reads files and judges the results it is given; writes nothing.
     "handoff_doctor",
+    // SPEC-ONB-011: reads the project's state and recommends one operation;
+    // writes nothing.
+    "handoff_next_step",
     "handoff_get_metrics",
     // REQ-RPT-004: pure read over `.handoff/metrics_snapshots/`, `events.jsonl`
     // and the task tree; writes nothing.

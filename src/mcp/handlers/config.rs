@@ -6,7 +6,7 @@ use super::config_crud::validate_work_hours_table;
 use super::HandlerContext;
 use crate::storage::config::{
     ensure_table_like, read_config, render_config, CommandsConfig, Config, OnboardingConfig,
-    DONE_GUARD_MODES, ONBOARDING_PRESETS,
+    ReleaseConfig, DONE_GUARD_MODES, ONBOARDING_PRESETS,
 };
 use crate::storage::config_preset::plan_preset;
 use crate::storage::docs::layer::LayerRegistry;
@@ -514,6 +514,9 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         {
             validate_onboarding(&rendered)?;
         }
+        if updates.keys().any(|k| is_section_key(k, RELEASE_SECTION)) {
+            validate_release(&rendered)?;
+        }
         if updates
             .keys()
             .any(|k| k == "calendar" || k.starts_with("calendar."))
@@ -643,6 +646,26 @@ fn validate_onboarding(rendered: &str) -> Result<()> {
         .try_into::<OnboardingConfig>()
         .map_err(|e| invalid(&e))?;
     onboarding.validate().map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Top-level `[release]` section (SPEC-ONB-040).
+const RELEASE_SECTION: &str = "release";
+
+/// Rejects (before anything is written) a config text whose `[release]`
+/// holds a value of the wrong type or a list of manual checks the readers
+/// would silently reduce. Like [`validate_commands`], it looks at that
+/// section alone and is only called when the update writes it.
+fn validate_release(rendered: &str) -> Result<()> {
+    let invalid = |e: &dyn std::fmt::Display| anyhow::anyhow!("invalid [{RELEASE_SECTION}]: {e}");
+    let root: toml::Value = toml::from_str(rendered).map_err(|e| invalid(&e))?;
+    let Some(section) = root.get(RELEASE_SECTION) else {
+        return Ok(());
+    };
+    let release = section
+        .clone()
+        .try_into::<ReleaseConfig>()
+        .map_err(|e| invalid(&e))?;
+    release.validate().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Rejects (before anything is written) a config text whose `[session_loop]`
@@ -1006,5 +1029,89 @@ mod tests {
         .unwrap();
         let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
         assert_eq!(config.commands.get("test"), Some("make test"));
+    }
+
+    // --- [release] and [onboarding] secret_file_patterns (SPEC-ONB-040/050) ---
+
+    #[test]
+    fn update_sets_manual_checks_and_secret_file_patterns() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": {
+                "release.manual_checks": ["docs_updated", "changelog"],
+                "onboarding.secret_file_patterns": ["*.tfstate"],
+            } }),
+        )
+        .unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(
+            config.release.manual_checks(),
+            ["docs_updated", "changelog"]
+        );
+        assert_eq!(config.onboarding.secret_file_patterns(), ["*.tfstate"]);
+        let shown = handle_get(&ctx, &json!({})).unwrap();
+        assert!(shown.contains("docs_updated"), "{shown}");
+        assert!(shown.contains("*.tfstate"), "{shown}");
+    }
+
+    #[test]
+    fn update_rejects_invalid_release_and_pattern_values_without_writing() {
+        let (_tmp, ctx) = project();
+        let path = ctx.handoff_dir.join("config.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (updates, expected) in [
+            (
+                json!({ "release.manual_checks": ["a", "a"] }),
+                "more than once",
+            ),
+            (json!({ "release.manual_checks": ["a", " "] }), "blank"),
+            (
+                json!({ "release.manual_checks": "docs_updated" }),
+                "invalid [release]",
+            ),
+            (json!({ "release.manual_checks": [1] }), "invalid [release]"),
+            (
+                json!({ "onboarding.secret_file_patterns": [".env", ""] }),
+                "onboarding.secret_file_patterns",
+            ),
+            (
+                json!({ "onboarding.secret_file_patterns": ".env" }),
+                "invalid [onboarding]",
+            ),
+        ] {
+            let err = handle_update(&ctx, &json!({ "updates": updates }))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{updates}: {err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{updates}");
+        }
+    }
+
+    /// A typed-key update re-serializes the whole config; `[release]` and the
+    /// patterns must survive it.
+    #[test]
+    fn typed_key_update_keeps_the_release_section_and_the_patterns() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": {
+                "release.manual_checks": ["docs_updated"],
+                "onboarding.secret_file_patterns": [],
+            } }),
+        )
+        .unwrap();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "settings.default_estimate_hours": 2.0 } }),
+        )
+        .unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(config.release.manual_checks(), ["docs_updated"]);
+        assert_eq!(
+            config.onboarding.secret_file_patterns,
+            Some(Vec::new()),
+            "an explicitly empty list is kept"
+        );
     }
 }
