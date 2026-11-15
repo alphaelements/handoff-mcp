@@ -149,6 +149,62 @@ Typical quantifiers: supported-platform matrix with versions, upgrade path from 
 
 Typical quantifiers: numeric tolerance, number of invariants that must hold, share of use cases covered by acceptance criteria.
 
+## Security minimum: three decisions
+
+Three security concerns are cheap to settle at the start and expensive to
+discover after a leak or an incident. A project that sets
+`[onboarding] security_min_nfr = true` in `config.toml` (the `beginner` preset
+does) must decide each of them explicitly before the scan is complete. Without
+the key this section is advice: the security characteristic above is walked like
+the other seven.
+
+| Item | Questions |
+|---|---|
+| Handling of secrets | Which passwords, API keys, tokens or certificates does the product use? Where are they kept (environment, secret store), and who can read them? How are they kept out of the repository, the logs and error messages? How is a leaked secret replaced? |
+| Validation of external input | Which input comes from outside the product's control (users, uploaded files, network requests, other systems)? Where is it checked (type, length, format, allowed values) before it is used? What happens to input that fails the check? |
+| Dependency updates | How are third-party dependencies with known vulnerabilities found (an audit command, a scanner, a bot)? How soon after a fix is published must an update be applied? Who does it? |
+
+For **each** item take one of two decisions. There is no third option, and "not
+discussed yet" is not a decision.
+
+1. **File it as a requirement.** Write an `NFR-SEC-nnn` item like any other NFR:
+   a measurable threshold, a `method` and an acceptance criterion. The `SEC`
+   segment makes `handoff_trace_lint(action="nfr_check")` list it under security.
+2. **Rule it out of scope**, with the reason in one line (for example "the tool
+   reads no credentials" or "no third-party dependencies").
+
+Keep the result in a `## Security minimum` section of the NFR document (a
+heading without an item ID), one row per item:
+
+```markdown
+## Security minimum
+
+| Item | Decision | Requirement or reason |
+|---|---|---|
+| Handling of secrets | requirement | NFR-SEC-001 |
+| Validation of external input | requirement | NFR-SEC-002 |
+| Dependency updates | out of scope | No third-party dependencies |
+```
+
+`Decision` is `requirement`, `out of scope` or, while the question is still
+open, `undecided`. Then record the status of the security characteristic:
+`handoff_trace_lint(action="nfr_check", review={"security": "applicable"})` when
+at least one security NFR exists, or `review={"security": "not_applicable"}`
+when all three are out of scope and no other security NFR exists. The tool keeps
+the status only, so the reasons have to be in the document.
+
+```markdown
+### NFR-SEC-001 Secrets stay out of the repository
+- priority: P1
+- method: auto
+
+API keys and passwords are read from the environment and are never committed.
+
+Acceptance criteria:
+- AC-1: Given the repository at any commit, when the secrets scan of CI runs,
+  then it reports 0 findings.
+```
+
 ## Completion check
 
 Before leaving the scan:
@@ -157,3 +213,4 @@ Before leaving the scan:
 - Every NFR has a measurable threshold (or an explicit `TBD` with owner and date), a `method`, and at least one acceptance criterion.
 - `trace_lint` reports no `ambiguous_word` or `missing_acceptance` finding for the NFR items.
 - Conflicting NFRs (for example strict latency against strong encryption on a small device) are called out and the priority order is decided.
+- When `[onboarding] security_min_nfr = true`: each of the three security minimum items has a decision in the `## Security minimum` section, a requirement or an "out of scope" reason, and none is `undecided`.

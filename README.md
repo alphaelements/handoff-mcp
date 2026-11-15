@@ -146,8 +146,9 @@ with `HANDOFF_MCP_BINARY_PATH=/path/to/handoff-mcp`.
 ```
 
 Adds `/session-loop` (parallel TDD implementation, adversarial testing, Opus
-review) and `/research-loop` (multi-agent investigation, verification, spec
-drafting). See [plugin-task-loop/README.md](plugin-task-loop/README.md).
+review), `/research-loop` (multi-agent investigation, verification, spec
+drafting) and `/bugfix-loop` (one bug: failing test first, approval, fix, the
+same test, the full suite). See [plugin-task-loop/README.md](plugin-task-loop/README.md).
 
 **Optional: memory auto-injection hooks**
 
@@ -1191,12 +1192,30 @@ smoke_check = true         # Run [commands] smoke before implementation starts (
 release_guard = "warn"     # "off" (default) | "warn" | "block": consult the release check when a milestone is released (see Release guard)
 security_min_nfr = true    # Require a decision on the minimum security requirements (default false)
 command_timeout_sec = 600  # Seconds a [commands] command may run in the readiness and release checks (default 600)
+smoke_timeout_sec = 120    # Seconds the smoke command may run in the smoke check of /session-loop (default 120)
 secret_file_patterns = [".env", "*.pem"]   # Replaces the default secrets patterns (see Readiness check)
 ```
 
 handoff-mcp stores and validates these values; the task-loop commands read them
 to decide which checks to run (`next_step` and `release_guard` are applied by
 handoff-mcp itself).
+
+`preflight` and `smoke_check` act at the start of `/session-loop`, before a task
+is fetched. With `preflight = "check"` the session manager calls
+`handoff_doctor()`; with `"run"` it also runs the commands the tool hands out
+(the dependency audit included) and reports the results. A project that is not
+ready ends the session there: the failed checks are shown with their
+`next_step`, and no Workflow is launched. With `smoke_check = true` the manager
+runs `[commands] smoke`; when it fails, the session ends, one task labelled `bug`
+and titled `[smoke] Smoke check failed` is filed (launching again does not file
+a second one) and `/bugfix-loop task: <id>` is proposed. Without a smoke command
+the check is recorded as `skip`.
+
+`security_min_nfr` acts in `/requirement-loop`: before the NFR gate of Phase 2 the
+user decides, for each of three items (handling of secrets, validation of
+external input, dependency updates), whether it becomes an `NFR-` requirement or
+is out of scope, with a reason. The decisions are kept in the NFR document, and
+an undecided item keeps the gate closed.
 
 The **`beginner` preset** sets everything for one person building a first
 application, in one step:

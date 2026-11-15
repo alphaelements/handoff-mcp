@@ -305,17 +305,53 @@ validated on write.
 | Key | Values | Default |
 |-----|--------|---------|
 | `preset` | `beginner` | unset |
-| `preflight` | `off` / `check` / `run` | `off` |
+| `preflight` | `off` / `check` / `run`: readiness check at the start of `/session-loop` — see below | `off` |
 | `next_step` | boolean: `handoff_load_context` carries the answer of `handoff_next_step` as its `next_step` key | `false` |
-| `smoke_check` | boolean | `false` |
+| `smoke_check` | boolean: `/session-loop` runs `[commands] smoke` before it plans a session — see below | `false` |
 | `release_guard` | `off` / `warn` / `block`: what `handoff_update_milestone(status: "released")` does when an item of the release check is not `pass` (`warn` lists them, `block` rejects the call unless `force: true`) — see below | `off` |
-| `security_min_nfr` | boolean | `false` |
+| `security_min_nfr` | boolean: `/requirement-loop` requires a decision on three security items before its NFR gate — see below | `false` |
 | `command_timeout_sec` | seconds (>= 1) | `600` |
+| `smoke_timeout_sec` | seconds (>= 1) the smoke command of `smoke_check` may run | `120` |
 | `secret_file_patterns` | list of file-name patterns | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `credentials.json`, `secrets.*` |
 
 handoff-mcp stores these values; the task-loop commands read them through
 `handoff_get_config` to decide which checks to run. `release_guard` is the
 exception, with `next_step`: handoff-mcp applies these two itself.
+
+### `preflight` and `smoke_check` — checks at the start of `/session-loop`
+
+Both are carried out by the session manager of the task-loop plugin, right after
+it establishes the session and before it fetches a task. handoff-mcp runs
+nothing.
+
+- `preflight = "check"`: the manager calls `handoff_doctor()` and runs no
+  command. `preflight = "run"`: it also runs the commands of `commands_to_run`
+  (the dependency audit included) and reports the results back. When the answer
+  is `ready: false` the session ends there: the failed checks are shown with
+  their `next_step`, nothing is planned and no Workflow is launched. When it is
+  `ready: true` the loop goes on without a question and notes the outcome in
+  the session.
+- `smoke_check = true`: the manager runs `[commands] smoke` itself, for at most
+  `smoke_timeout_sec` seconds; exit code 0 passes. A failure ends the session
+  before anything is planned: one task labelled `bug` and titled
+  `[smoke] Smoke check failed` is filed (none when an unfinished one already
+  exists, so repeated launches leave one), and `/bugfix-loop task: <id>` is
+  proposed. Without a smoke command the check is noted as `skip`, never as a
+  pass, and the loop goes on.
+
+With both keys off the loop runs exactly as before.
+
+### `security_min_nfr` — three security decisions in `/requirement-loop`
+
+With `security_min_nfr = true`, the requirements coordinator of the task-loop
+plugin does not pass its NFR gate (Phase 2, "Gate 2 to 3") until the user has
+decided each of three items: handling of secrets, validation of external input,
+and dependency updates. Each one is either filed as an `NFR-` requirement or
+ruled out of scope with a reason, and the decisions are kept in a
+`## Security minimum` section of the NFR document. An item left undecided
+keeps the gate closed. With the key off, Phase 2 runs as before. The questions
+for each item are in the `handoff-requirements` skill
+(`references/nfr-checklist.md`, "Security minimum: three decisions").
 
 ### `release_guard` — the release check at the moment of release
 

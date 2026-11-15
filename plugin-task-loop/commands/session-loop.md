@@ -53,6 +53,13 @@ Session N:
 > Step 9 for merge orchestration, Step 10 for cleanup). When `auto_assign = false`
 > (the default) or absent, ignore multi-WT entirely — the flow above runs unchanged.
 
+> **Onboarding checks (opt-in, off by default).** Two checks can run right after the
+> session is established, before any task is fetched: `[onboarding] preflight`
+> (`check` or `run`) turns on the readiness check of Step 0b, and
+> `[onboarding] smoke_check` (`true`) turns on the smoke check of Step 0c. A check that
+> fails ends the session there: nothing is planned and no Workflow is launched. When
+> both keys are off (the default) or absent, the flow above runs unchanged.
+
 ## The three verification layers
 
 | Layer | Agent | Scope | Answers |
@@ -128,6 +135,148 @@ handoff_load_context
     label="Session N: <brief description>")
 -> Read suggestion notes and continue from where the previous session left off
 ```
+
+### 0b. Preflight (only when `[onboarding] preflight` is `check` or `run`)
+
+Read the project configuration once, right after Step 0. Steps 0b and 0c both use this
+one response:
+
+```
+handoff_get_config
+-> onboarding.preflight           "off" | "check" | "run"   (absent = "off")       Step 0b
+-> onboarding.smoke_check         true | false              (absent = false)       Step 0c
+-> commands.smoke                 the smoke command         (absent = not defined) Step 0c
+-> onboarding.smoke_timeout_sec   seconds                   (absent = 120)         Step 0c
+```
+
+**When `onboarding.preflight` is absent, `"off"`, or any value other than `"check"` and
+`"run"`: skip this step.** Do not call `handoff_doctor`, run no command, record nothing,
+and continue at Step 0c. A project without an `[onboarding]` section goes through the
+loop exactly as it did before this step existed.
+
+Otherwise diagnose the project with `handoff_doctor`. The tool never runs a command: it
+hands the commands out in `commands_to_run`, and running them is your job.
+
+- **`check`** — call `handoff_doctor()` once, without `results`. **Run no command.** The
+  command checks (`cmd_*` and `dependencies_audited`) stay `skip`, and a `skip` does not
+  lower `ready`. That response is the verdict.
+- **`run`** —
+  1. Call `handoff_doctor()` without `results`.
+  2. Run every entry of `commands_to_run` yourself, with Bash, from the project root,
+     exactly as given: do not edit or combine the commands. Run them in the order
+     listed, and run all of them even when an earlier one fails. Stop a command after its
+     `timeout_sec`. You may time a command and capture its output, but the exit code you
+     report must be the command's own: behind a pipe such as `| tail` the shell reports
+     the exit code of `tail`. The list holds the project's install, build, test, lint and
+     typecheck commands that are defined, and the dependency audit command
+     (`[commands] audit`, id `dependencies_audited`): the audit runs here too. `format`
+     and `smoke` are never in it (the smoke check is Step 0c).
+  3. Call `handoff_doctor(results: [...])` with one entry per command you ran:
+     `{ id, command, exit_code, duration_ms, output_tail }`, with `id` and `command`
+     copied unchanged from `commands_to_run` and `output_tail` holding the last ~20 lines
+     of output. For a command that could not be started or was stopped at the timeout,
+     send `{ id, command, error: "<reason>" }` and no exit code. Never report a result
+     for a command you did not run, and never change an exit code.
+  4. The second response is the verdict. Do not call a third time.
+
+  When `commands_to_run` is empty there is nothing to run and the first response is the
+  verdict.
+
+**`ready: false` — stop here.** Do not continue to Step 0c or Step 1: fetch no tasks,
+present no session plan, mark no task `in_progress`, and **do not launch the Workflow**.
+Show the user every check whose `status` is `fail`, each with its `id`, its `detail` and
+its `next_step`:
+
+```
+Preflight stopped the session: the project is not ready.
+
+- <id>: <detail>
+  Next step: <next_step>
+```
+
+Then close the session opened in Step 0 with
+`handoff_save_context(session_status="closed", summary="Preflight stopped the session: <failed ids>", handoff_notes=[{ category: "suggestion", note: "<the next steps shown above>" }])`
+and end the loop. Do not ask whether to continue anyway, and do not start fixing the
+failed checks: the user decides what to do with the next steps.
+
+**`ready: true`** — continue at Step 0c without asking the user anything: no
+confirmation, and no report to approve. Record the outcome as one line in the session
+notes:
+
+```
+handoff_update_session(add_handoff_note: { category: "context",
+  note: "Preflight (<check|run>): ready — <n> pass, <n> skip, 0 fail" })
+```
+
+**If `handoff_doctor` cannot be called or returns an error**, treat the project as not
+ready: show the error and stop exactly as for `ready: false`. Never continue past a
+preflight that is switched on but was not carried out.
+
+### 0c. Smoke check (only when `[onboarding] smoke_check = true`)
+
+Use the configuration read in Step 0b (`onboarding.smoke_check`, `commands.smoke`,
+`onboarding.smoke_timeout_sec`).
+
+**When `onboarding.smoke_check` is absent or `false`: skip this step.** Do not run the
+smoke command, record nothing, file nothing, and continue at Step 1.
+
+Otherwise the outcome is recorded with one of the status words `pass`, `fail` or `skip`:
+
+**`[commands] smoke` is not defined** (`commands.smoke` is absent or blank) — run
+nothing. Record that the check was not carried out, then continue at Step 1:
+
+```
+handoff_update_session(add_handoff_note: { category: "context",
+  note: "Smoke check: skip — [commands] smoke is not defined, nothing was run" })
+```
+
+Never record this as a pass: a check that did not run shows nothing.
+
+**`[commands] smoke` is defined** — run the command once yourself, with Bash, from the
+project root, exactly as written in `commands.smoke`. No MCP tool runs it. Stop it after
+`onboarding.smoke_timeout_sec` seconds (default 120). The check passes only when the
+command ends with exit code 0. Anything else — a non-zero exit code, a command that could
+not be started, a command stopped at the timeout — is a failure. Judge the command's own
+exit code: behind a pipe such as `| tail` the shell reports the exit code of `tail`.
+
+**Smoke check passed** — record it, then continue at Step 1 without asking:
+
+```
+handoff_update_session(add_handoff_note: { category: "context",
+  note: "Smoke check: pass — <command> (<duration> s)" })
+```
+
+**Smoke check failed — stop here.** Do not continue to Step 1: fetch no tasks, present no
+session plan, and **do not launch the Workflow**. The application does not work, so new
+work on top of it would only hide the failure. Instead:
+
+1. Look for the bug task of an earlier failed run: `handoff_list_tasks(label_filter="bug")`,
+   then search the whole tree, children included, for a task whose title is exactly
+   `[smoke] Smoke check failed` and whose status is neither `done` nor `skipped`. Make
+   this call even when the context loaded in Step 0 lists tasks: that list can be cut
+   short, and a task it does not show may still exist.
+2. If there is one, file nothing and use its id. If there is none, file exactly one:
+
+   ```
+   handoff_update_task(task={
+     title: "[smoke] Smoke check failed",
+     status: "todo",
+     priority: "high",
+     labels: ["bug"],
+     notes: "Smoke check failed at the start of session <session id>.\nCommand: <command>\nResult: <exit code N | could not be started: reason | timed out after N s>\nDuration: <duration> s\nOutput (last ~20 lines):\n<output tail>",
+     done_criteria: [{ item: "The smoke command exits with code 0" }]
+   })
+   ```
+
+   Do not add the command or anything else to the title: the title is how the next run
+   finds this task, so the project has at most one open `[smoke]` bug task however many
+   times the loop is started while the smoke check fails.
+3. Tell the user what failed (the command, the exit code or reason, the last lines of
+   output), name the bug task (say whether it was filed now or already existed), and
+   propose the next command: `/bugfix-loop task: <id>`.
+4. Close the session opened in Step 0 with
+   `handoff_save_context(session_status="closed", summary="Smoke check: fail — <command> (<exit code or reason>), bug task <id>", handoff_notes=[{ category: "suggestion", note: "Run /bugfix-loop task: <id>" }])`
+   and end the loop. Do not start fixing the failure in this session.
 
 ### 1. Fetch tasks and split into sessions
 
@@ -753,6 +902,8 @@ handoff_save_context(
 - If the goal is not yet met, `/loop` triggers the next iteration
 - **Step 0 runs at the top of each iteration**, loading the handoff from step 7
 - This ensures "Session N completion -> Session N+1 start" is properly chained
+- Steps 0b and 0c follow Step 0 in every iteration, when their `[onboarding]` keys
+  are on: the project is checked again before each session, not only before the first
 
 ## Task selector (argument parsing)
 
@@ -801,6 +952,8 @@ If target tasks remain, continue. If zero, run completion procedure.
 ## Rules
 
 - **Do not start implementation without user approval** (session plan + uncertainties first)
+- **Never launch the Workflow after a failed preflight (Step 0b) or smoke check (Step 0c).**
+  A failed check ends the session; it is not a warning to plan around.
 - **Never fake a completion report.** If the reviewer says FAIL, don't close the task.
 - **Never swallow discovered issues.** Follow `_bug-report-protocol.md`.
 - **Never leave a session's tasks sitting in `todo` while the Workflow runs.** Mark

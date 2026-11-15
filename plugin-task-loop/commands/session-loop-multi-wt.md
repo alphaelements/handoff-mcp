@@ -14,6 +14,12 @@ These steps interleave with the main session-loop procedure:
 - **Step 6 multi-WT** replaces the conventional Step 6 (process results)
 - **Steps 9–10** run after Step 8 (next session), before session close
 
+Steps 0b (Preflight) and 0c (Smoke check) of `session-loop.md` come before Step 1, so
+they run once, in the primary worktree, ahead of every step in this file. When either of
+them stops the session, none of the steps in this file runs: no WT assignment plan is
+presented, no worktree is created and no subagent is dispatched. The per-WT subagents
+run Steps 2-7 only and do not repeat them.
+
 ## Step 1b. Functional grouping + WT assignment plan
 
 **Gate check:**

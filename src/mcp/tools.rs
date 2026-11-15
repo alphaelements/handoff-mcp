@@ -473,7 +473,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_update_config".to_string(),
-            description: "Update the project's handoff configuration. Pass either `updates` (individual keys) or `preset` (a named set of values), not both. `updates` replies with plain text. `preset` replies with JSON {preset, applied, changes:[{key, old, new}], overwrites:[key], message}: keys that had no value are set at once; when the preset would replace a value the project already set (overwrites is not empty) nothing is written and applied=false unless confirm=true - show `changes` to the user and call again with confirm=true. `[commands]` values must be strings; `[onboarding]` values are validated (preflight: off/check/run, release_guard: off/warn/block, the switches are booleans).".to_string(),
+            description: "Update the project's handoff configuration. Pass either `updates` (individual keys) or `preset` (a named set of values), not both. `updates` replies with plain text. `preset` replies with JSON {preset, applied, changes:[{key, old, new}], overwrites:[key], message}: keys that had no value are set at once; when the preset would replace a value the project already set (overwrites is not empty) nothing is written and applied=false unless confirm=true - show `changes` to the user and call again with confirm=true. `[commands]` values must be strings; `[onboarding]` values are validated (preflight: off/check/run, release_guard: off/warn/block, the switches are booleans, command_timeout_sec and smoke_timeout_sec are seconds >= 1).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

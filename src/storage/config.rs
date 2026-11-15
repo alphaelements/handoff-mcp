@@ -295,6 +295,14 @@ pub struct OnboardingConfig {
     /// (default [`DEFAULT_COMMAND_TIMEOUT_SEC`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_timeout_sec: Option<u64>,
+    /// Seconds `[commands] smoke` may run in the smoke check of the session
+    /// loop before it is stopped (SPEC-ONB-030). handoff-mcp never runs the
+    /// smoke check: the session-loop command reads this key through
+    /// `handoff_get_config` and applies its default of 120 seconds when the
+    /// key is unset. It is typed here so that a value that is not a positive
+    /// number of seconds is rejected when it is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke_timeout_sec: Option<u64>,
     /// File-name patterns of secrets files, replacing
     /// [`DEFAULT_SECRET_FILE_PATTERNS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -382,11 +390,15 @@ impl OnboardingConfig {
                 }
             }
         }
-        if self.command_timeout_sec == Some(0) {
-            return Err(
-                "invalid onboarding.command_timeout_sec 0: expected a number of seconds >= 1"
-                    .to_string(),
-            );
+        for (key, seconds) in [
+            ("command_timeout_sec", self.command_timeout_sec),
+            ("smoke_timeout_sec", self.smoke_timeout_sec),
+        ] {
+            if seconds == Some(0) {
+                return Err(format!(
+                    "invalid onboarding.{key} 0: expected a number of seconds >= 1"
+                ));
+            }
         }
         if self
             .secret_file_patterns
@@ -3037,6 +3049,60 @@ pair = "usability_test"
         assert!(err.contains("onboarding.command_timeout_sec"), "{err}");
 
         for bad in ["command_timeout_sec = -5", "command_timeout_sec = \"60\""] {
+            let parsed = toml::from_str::<Config>(&format!(
+                "[project]\nname = \"x\"\n\n[onboarding]\n{bad}\n"
+            ));
+            assert!(parsed.is_err(), "{bad}");
+        }
+    }
+
+    // --- [onboarding] smoke_timeout_sec (SPEC-ONB-030) ---
+
+    /// The key is typed, not one of the unknown keys that are only carried
+    /// along, and an unset key leaves the section empty: the default (120
+    /// seconds) is applied by its reader, session-loop Step 0c.
+    #[test]
+    fn smoke_timeout_is_read_and_round_trips() {
+        let unset = parse_config("[project]\nname = \"x\"\n");
+        assert_eq!(unset.onboarding.smoke_timeout_sec, None);
+        assert!(unset.onboarding.is_empty());
+
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 45\n");
+        assert_eq!(cfg.onboarding.smoke_timeout_sec, Some(45));
+        assert!(
+            cfg.onboarding.extra.is_empty(),
+            "{:?}",
+            cfg.onboarding.extra
+        );
+        assert!(cfg.onboarding.validate().is_ok());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("smoke_timeout_sec = 45"), "{rendered}");
+        assert_eq!(parse_config(&rendered).onboarding, cfg.onboarding);
+    }
+
+    /// The smoke timeout and `command_timeout_sec` are independent keys.
+    #[test]
+    fn smoke_timeout_is_independent_of_the_command_timeout() {
+        let cfg =
+            parse_config("[project]\nname = \"x\"\n\n[onboarding]\ncommand_timeout_sec = 45\n");
+        assert_eq!(cfg.onboarding.smoke_timeout_sec, None);
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 7\n");
+        assert_eq!(cfg.onboarding.command_timeout_sec(), 600);
+    }
+
+    /// A timeout of zero would fail the smoke check at once; it is rejected
+    /// on write. A value that is not a whole number of seconds does not parse.
+    #[test]
+    fn smoke_timeout_must_be_a_positive_number_of_seconds() {
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 0\n");
+        let err = cfg.onboarding.validate().unwrap_err();
+        assert!(err.contains("onboarding.smoke_timeout_sec"), "{err}");
+        assert!(err.contains(">= 1"), "{err}");
+
+        let one = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 1\n");
+        assert!(one.onboarding.validate().is_ok());
+
+        for bad in ["smoke_timeout_sec = -5", "smoke_timeout_sec = \"60\""] {
             let parsed = toml::from_str::<Config>(&format!(
                 "[project]\nname = \"x\"\n\n[onboarding]\n{bad}\n"
             ));

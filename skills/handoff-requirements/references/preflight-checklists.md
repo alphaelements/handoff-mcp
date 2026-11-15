@@ -50,6 +50,7 @@ conversation or in a task note; nothing here is recorded by a tool.
 - [ ] An NFR item exists for every applicable concern. `handoff_trace_tree(scope="NFR-")` lists them.
 - [ ] Cross-cutting quality targets (response time, availability, capacity, security level) have numeric values, units and conditions.
 - [ ] Each NFR has `- method: manual` or `- method: auto` and an acceptance criterion. `handoff_trace_lint(rules=["missing_acceptance","ambiguous_word"])` is quiet for the NFR items.
+- [ ] (Only when `[onboarding] security_min_nfr = true`.) Each of the three security minimum items — handling of secrets, validation of external input, dependency updates — has a decision in the `## Security minimum` section of the NFR document: an `NFR-` item or an "out of scope" reason ([nfr-checklist.md](nfr-checklist.md), "Security minimum: three decisions"). An undecided item fails this gate. `handoff_get_config` shows the key; without it this check does not apply.
 
 ## Gate 3 to 4: basic requirements complete
 
