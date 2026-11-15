@@ -12,7 +12,9 @@
 //! 3. no skill cites internal artifacts (design-wiki pages, internal
 //!    requirement/task ids, milestone names, private repos/skills),
 //! 4. every skill is structurally sound (frontmatter, Codex metadata,
-//!    `references/` links resolve and nothing is orphaned, size budget).
+//!    `references/` links resolve and nothing is orphaned, size budget),
+//! 5. every skill is listed where users look for skills (the README skills
+//!    table, the plugin README).
 
 use handoff_mcp::mcp::tools::all_tool_definitions;
 use handoff_mcp::storage::config::{
@@ -533,4 +535,43 @@ fn report_schedule_skill_documents_the_cloud_scheduling_recipe() {
         "{} is missing required guidance: {missing:?}",
         path.display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Listing
+// ---------------------------------------------------------------------------
+
+/// A skill nobody can find is not shipped: each skill directory has its row
+/// in the README skills table and is named in the plugin README's list.
+#[test]
+fn every_skill_is_listed_in_the_readmes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    let table = readme
+        .split_once("\n## Skills\n")
+        .expect("README has a Skills section")
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let plugin_readme = fs::read_to_string(root.join("plugin/README.md")).unwrap();
+    let listed = plugin_readme
+        .lines()
+        .find(|line| line.starts_with("- **Skills**"))
+        .expect("plugin/README.md has a Skills line");
+    let listed: Vec<&str> = listed
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .collect();
+
+    let mut problems = Vec::new();
+    for dir in skill_dirs() {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        if !table.contains(&format!("| `{name}` |")) {
+            problems.push(format!("{name}: no row in the README skills table"));
+        }
+        if !listed.contains(&name.as_str()) {
+            problems.push(format!("{name}: not in the plugin/README.md skills list"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

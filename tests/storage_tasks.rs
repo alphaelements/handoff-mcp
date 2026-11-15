@@ -132,6 +132,185 @@ fn next_child_id_with_existing_children() {
     assert_eq!(next_child_id(&parent_dir, "t1").unwrap(), "t1.3");
 }
 
+/// A child moved under another parent keeps its id, so its number stays
+/// taken for the parent it was numbered under.
+#[test]
+fn next_child_id_counts_a_child_that_lives_under_another_parent() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t1-parent/t1.1-first")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t2-other/t1.2-moved")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t1.5-misplaced-at-the-top")).unwrap();
+
+    assert_eq!(next_child_id(&tasks_dir, "t1").unwrap(), "t1.6");
+}
+
+/// Only `{parent}.{n}` and its descendants use the child number `n` of
+/// `parent`: a grandchild uses the number of the child it is under (`t1.2.9`
+/// uses 2, not 9), and a child of a parent whose id merely starts with the
+/// same characters, or a non-numeric suffix, uses none.
+#[test]
+fn next_child_id_ignores_ids_that_are_not_direct_children() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t1-parent/t1.2-second/t1.2.9-grandchild")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t10-ten/t10.7-child-of-ten")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t1-parent/t1.x-not-a-number")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t1-parent/t1-8-dash-not-dot")).unwrap();
+
+    assert_eq!(next_child_id(&tasks_dir, "t1").unwrap(), "t1.3");
+    assert_eq!(next_child_id(&tasks_dir, "t1.2").unwrap(), "t1.2.10");
+    assert_eq!(next_child_id(&tasks_dir, "t10").unwrap(), "t10.8");
+}
+
+/// The id a task file stores counts, whatever its directory is called and
+/// whatever its status.
+#[test]
+fn next_ids_count_the_id_stored_in_a_task_file() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let renamed = tasks_dir.join("renamed-by-hand");
+    fs::create_dir_all(&renamed).unwrap();
+    write_task(&renamed, "done", &make_task("t7", "Top")).unwrap();
+    let nested = tasks_dir.join("t1-parent/also-renamed");
+    fs::create_dir_all(&nested).unwrap();
+    write_task(&nested, "skipped", &make_task("t1.4", "Child")).unwrap();
+
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t8");
+    assert_eq!(next_child_id(&tasks_dir, "t1").unwrap(), "t1.5");
+}
+
+#[test]
+fn next_top_level_id_counts_a_task_moved_under_a_parent() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t1-first/t1.1-child/t9-moved-deep")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t2-second")).unwrap();
+
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t10");
+}
+
+/// A task file that cannot be parsed does not block allocation: its
+/// directory name still reserves its number, and the directories below it
+/// are still counted.
+#[test]
+fn next_ids_survive_an_unreadable_task_file() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let broken = tasks_dir.join("t4-broken");
+    fs::create_dir_all(broken.join("t4.3-child")).unwrap();
+    fs::write(broken.join("_task.todo.json"), "{ not json").unwrap();
+
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t5");
+    assert_eq!(next_child_id(&tasks_dir, "t4").unwrap(), "t4.4");
+}
+
+#[test]
+fn next_ids_start_at_one_without_a_tasks_directory() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("no-such-dir");
+
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t1");
+    assert_eq!(next_child_id(&tasks_dir, "t1").unwrap(), "t1.1");
+}
+
+/// The highest number is the last one: allocation fails instead of wrapping
+/// around to a number that is in use.
+#[test]
+fn next_ids_fail_when_the_numbers_are_exhausted() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t4294967295-last/t4294967295.4294967295-last")).unwrap();
+
+    let top = next_top_level_id(&tasks_dir).unwrap_err().to_string();
+    assert!(top.contains("exhausted"), "{top}");
+    let child = next_child_id(&tasks_dir, "t4294967295")
+        .unwrap_err()
+        .to_string();
+    assert!(child.contains("exhausted"), "{child}");
+}
+
+/// A fresh top-level id has no descendants yet. A dotted id whose parent
+/// does not exist (an older build accepted `t7.1` without a `t7`) therefore
+/// keeps `t7` from being handed out: the next `t7` would be born with a
+/// child it never numbered, and its own first child would be a second `t7.1`.
+#[test]
+fn next_top_level_id_skips_a_number_that_a_dotted_id_names_as_its_ancestor() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t1-first")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t7.1-orphan-at-the-top")).unwrap();
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t8");
+
+    fs::create_dir_all(tasks_dir.join("t1-first/t9.4.2-orphan-below-a-task")).unwrap();
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t10");
+
+    let renamed = tasks_dir.join("renamed-by-hand");
+    fs::create_dir_all(&renamed).unwrap();
+    write_task(&renamed, "todo", &make_task("t12.3", "Orphan")).unwrap();
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t13");
+}
+
+/// The same for a child number: `t1.5.1` without a `t1.5` keeps `t1.5` from
+/// being handed out.
+#[test]
+fn next_child_id_skips_a_number_that_a_deeper_id_names_as_its_ancestor() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t1-parent/t1.2-second")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t1.5.1-orphan-at-the-top")).unwrap();
+
+    assert_eq!(next_child_id(&tasks_dir, "t1").unwrap(), "t1.6");
+    assert_eq!(next_child_id(&tasks_dir, "t1.5").unwrap(), "t1.5.2");
+}
+
+/// Only `t{n}` and its descendants use the number `n`: an id that merely
+/// starts with `t` does not.
+#[test]
+fn next_top_level_id_ignores_ids_that_are_not_numbered() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    fs::create_dir_all(tasks_dir.join("t2-second")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t-book-custom/t-book.40-chapter")).unwrap();
+    fs::create_dir_all(tasks_dir.join("task-90-not-an-id")).unwrap();
+    fs::create_dir_all(tasks_dir.join("t5x.1-not-a-number")).unwrap();
+    fs::create_dir_all(tasks_dir.join("x50-other-prefix")).unwrap();
+
+    assert_eq!(next_top_level_id(&tasks_dir).unwrap(), "t3");
+}
+
+#[test]
+fn implied_parent_id_is_the_id_before_the_last_dot() {
+    assert_eq!(implied_parent_id("t-book.16"), Some("t-book"));
+    assert_eq!(implied_parent_id("t1.2.3"), Some("t1.2"));
+    assert_eq!(implied_parent_id("t1"), None);
+    assert_eq!(implied_parent_id("t-book"), None);
+}
+
+#[test]
+fn validate_new_task_id_rejects_an_empty_id_or_part() {
+    for id in ["t1", "t-book.16", "t1.2.3", "custom-id"] {
+        assert!(validate_new_task_id(id).is_ok(), "{id}");
+    }
+    for id in ["", ".", "t1.", ".1", "t1..2"] {
+        let error = validate_new_task_id(id).unwrap_err().to_string();
+        assert!(error.contains(&format!("'{id}'")), "{id}: {error}");
+    }
+}
+
+/// The id becomes part of a directory name, so a path separator in it would
+/// name a directory somewhere else.
+#[test]
+fn validate_new_task_id_rejects_a_path_separator() {
+    for id in ["a/b", "/tmp/abs", "t1.a/b", "x\\y", "..\\up"] {
+        let error = validate_new_task_id(id).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("'{id}'")) && error.contains("path separator"),
+            "{id}: {error}"
+        );
+    }
+}
+
 #[test]
 fn title_to_slug_basic() {
     assert_eq!(title_to_slug("Hello World"), "hello-world");

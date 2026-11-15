@@ -20,7 +20,7 @@ cargo install handoff-mcp
 ## What's included
 
 - **MCP Server** — 101 tools for session handoff, task management, metrics, scheduling, memory, document management, V-model traceability, onboarding checks (next step, readiness, release), and cross-project referrals
-- **Skills** — handoff, handoff-load, handoff-memory, handoff-docs, handoff-trace, handoff-requirements, handoff-refer, handoff-import, handoff-report-schedule
+- **Skills** — handoff, handoff-getting-started, handoff-load, handoff-memory, handoff-docs, handoff-trace, handoff-requirements, handoff-gui-requirements, handoff-refer, handoff-import, handoff-report-schedule
 
 ## Getting started
 

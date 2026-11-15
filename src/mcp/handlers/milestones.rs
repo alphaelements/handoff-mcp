@@ -291,6 +291,61 @@ fn append_dependency_warnings(msg: &mut String, name: &str, depends_on: &[&str],
     }
 }
 
+/// Machine-readable code of the warning for a task milestone that has no
+/// `[milestones.<name>]` definition. Plain-text responses carry it in brackets,
+/// like `DANGLING_DEPENDENCY`, so consumers can match on it without parsing
+/// the prose.
+pub const UNKNOWN_MILESTONE_CODE: &str = "UNKNOWN_MILESTONE";
+
+/// The milestone name a task payload asks for: `schedule.milestone` of a
+/// `handoff_update_task` task, a `handoff_bulk_update_tasks` update or a
+/// `handoff_import_context` task. `None` when the payload does not pass one.
+pub fn requested_task_milestone(task: &Value) -> Option<&str> {
+    task.get("schedule")?.get("milestone")?.as_str()
+}
+
+/// Advisory warnings for the milestone names a call assigns tasks to: one
+/// line per distinct name, in name order, that has no `[milestones.<name>]`
+/// definition in config.toml. Such a name is most often a typing mistake, and
+/// its tasks are missed by everything that works from the definitions (the
+/// milestone list, the release check).
+///
+/// `requested` holds the names the call itself passed. A name a task already
+/// had is not reported by a call that does not pass it, and a name that is
+/// passed again is reported again, as it is still undefined. An empty string
+/// is not a name. Never blocks: the name is stored as given.
+///
+/// A missing or unreadable config.toml yields no warning, because nobody can
+/// then tell which milestones are defined. The config problem itself is
+/// reported by [`frozen_assignment_warning`] and by the tools that own the
+/// config.
+pub fn unknown_milestone_warnings<'a>(
+    handoff_dir: &Path,
+    requested: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let names: std::collections::BTreeSet<&str> = requested
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let (Some(config), _) = read_config_lenient(handoff_dir) else {
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter(|name| !config.milestones.contains_key(*name))
+        .map(|name| {
+            format!(
+                "Warning [{UNKNOWN_MILESTONE_CODE}]: Milestone '{name}' does not match any \
+                 milestone defined in config.toml. Check the milestone name spelling or define \
+                 it with handoff_add_milestone. The assignment was still saved."
+            )
+        })
+        .collect()
+}
+
 /// Advisory warning for moving a task into a frozen milestone (REQ-MS-CFG-002).
 ///
 /// `previous` is the task's milestone before the write (`None` on create) and

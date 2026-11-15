@@ -365,7 +365,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "object",
                         "description": "The task to add or update. schedule.estimate_hours is REQUIRED when a leaf task is in status in_progress/review/done. Omit it for parent tasks (any task with children) or status todo/blocked/skipped.",
                         "properties": {
-                            "id": { "type": "string", "description": "Task ID. Omit for auto-generated ID. If provided and task exists, updates it. If provided and task does not exist, creates a new task with that ID (upsert)." },
+                            "id": { "type": "string", "description": "Task ID. Omit for auto-generated ID (never an ID already in use anywhere in the task tree). If provided and task exists, updates it. If provided and task does not exist, creates a new task with that ID (upsert). A new ID with a dot names its parent (\"t5.3\" is a child of \"t5\"): the task is created under that parent, and the call is rejected when the parent does not exist or when parent_id names a different task. A new ID without a dot is created at the top level, or under parent_id when given." },
                             "title": { "type": "string", "description": "Required for new tasks. Optional when updating (id present)." },
                             "status": {
                                 "type": "string",
@@ -405,7 +405,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     "estimate_hours": { "type": "number", "description": "REQUIRED for leaf tasks in status in_progress/review/done; the call is rejected without it. Omit for parent tasks (any task with children) or status todo/blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
                                     "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically. Setting it directly appends the difference (negative when lowered, a correction) to .handoff/time_log.jsonl with source=direct_update." },
                                     "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
-                                    "milestone": { "type": "string" },
+                                    "milestone": { "type": "string", "description": "Milestone name. A name with no [milestones.<name>] definition in config.toml is saved, and the response carries Warning [UNKNOWN_MILESTONE]." },
                                     "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." },
                                     "baseline_start": { "type": "string", "description": "YYYY-MM-DD. Originally planned start (for plan-vs-actual Gantt bars). handoff_auto_schedule(dry_run=false) records it automatically the first time it schedules the task and never overwrites it afterwards. Pass \"\" to reset it so the next auto_schedule run records a fresh baseline." },
                                     "baseline_due": { "type": "string", "description": "YYYY-MM-DD. Originally planned due date; same auto-record / never-overwrite / \"\"-to-reset behavior as baseline_start." }
@@ -443,7 +443,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "parent_id": {
                         "type": "string",
-                        "description": "Parent task ID for placement. Omit for auto-placement."
+                        "description": "Parent task ID for placement of a new task. Omit for a top-level task, or when a new task.id with a dot already names its parent."
                     },
                     "move_to": {
                         "type": "string",
@@ -1170,7 +1170,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                         "estimate_hours": { "type": "number", "description": "REQUIRED for a leaf task in status in_progress/review/done; the update is rejected without it. Omit for parent tasks (any task with children) or status todo/blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
                                         "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically. Setting it directly appends the difference (negative when lowered, a correction) to .handoff/time_log.jsonl with source=direct_update." },
                                         "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
-                                        "milestone": { "type": "string" },
+                                        "milestone": { "type": "string", "description": "Milestone name. A name with no [milestones.<name>] definition in config.toml is saved, and the update gets an UNKNOWN_MILESTONE entry in warnings." },
                                         "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." },
                                         "baseline_start": { "type": "string", "description": "YYYY-MM-DD. Originally planned start (for plan-vs-actual Gantt bars). handoff_auto_schedule(dry_run=false) records it automatically the first time it schedules the task and never overwrites it afterwards. Pass \"\" to reset it so the next auto_schedule run records a fresh baseline." },
                                         "baseline_due": { "type": "string", "description": "YYYY-MM-DD. Originally planned due date; same auto-record / never-overwrite / \"\"-to-reset behavior as baseline_start." }

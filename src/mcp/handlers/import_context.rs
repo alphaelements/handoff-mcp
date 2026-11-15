@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
+use super::milestones::{requested_task_milestone, unknown_milestone_warnings};
 use super::save_context::{
     append_session_event, prune_sessions_per_config, transition_group_member,
 };
@@ -336,7 +337,31 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         msg.push_str("\n  Raw notes: saved as handoff_note (context)");
     }
 
+    // Advisory, as in `handoff_update_task`: each milestone name the imported
+    // tasks were given that config.toml does not define, once per name.
+    let mut milestones = Vec::new();
+    for task_val in arguments
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        collect_requested_milestones(task_val, &mut milestones);
+    }
+    for warning in unknown_milestone_warnings(handoff, milestones) {
+        msg.push_str("\n  ");
+        msg.push_str(&warning);
+    }
+
     Ok(msg)
+}
+
+/// The milestone names the payload gives `task_val` and the tasks below it.
+fn collect_requested_milestones<'a>(task_val: &'a Value, out: &mut Vec<&'a str>) {
+    out.extend(requested_task_milestone(task_val));
+    for child in task_children(task_val).into_iter().flatten() {
+        collect_requested_milestones(child, out);
+    }
 }
 
 // The validating pass and the writing pass must read the payload identically, or

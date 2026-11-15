@@ -5,7 +5,9 @@ use chrono::Utc;
 use fs2::FileExt;
 use serde_json::Value;
 
-use super::milestones::frozen_assignment_warning;
+use super::milestones::{
+    frozen_assignment_warning, requested_task_milestone, unknown_milestone_warnings,
+};
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
@@ -666,7 +668,7 @@ pub(super) fn handle_create(
         Some(pid) => {
             let parent_dir = find_task_dir_by_id(tasks_dir, pid)?
                 .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, pid)))?;
-            let id = next_child_id(&parent_dir, pid)?;
+            let id = next_child_id(tasks_dir, pid)?;
             (id, parent_dir)
         }
         None => {
@@ -771,7 +773,13 @@ pub(super) fn handle_create(
     let mut msg = format!("Created task {new_id}: {title} [{status}]");
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
-    append_frozen_milestone_warning(handoff_dir, None, data.schedule.as_ref(), &mut msg);
+    append_milestone_warnings(
+        handoff_dir,
+        None,
+        task_val,
+        data.schedule.as_ref(),
+        &mut msg,
+    );
 
     if status != "todo" && status != "blocked" {
         let task_data = read_task(&task_dir)?
@@ -807,12 +815,7 @@ fn handle_upsert_create(
         })?;
 
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
-
-    let parent_dir = match parent_id {
-        Some(pid) => find_task_dir_by_id(tasks_dir, pid)?
-            .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, pid)))?,
-        None => tasks_dir.to_path_buf(),
-    };
+    let parent_dir = resolve_upsert_parent_dir(tasks_dir, task_id, parent_id)?;
 
     let slug = title_to_slug(title);
     let dir_name = format!("{task_id}-{slug}");
@@ -904,7 +907,13 @@ fn handle_upsert_create(
     let mut msg = format!("Created task {task_id}: {title} [{status}]");
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
-    append_frozen_milestone_warning(handoff_dir, None, data.schedule.as_ref(), &mut msg);
+    append_milestone_warnings(
+        handoff_dir,
+        None,
+        task_val,
+        data.schedule.as_ref(),
+        &mut msg,
+    );
 
     if status != "todo" && status != "blocked" {
         let task_data = read_task(&task_dir)?
@@ -918,6 +927,44 @@ fn handle_upsert_create(
     }
 
     Ok(msg)
+}
+
+/// The directory a task created with the caller-chosen id `task_id` goes in.
+///
+/// A dotted id names its parent (`t-book.16` is a child of `t-book`), so the
+/// id alone decides the placement: the task goes under that parent, wherever
+/// the parent lives, and `parent_id` may only repeat what the id already
+/// says. A dotted id is never created at the top level: once it sits outside
+/// its parent, that parent's next auto-numbered child gets the same id. When
+/// the parent does not exist, or `parent_id` names another task, the create
+/// is rejected instead.
+///
+/// An id without a dot names no parent: it goes under `parent_id` when one
+/// is given, else at the top level.
+fn resolve_upsert_parent_dir(
+    tasks_dir: &std::path::Path,
+    task_id: &str,
+    parent_id: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    validate_new_task_id(task_id)?;
+    let implied = implied_parent_id(task_id);
+    match (implied, parent_id) {
+        (Some(implied), Some(pid)) if implied != pid => anyhow::bail!(
+            "Task id '{task_id}' names '{implied}' as its parent, but parent_id is '{pid}'. \
+             Omit parent_id (the task is created under '{implied}'), or pass an id that \
+             belongs under '{pid}'."
+        ),
+        (Some(implied), None) => find_task_dir_by_id(tasks_dir, implied)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Task id '{task_id}' names '{implied}' as its parent, but task '{implied}' \
+                 does not exist. Create '{implied}' first, or use an id without a dot for a \
+                 top-level task."
+            )
+        }),
+        (_, Some(pid)) => find_task_dir_by_id(tasks_dir, pid)?
+            .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, pid))),
+        (None, None) => Ok(tasks_dir.to_path_buf()),
+    }
 }
 
 /// Update an existing task. The whole read-modify-write cycle below is
@@ -1440,9 +1487,10 @@ fn handle_update_locked(
         msg.push_str(&format!("\n{warning}"));
     }
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
-    append_frozen_milestone_warning(
+    append_milestone_warnings(
         handoff_dir,
         milestone_before.as_deref(),
+        task_val,
         data.schedule.as_ref(),
         &mut msg,
     );
@@ -1691,14 +1739,21 @@ fn append_dangling_dependency_warnings(dangling: &[String], msg: &mut String) {
     }
 }
 
-/// Appends the REQ-MS-CFG-002 advisory when the task now sits in a frozen
-/// milestone it was not in before (`previous`; `None` for a new task).
-fn append_frozen_milestone_warning(
+/// Appends the advisories on the milestone of a task that was just written:
+/// `UNKNOWN_MILESTONE` when this call (`task_val`) passes a milestone name
+/// that config.toml does not define, and the REQ-MS-CFG-002 advisory when the
+/// task now sits in a frozen milestone it was not in before (`previous`;
+/// `None` for a new task).
+fn append_milestone_warnings(
     handoff_dir: &std::path::Path,
     previous: Option<&str>,
+    task_val: &Value,
     schedule: Option<&Schedule>,
     msg: &mut String,
 ) {
+    for warning in unknown_milestone_warnings(handoff_dir, requested_task_milestone(task_val)) {
+        msg.push_str(&format!("\n{warning}"));
+    }
     let current = schedule.and_then(|s| s.milestone.as_deref());
     if let Some(warning) = frozen_assignment_warning(handoff_dir, previous, current) {
         msg.push_str(&format!("\n{warning}"));

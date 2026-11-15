@@ -2,7 +2,9 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use super::milestones::frozen_assignment_warning;
+use super::milestones::{
+    frozen_assignment_warning, requested_task_milestone, unknown_milestone_warnings,
+};
 use super::update_task::{
     done_guard_blocker_message, load_done_guard_block_check, log_direct_actual_hours_change,
     non_empty, resolve_done_guard,
@@ -158,9 +160,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "applied": applied,
         "errors": errors,
     });
-    // Present only when a `warn`-mode guard, an actual_hours log failure or a
-    // frozen-milestone assignment produced one, so the response shape for
-    // every other call is unchanged.
+    // Present only when a `warn`-mode guard, an actual_hours log failure, a
+    // frozen-milestone assignment or an undefined milestone name produced
+    // one, so the response shape for every other call is unchanged.
     if !warnings.is_empty() {
         result["warnings"] = Value::Array(warnings);
     }
@@ -335,9 +337,15 @@ fn apply_single_update(
         data.schedule.as_ref().and_then(|s| s.milestone.as_deref()),
     );
 
+    // Advisory as well: a milestone name this update passed that config.toml
+    // does not define, as in `handoff_update_task`.
+    let unknown_milestone =
+        unknown_milestone_warnings(handoff_dir, requested_task_milestone(update));
+
     let warnings: Vec<String> = [guard_warning, log_warning, frozen_warning]
         .into_iter()
         .flatten()
+        .chain(unknown_milestone)
         .collect();
     Ok((!warnings.is_empty()).then(|| warnings.join("\n")))
 }

@@ -309,6 +309,10 @@ fn update_task_warns_on_frozen_milestone() {
 fn bulk_update_warns_on_frozen_milestone() {
     let dir = setup_project();
     add(&dir, json!({ "name": "frozen-ms", "status": "frozen" }));
+    // Defined, like `open-ms` above: a name config.toml does not define gets
+    // its own warning (`UNKNOWN_MILESTONE`), which is not what this test is
+    // about.
+    add(&dir, json!({ "name": "other", "status": "active" }));
     call(
         &dir,
         "handoff_update_task",

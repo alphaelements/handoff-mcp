@@ -6,6 +6,14 @@
 //! The projects are built through the running server (the same tool calls the
 //! golden fixtures were built with, `scripts/gen-load-context-golden-v0472.sh`);
 //! every due date is a fixed day so `overdue_count` does not depend on today.
+//!
+//! v0.47.2 created a task given a dotted id (`t1.2`) without `parent_id` at
+//! the top level, so both golden projects are flat: every task sits directly
+//! under `tasks/`. The current server creates such a task under the parent its
+//! id names, so `small_project` and `todo300_project` move the tasks back to
+//! the top level afterwards ([`Project::move_every_task_to_the_top_level`]).
+//! Projects with that layout exist wherever v0.47.x was used this way, and
+//! `task_tree:"full"` must keep reading them as v0.47.2 did.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -155,6 +163,34 @@ impl Project {
         );
     }
 
+    /// Moves every task directory below another task up to `tasks/`, leaving
+    /// the layout v0.47.2 gave a project whose dotted ids were created
+    /// without `parent_id` (see the module comment). A task keeps its
+    /// directory name, so its id, title and file are untouched.
+    fn move_every_task_to_the_top_level(&mut self) {
+        fn nested_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read task dir").flatten() {
+                let is_task_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !entry.file_name().to_string_lossy().starts_with('.');
+                if is_task_dir {
+                    // Deepest first: a directory is listed after the ones below it.
+                    nested_dirs(&entry.path(), depth + 1, out);
+                    if depth > 0 {
+                        out.push(entry.path());
+                    }
+                }
+            }
+        }
+        let root = self.dir.join(".handoff/tasks");
+        let mut nested = Vec::new();
+        nested_dirs(&root, 0, &mut nested);
+        for dir in nested {
+            let dest = root.join(dir.file_name().expect("task dir name"));
+            assert!(!dest.exists(), "{} exists already", dest.display());
+            std::fs::rename(&dir, &dest).expect("move task dir to the top level");
+        }
+    }
+
     /// Close a session whose `related_task_ids` the next load inherits.
     fn close_previous_session(&mut self, related: Vec<String>) {
         self.server.call(
@@ -192,8 +228,9 @@ fn priority_of(i: u32) -> &'static str {
     }
 }
 
-/// 29 tasks: parent/child/grandchild, every status, dependencies and one
-/// closed previous session (`small.json`).
+/// 29 tasks with parent, child and grandchild ids, every status, dependencies
+/// and one closed previous session (`small.json`). All of them sit at the top
+/// level, as v0.47.2 built this project.
 fn small_project() -> Project {
     let mut p = Project::new("golden-small");
     p.task(json!({"id":"t1","title":"Epic A","status":"in_progress","priority":"high","labels":["epic"],
@@ -247,12 +284,15 @@ fn small_project() -> Project {
             "priority":priority,"schedule":{"due_date":due}}),
         );
     }
+    p.move_every_task_to_the_top_level();
     p.close_previous_session(vec!["t1.2".into(), "t2.1".into(), "t2.2".into()]);
     p
 }
 
-/// 300 tasks: 299 todo and one `in_progress` parent with 240 children; the
-/// previous session lists 299 of them (`todo300.json`).
+/// 300 tasks: 299 todo and one `in_progress` task `t1`, 240 of the todos
+/// carrying child ids of it (`t1.1`..`t1.240`); the previous session lists 299
+/// of them (`todo300.json`). All of them sit at the top level, as v0.47.2
+/// built this project.
 fn todo300_project() -> Project {
     let mut p = Project::new("golden-todo300");
     p.task(
@@ -279,6 +319,7 @@ fn todo300_project() -> Project {
         .map(|i| format!("t1.{i}"))
         .chain((2..=60).map(|i| format!("t{i}")))
         .collect();
+    p.move_every_task_to_the_top_level();
     p.close_previous_session(related);
     p
 }

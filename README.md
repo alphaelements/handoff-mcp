@@ -467,6 +467,32 @@ manual configuration alternative.
 
 ## Quick Start
 
+### First project
+
+The `handoff-getting-started` skill walks you from an empty directory to one
+finished task. With the plugins installed (see
+[Installation](#installation); the loop commands come with `handoff-task-loop`),
+open Claude Code in the directory and say "getting started", or type
+`/handoff-getting-started`. Claude then takes you through these steps, telling
+you before each one what is about to happen:
+
+| Step | Operation | What you get |
+|------|-----------|--------------|
+| 1 | Install | The `handoff-mcp` program and the `handoff-mcp` and `handoff-task-loop` plugins |
+| 2 | `handoff_init(project_name: "<name>", preset: "beginner")` | A `.handoff/` directory, with the [beginner preset](#beginner-preset-and-onboarding) applied |
+| 3 | `handoff-mcp setup` | `CLAUDE.md` with the project sections, and the server entry in `.mcp.json` |
+| 4 | `handoff_doctor` | The [readiness check](#readiness-check): what is still missing, and what to do about it |
+| 5 | `/brainstorm-loop` | A brainstorm report: what to build and for whom |
+| 6 | `/requirement-loop` | Requirements with acceptance criteria, and the tasks to work on |
+| 7 | `/session-loop` | Tasks implemented and tested by agents, ending in `done` |
+
+Lost on the way? `handoff_next_step` (or `handoff-mcp next-step` in a terminal)
+names the one operation to do next; see [Next step](#next-step).
+
+### The session cycle
+
+Adding handoff to work you already do takes only the session cycle:
+
 1. **Initialize** a project:
 
    The agent calls `handoff_init` with your project name. This creates a `.handoff/` directory:
@@ -474,8 +500,8 @@ manual configuration alternative.
    ```
    .handoff/
    ├── config.toml      # Project settings
-   ├── sessions/        # Session history (TOML files)
-   └── tasks/           # Task tree (directories + TOML files)
+   ├── sessions/        # Session history (JSON files)
+   └── tasks/           # Task tree (directories + JSON files)
    ```
 
 2. **Load context** at session start — the agent calls `handoff_load_context`. If `session_guidance` is returned, the agent establishes an active session via `handoff_save_context` with `session_status: "active"` before starting work.
@@ -1275,6 +1301,9 @@ from the **AI-effort hours** used in scheduling and metrics:
 - A dependency on a task ID that does not exist yet is accepted with a
   `DANGLING_DEPENDENCY` warning, which also notes that the dependency may become
   circular if that ID is later assigned to a different task.
+- A task milestone (`schedule.milestone`) that has no `[milestones.<name>]`
+  definition in `config.toml` is accepted with an `UNKNOWN_MILESTONE` warning.
+  Check the spelling, or define the milestone with `handoff_add_milestone`.
 
 Both keys are set with `handoff_update_config` (for example
 `settings.schedule_stale_notice`) and must be booleans.
@@ -1556,10 +1585,12 @@ This repository includes skill files that make handoff behavior automatic in Cla
 | Skill | Purpose |
 |-------|---------|
 | `handoff` | Core session lifecycle, task management, metrics, scheduling |
+| `handoff-getting-started` | First steps: from an empty directory to one finished task, in seven steps |
 | `handoff-load` | Quick session-start procedure |
 | `handoff-docs` | Document management — save, search, verify, import, family tree |
 | `handoff-trace` | V-model traceability — setup, coverage, suspects, verification campaigns, approval, baselines, reports |
 | `handoff-requirements` | Writing V-model items — IDs, attributes, acceptance criteria, templates, requirement trees |
+| `handoff-gui-requirements` | GUI requirements — from brainstorm to a recorded visual regression verdict |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
 | `handoff-report-schedule` | Recurring weekly / monthly reports via `/schedule` (cloud agents), cron examples, PDF re-rendering of past reports |
 | `handoff-refer` | Cross-project referrals |
