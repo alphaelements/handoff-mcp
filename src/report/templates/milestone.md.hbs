@@ -22,12 +22,12 @@
 {{#if data.charts}}
 ## Charts
 
-{{#if data.charts.timeline}}
-### Timeline
+{{#each data.charts}}
+### {{chart_title @key}}
 
-{{{data.charts.timeline}}}
+{{{this}}}
 
-{{/if}}
+{{/each}}
 {{/if}}
 
 ## Tasks

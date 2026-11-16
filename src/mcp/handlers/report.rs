@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 use super::doc_export::{self, PdfOptions, PdfSource, FORMAT_PDF};
 use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
-use crate::report::period::{parse_date, Period};
 use crate::report::sections::{self, SectionSpec};
 use crate::report::store::{self, RenderOptions};
 use crate::report::trace_diagram::{self, TraceDiagram};
@@ -415,17 +414,6 @@ fn generate(
 /// images cannot be generated.
 const CHART_UNAVAILABLE_NOTE: &str = "VSCode拡張が未起動のためチャート画像を生成できませんでした";
 
-/// Chart name to [`ChartView`](crate::charts::file_channel::ChartView) mapping
-/// for the file channel request.
-fn chart_view_for_name(name: &str) -> crate::charts::file_channel::ChartView {
-    use crate::charts::file_channel::ChartView;
-    match name {
-        "burndown" | "velocity" | "cumulative_hours" | "coverage" => ChartView::Metrics,
-        "timeline" => ChartView::Gantt,
-        _ => ChartView::Metrics,
-    }
-}
-
 /// Adds the report type's charts to `data.charts` for the templates to render.
 /// Each chart value is either a `![](path)` image reference (when the VSCode
 /// extension rendered the chart) or a fallback note (when it did not respond).
@@ -440,102 +428,116 @@ fn chart_view_for_name(name: &str) -> crate::charts::file_channel::ChartView {
 fn with_charts(
     ctx: &HandlerContext,
     report_type: ReportType,
-    scope: &ReportScope,
+    _scope: &ReportScope,
     mut data: Value,
     filter: &ChartFilter,
 ) -> Result<Value> {
     if data.get("charts").is_some() {
         return Ok(data);
     }
+
+    // Check whether the report type + data warrant charts at all.
+    // This reuses build_charts' data checks so report types without
+    // meaningful data (e.g. effort with no time logged) skip the file
+    // channel entirely.
     let progress = matches!(report_type, ReportType::Weekly | ReportType::Monthly);
-    // Weekly/monthly generation resolved the period into scope.from/to.
-    let period = match (&scope.from, &scope.to) {
-        (Some(from), Some(to)) if progress => {
-            Some(Period::new(parse_date(from)?, parse_date(to)?)?)
-        }
-        _ => None,
-    };
     let tasks = if progress {
         all_tasks(ctx)?
     } else {
         Vec::new()
     };
-    // Determine which charts this report type needs.
-    let mut needed = charts::build_charts(report_type, &data, &tasks, period);
-
-    // Apply the chart filter.
-    let mut chart_warnings: Vec<String> = Vec::new();
-    if let ChartFilter::Ids(ids) = filter {
-        // Warn about unknown chart IDs.
-        for id in ids {
-            if !needed.contains_key(id) {
-                chart_warnings.push(format!(
-                    "Unknown chart ID '{id}' ignored (available: {})",
-                    needed.keys().cloned().collect::<Vec<_>>().join(", ")
-                ));
-            }
-        }
-        // Keep only the requested IDs.
-        needed.retain(|name, _| ids.iter().any(|id| id == name));
-    }
-
-    if needed.is_empty() {
-        // Push chart warnings into data.warnings even when no charts remain.
-        for w in &chart_warnings {
-            crate::report::push_data_warning(&mut data, w.clone())?;
-        }
+    let needed = charts::build_charts(report_type, &data, &tasks, None);
+    if needed.is_empty() && !progress {
         return Ok(data);
     }
 
-    // Build file channel requests for each chart.
+    // Determine which view to request from the VSCode extension.
+    let view = match report_type {
+        ReportType::Weekly
+        | ReportType::Monthly
+        | ReportType::Effort
+        | ReportType::Completion
+        | ReportType::Daily
+        | ReportType::Quarterly
+        | ReportType::Yearly => crate::charts::file_channel::ChartView::Metrics,
+        ReportType::Verification => crate::charts::file_channel::ChartView::Metrics,
+        ReportType::Milestone => crate::charts::file_channel::ChartView::Gantt,
+        ReportType::Inspection | ReportType::Defect => {
+            return Ok(data);
+        }
+    };
+
     use crate::charts::file_channel::{self, ChartFormat, ChartRequest, ChartResult};
     let charts_dir = ctx.handoff_dir.join("charts/output");
     if !charts_dir.exists() {
         std::fs::create_dir_all(&charts_dir)?;
     }
 
-    let requests: Vec<(String, ChartRequest)> = needed
-        .keys()
-        .map(|name| {
-            let output_path = charts_dir
-                .join(format!("{name}.png"))
-                .to_string_lossy()
-                .to_string();
-            (
-                name.clone(),
-                ChartRequest {
-                    view: chart_view_for_name(name),
-                    format: ChartFormat::Png,
-                    filters: serde_json::json!({
-                        "report_type": report_type.as_str(),
-                        "chart_name": name,
-                    }),
-                    output_path,
-                },
-            )
-        })
-        .collect();
-
-    let req_list: Vec<ChartRequest> = requests.iter().map(|(_, r)| r.clone()).collect();
+    // Send one SVG request per view; the extension returns all charts for that
+    // view in a single response (each as a separate file in output_paths).
+    let request = ChartRequest {
+        view,
+        format: ChartFormat::Svg,
+        filters: serde_json::json!({
+            "report_type": report_type.as_str(),
+        }),
+        output_path: charts_dir.to_string_lossy().to_string(),
+    };
     let per_timeout = file_channel::per_chart_timeout();
-    let tot_timeout = file_channel::total_timeout();
-    let results =
-        file_channel::request_charts(&ctx.handoff_dir, &req_list, per_timeout, tot_timeout)?;
+    let result = file_channel::request_chart(&ctx.handoff_dir, &request, per_timeout)?;
 
+    let output_paths = match &result {
+        ChartResult::Success { output_paths } | ChartResult::Partial { output_paths, .. }
+            if !output_paths.is_empty() =>
+        {
+            output_paths.clone()
+        }
+        _ => {
+            // Timeout or error: no charts available.
+            let mut chart_values = serde_json::Map::new();
+            chart_values.insert(
+                "unavailable".to_string(),
+                Value::String(CHART_UNAVAILABLE_NOTE.to_string()),
+            );
+            data["charts"] = Value::Object(chart_values);
+            if let ChartFilter::Ids(ids) = filter {
+                for id in ids {
+                    crate::report::push_data_warning(
+                        &mut data,
+                        format!("Unknown chart ID '{id}' ignored (no charts available)"),
+                    )?;
+                }
+            }
+            return Ok(data);
+        }
+    };
+
+    // Build chart map from all returned SVG files, keyed by file stem
+    // (e.g. "burndown_line.svg" → key "burndown_line").
     let mut chart_values = serde_json::Map::new();
-    for ((name, _), result) in requests.iter().zip(results.iter()) {
-        let value = match result {
-            ChartResult::Success { output_paths } | ChartResult::Partial { output_paths, .. }
-                if !output_paths.is_empty() =>
-            {
-                format!("![{}]({})", name, output_paths[0])
+    let mut chart_warnings: Vec<String> = Vec::new();
+    for path in &output_paths {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        chart_values.insert(
+            stem.to_string(),
+            Value::String(format!("![{}]({})", stem, path)),
+        );
+    }
+
+    // Apply the chart filter.
+    if let ChartFilter::Ids(ids) = filter {
+        for id in ids {
+            if !chart_values.contains_key(id) {
+                chart_warnings.push(format!(
+                    "Unknown chart ID '{id}' ignored (available: {})",
+                    chart_values.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
             }
-            _ => {
-                // Timeout or error: insert fallback note.
-                CHART_UNAVAILABLE_NOTE.to_string()
-            }
-        };
-        chart_values.insert(name.clone(), Value::String(value));
+        }
+        chart_values.retain(|name, _| ids.iter().any(|id| id == name));
     }
     if !chart_values.is_empty() {
         data["charts"] = Value::Object(chart_values);

@@ -392,6 +392,29 @@ fn signed_helper(
     Ok(())
 }
 
+fn chart_title_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &HbContext,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> HelperResult {
+    let title = match h.param(0).and_then(|p| p.value().as_str()) {
+        Some("completion_donut") => "Completion",
+        Some("status_donut") => "Status Distribution",
+        Some("velocity_bar") => "Velocity (tasks/week)",
+        Some("burndown_line") => "Burndown",
+        Some("burnup_line") => "Burn-up",
+        Some("budget_donut") => "Effort Budget",
+        Some("coverage_trend") => "Coverage Trend",
+        Some("unavailable") => "Charts",
+        Some(other) => other,
+        None => "Chart",
+    };
+    out.write(title)?;
+    Ok(())
+}
+
 /// Appends `note` to the report data's `warnings` list (created when absent
 /// or null), which the templates render as their warnings section. A
 /// `warnings` of any other type is the caller's `data` mistake: an error
@@ -458,6 +481,7 @@ impl ReportEngine {
         registry.register_helper("cell", Box::new(cell_helper));
         registry.register_helper("percent", Box::new(percent_helper));
         registry.register_helper("signed", Box::new(signed_helper));
+        registry.register_helper("chart_title", Box::new(chart_title_helper));
         for (name, source) in BUILTIN_TEMPLATES {
             registry
                 .register_template_string(name, source)

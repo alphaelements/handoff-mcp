@@ -23,18 +23,12 @@
 {{#if data.charts}}
 ## Charts
 
-{{#if data.charts.burndown}}
-### Burndown
+{{#each data.charts}}
+### {{chart_title @key}}
 
-{{{data.charts.burndown}}}
+{{{this}}}
 
-{{/if}}
-{{#if data.charts.velocity}}
-### Velocity
-
-{{{data.charts.velocity}}}
-
-{{/if}}
+{{/each}}
 {{/if}}
 
 ## Completed Tasks

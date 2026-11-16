@@ -30,12 +30,12 @@
 {{#if data.charts}}
 ## Charts
 
-{{#if data.charts.cumulative_hours}}
-### Cumulative Hours
+{{#each data.charts}}
+### {{chart_title @key}}
 
-{{{data.charts.cumulative_hours}}}
+{{{this}}}
 
-{{/if}}
+{{/each}}
 {{/if}}
 
 ## Hours by Period
