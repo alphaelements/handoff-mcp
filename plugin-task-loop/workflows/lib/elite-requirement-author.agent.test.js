@@ -62,7 +62,7 @@ async function eliteLaunch(extraArgs = {}) {
   const agent = async (prompt, opts) => { launch = { prompt, opts }; return null; };
   const fn = new AsyncFunction('args', 'agent', 'phase', 'parallel', 'log', src);
   await fn(
-    { profile: 'elite', scopes: [{ id: 's1', title: 'Auth' }], parent_task_id: 't-parent', ...extraArgs },
+    { profile: 'elite', elite_confirmed: true, scopes: [{ id: 's1', title: 'Auth' }], parent_task_id: 't-parent', ...extraArgs },
     agent,
     () => {},
     async (thunks) => Promise.all(thunks.map((t) => t())),

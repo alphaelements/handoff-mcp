@@ -56,7 +56,7 @@ async function workflowResultKeys() {
   const src = WORKFLOW.replace(/^export const meta/m, 'const meta');
   const fn = new AsyncFunction('args', 'agent', 'phase', 'parallel', 'log', src);
   const result = await fn(
-    { profile: 'elite', topic: 'T', scope_items: [{ id: 'BS-SCOPE-001', title: 'A' }] },
+    { profile: 'elite', elite_confirmed: true, topic: 'T', scope_items: [{ id: 'BS-SCOPE-001', title: 'A' }] },
     async () => null,
     () => {},
     async (thunks) => Promise.all(thunks.map((t) => t())),

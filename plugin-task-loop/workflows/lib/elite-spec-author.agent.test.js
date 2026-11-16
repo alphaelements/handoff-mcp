@@ -66,6 +66,7 @@ async function eliteLaunch() {
   await fn(
     {
       profile: 'elite',
+      elite_confirmed: true,
       topic: 'Sensor app',
       scope_items: [{ id: 'BS-SCOPE-001', title: 'Pair a sensor' }],
       screens: [{ id: 'pairing', name: 'Pairing' }],

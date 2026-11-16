@@ -87,6 +87,7 @@ const {
   additional_instructions,
   profile,
   elite_model,
+  elite_confirmed,
   tech_investigations,
   skip_regulatory,
   max_regulatory_investigators,
@@ -133,6 +134,16 @@ function resolveProfile(value) {
   );
 }
 
+function requireEliteConfirmation(resolvedProfile, eliteConfirmed, workflowName) {
+  if (resolvedProfile === 'elite' && eliteConfirmed !== true) {
+    throw new Error(
+      `${workflowName || 'workflow'}: elite profile requires explicit user confirmation. ` +
+        `Pass elite_confirmed: true in args to acknowledge that elite (Fable model, 3-5x cost) ` +
+        `was requested by the user. Without it, elite cannot be selected.`,
+    );
+  }
+}
+
 /** Does one agent run the whole investigation under this profile? Throws on an unknown profile. */
 function isSingleAgentProfile(value) {
   return SINGLE_AGENT_PROFILES.includes(resolveProfile(value));
@@ -140,6 +151,7 @@ function isSingleAgentProfile(value) {
 // --- END COPY: profile-core ---
 
 const PROFILE = resolveProfile(profile);
+requireEliteConfirmation(PROFILE, elite_confirmed, 'brainstorm-execute');
 
 // Does ONE elite-investigator replace Stream A and Stream B (`elite`)? The other
 // profiles differ only in how deep a development session goes, which this

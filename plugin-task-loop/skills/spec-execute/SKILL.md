@@ -410,6 +410,7 @@ Workflow({
     ux_policy: ['<policy line>'],
     output_dir: '.handoff/exports/spec-<topic-slug>/mocks',
     response_language: '<user language>',
+    elite_confirmed: true,       // required — confirms the user explicitly requested elite
     // elite_model: '<model>',   // only when the user names a model for this run
   },
 });
@@ -429,6 +430,7 @@ Workflow({
 | `previous_output` | re-run | the result the feedback is about (pass the previous run's `architecture` / `gui` / `use_cases` / `draft_spec`) |
 | `approved` | re-run | areas the user already approved, kept as they are: `{ architecture, gui, use_cases }`, each the approved `report` text |
 | `response_language` | no | the user's language (default `English`) |
+| `elite_confirmed` | yes | must be `true` — confirms the user explicitly requested elite. Without it, the workflow rejects the profile |
 | `elite_model` | no | model of the `elite-spec-author` (default `fable`). Pass it only when the user names one |
 
 `resumeFromRunId` does not inherit `args`: pass the same object again when resuming a run.

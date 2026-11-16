@@ -69,6 +69,7 @@ const {
   scopes,
   profile,
   elite_model,
+  elite_confirmed,
   max_rounds,
   skip_register,
   stop_after,
@@ -111,6 +112,16 @@ function resolveProfile(value) {
     `requirement-execute: unknown profile ${JSON.stringify(value)}. ` +
       `Expected one of: ${PROFILES.join(', ')}.`,
   );
+}
+
+function requireEliteConfirmation(resolvedProfile, eliteConfirmed, workflowName) {
+  if (resolvedProfile === 'elite' && eliteConfirmed !== true) {
+    throw new Error(
+      `${workflowName || 'workflow'}: elite profile requires explicit user confirmation. ` +
+        `Pass elite_confirmed: true in args to acknowledge that elite (Fable model, 3-5x cost) ` +
+        `was requested by the user. Without it, elite cannot be selected.`,
+    );
+  }
 }
 
 /** Does one agent run every stage under this profile? Throws on an unknown profile. */
@@ -205,6 +216,7 @@ function validateArgs() {
 // pipeline for a misspelled 'elite', or the reverse, under a name the caller did
 // not ask for.
 const PROFILE = resolveProfile(profile);
+requireEliteConfirmation(PROFILE, elite_confirmed, 'requirement-execute');
 // Does ONE agent run every stage (`elite`)? Then nothing of the multi-agent
 // pipeline below may launch, or an elite run would be the ordinary pipeline
 // under the elite name. The other profiles differ only in how deep a development

@@ -83,6 +83,7 @@ const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});
 const {
   profile,
   elite_model,
+  elite_confirmed,
   topic,
   scope_items,
   constraints,
@@ -117,6 +118,16 @@ function resolveProfile(value) {
     `spec-execute: unknown profile ${JSON.stringify(value)}. ` +
       `Expected one of: ${PROFILES.join(', ')}.`,
   );
+}
+
+function requireEliteConfirmation(resolvedProfile, eliteConfirmed, workflowName) {
+  if (resolvedProfile === 'elite' && eliteConfirmed !== true) {
+    throw new Error(
+      `${workflowName || 'workflow'}: elite profile requires explicit user confirmation. ` +
+        `Pass elite_confirmed: true in args to acknowledge that elite (Fable model, 3-5x cost) ` +
+        `was requested by the user. Without it, elite cannot be selected.`,
+    );
+  }
 }
 
 /** Does one agent generate every artifact under this profile? Throws on an unknown profile. */
@@ -190,6 +201,7 @@ function asList(value) {
 // The profile decides whether this workflow runs at all, so it is resolved
 // first. An unknown value is an error, never a fallback.
 const PROFILE = resolveProfile(profile);
+requireEliteConfirmation(PROFILE, elite_confirmed, 'spec-execute');
 if (!isSingleAgentProfile(PROFILE)) {
   // The multi-agent profiles hand each phase's APPROVED output to the next
   // agent, with a user gate in between. One workflow run cannot hold those
