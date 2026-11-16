@@ -228,12 +228,26 @@ pub fn request_chart(
 }
 
 /// Poll for a response file at `path` with `timeout`.
+///
+/// JSON parse errors, unknown status values and missing required fields are
+/// caught and returned as [`ChartResult::Error`] instead of propagating up,
+/// so a single broken response never aborts the entire report (SPEC-VIS-004).
 fn poll_response(path: &Path, timeout: Duration) -> Result<ChartResult> {
     let deadline = Instant::now() + timeout;
     loop {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            let response: ChartResponse = serde_json::from_str(&content)?;
+            let response: ChartResponse = match serde_json::from_str(&content) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(ChartResult::Error {
+                        errors: vec![ChartError {
+                            code: "PARSE_ERROR".into(),
+                            message: format!("Failed to parse chart response JSON: {e}"),
+                        }],
+                    });
+                }
+            };
             return Ok(match response.status {
                 ChartResponseStatus::Success => ChartResult::Success {
                     output_paths: response.output_paths,
@@ -561,5 +575,98 @@ mod tests {
             output_path: String::new(),
         };
         assert!(request_chart(&handoff, &req, Duration::from_millis(50)).is_err());
+    }
+
+    // --- Error resilience tests (SPEC-VIS-004) ---
+
+    #[test]
+    fn broken_json_response_returns_chart_error_not_propagated() {
+        let (_dir, handoff) = tmp_handoff();
+        let req = sample_request();
+        ensure_dirs(&handoff).unwrap();
+
+        let requests_dir = handoff.join(REQUESTS_SUBDIR);
+        let responses_dir = handoff.join(RESPONSES_SUBDIR);
+
+        let handle = std::thread::spawn(move || {
+            let uuid = wait_for_request_file(&requests_dir);
+            let path = responses_dir.join(format!("{uuid}.json"));
+            std::fs::write(&path, "this is not valid JSON{{{").unwrap();
+        });
+
+        let result = request_chart(&handoff, &req, Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+
+        match result {
+            ChartResult::Error { errors } => {
+                assert!(!errors.is_empty(), "should have at least one error");
+                assert!(
+                    errors[0].message.contains("JSON")
+                        || errors[0].message.contains("parse")
+                        || errors[0].message.contains("json"),
+                    "error should mention JSON parsing: {:?}",
+                    errors[0].message
+                );
+            }
+            other => panic!("expected ChartResult::Error for broken JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_status_in_response_returns_chart_error() {
+        let (_dir, handoff) = tmp_handoff();
+        let req = sample_request();
+        ensure_dirs(&handoff).unwrap();
+
+        let requests_dir = handoff.join(REQUESTS_SUBDIR);
+        let responses_dir = handoff.join(RESPONSES_SUBDIR);
+
+        let handle = std::thread::spawn(move || {
+            let uuid = wait_for_request_file(&requests_dir);
+            let path = responses_dir.join(format!("{uuid}.json"));
+            // Valid JSON but unknown status value
+            std::fs::write(
+                &path,
+                r#"{"status":"unknown_status","output_paths":[],"errors":[]}"#,
+            )
+            .unwrap();
+        });
+
+        let result = request_chart(&handoff, &req, Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+
+        match result {
+            ChartResult::Error { errors } => {
+                assert!(!errors.is_empty());
+            }
+            other => panic!("expected ChartResult::Error for unknown status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_fields_in_response_returns_chart_error() {
+        let (_dir, handoff) = tmp_handoff();
+        let req = sample_request();
+        ensure_dirs(&handoff).unwrap();
+
+        let requests_dir = handoff.join(REQUESTS_SUBDIR);
+        let responses_dir = handoff.join(RESPONSES_SUBDIR);
+
+        let handle = std::thread::spawn(move || {
+            let uuid = wait_for_request_file(&requests_dir);
+            let path = responses_dir.join(format!("{uuid}.json"));
+            // Missing 'status' field entirely
+            std::fs::write(&path, r#"{"output_paths":[]}"#).unwrap();
+        });
+
+        let result = request_chart(&handoff, &req, Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+
+        match result {
+            ChartResult::Error { errors } => {
+                assert!(!errors.is_empty());
+            }
+            other => panic!("expected ChartResult::Error for missing fields, got {other:?}"),
+        }
     }
 }

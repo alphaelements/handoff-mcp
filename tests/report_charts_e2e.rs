@@ -346,3 +346,97 @@ fn caller_supplied_charts_in_data_win() {
     // Only burndown was supplied, so velocity should not appear.
     assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
 }
+
+// --- charts parameter: ID list and "none" (SPEC-VIS-006/007) ---
+
+#[test]
+fn charts_none_excludes_all_charts() {
+    let (dir, pd) = setup();
+    seed_progress(&dir);
+    let (_, md) = generate(
+        &dir,
+        &pd,
+        "weekly",
+        json!({ "period": "2026-W41" }),
+        json!({ "charts": "none" }),
+    );
+    // "none" means no charts at all — same as include_charts: false.
+    assert!(!md.contains("## Charts"), "{md}");
+    assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+}
+
+#[test]
+fn charts_empty_array_behaves_like_none() {
+    let (dir, pd) = setup();
+    seed_progress(&dir);
+    let (_, md) = generate(
+        &dir,
+        &pd,
+        "weekly",
+        json!({ "period": "2026-W41" }),
+        json!({ "charts": [] }),
+    );
+    assert!(!md.contains("## Charts"), "{md}");
+    assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+}
+
+#[test]
+fn charts_id_list_filters_to_selected_charts() {
+    let (dir, pd) = setup();
+    seed_progress(&dir);
+    // Weekly normally produces burndown + velocity. Request only burndown.
+    let (out, md) = generate(
+        &dir,
+        &pd,
+        "weekly",
+        json!({ "period": "2026-W41" }),
+        json!({ "charts": ["burndown"] }),
+    );
+    // burndown requested and available -> fallback note (no VSCode).
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+    // The report's data.charts should have only burndown, not velocity.
+    let report_id = out["report"]["report_id"].as_str().unwrap();
+    let body_path = handoff(&dir).join(format!("reports/{report_id}.md"));
+    let body = std::fs::read_to_string(body_path).unwrap();
+    // Only one chart should appear (burndown), not two.
+    assert!(
+        body.matches(CHART_UNAVAILABLE_NOTE).count() == 1,
+        "expected exactly 1 fallback note (burndown only), got {} in:\n{body}",
+        body.matches(CHART_UNAVAILABLE_NOTE).count()
+    );
+}
+
+#[test]
+fn charts_unknown_id_produces_warning() {
+    let (dir, pd) = setup();
+    seed_progress(&dir);
+    let (_out, md) = generate(
+        &dir,
+        &pd,
+        "weekly",
+        json!({ "period": "2026-W41" }),
+        json!({ "charts": ["nonexistent_chart"] }),
+    );
+    // The report body should contain a warning about the unknown chart ID.
+    assert!(
+        md.contains("nonexistent_chart"),
+        "expected a warning about unknown chart ID 'nonexistent_chart' in report body:\n{md}"
+    );
+}
+
+#[test]
+fn charts_null_includes_all_charts() {
+    let (dir, pd) = setup();
+    seed_progress(&dir);
+    // null should behave the same as absent: include all.
+    let (_, md) = generate(
+        &dir,
+        &pd,
+        "weekly",
+        json!({ "period": "2026-W41" }),
+        json!({ "charts": null }),
+    );
+    // Default: all charts included, fallback notes present.
+    assert!(md.contains("## Charts"), "{md}");
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+}
