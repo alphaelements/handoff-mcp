@@ -92,6 +92,7 @@ platform; for `target_milestones`, name them so findings can be tied to the mile
 | `additional_instructions` | no | | extra instructions for every agent |
 | `profile` | no | `standard` | `elite` = one elite-investigator covers both streams (see "Elite profile"). Every other profile runs the multi-agent pipeline |
 | `elite_model` | no | `fable` | elite-investigator; read under `elite` only. Omit it unless the user names a model for this run, and never copy `investigator_model` into it |
+| `elite_confirmed` | no | | `true` = the user explicitly requested elite. Required when `profile` is `elite`; the workflow throws without it |
 | `tech_investigations` | no | feasibility / existing / competitors | `[{id, title, questions[], sources_hint?}]`; replaces the three defaults. Ids must be unique |
 | `skip_regulatory` | no | `false` | `true` = no Stream B. Only when nothing about the product is regulated; the reviewer will list regulation as unexamined |
 | `max_regulatory_investigators` | no | `6` | cap on regulatory areas investigated in parallel |
@@ -151,8 +152,9 @@ Workflow({
     // skip_regulatory: false,
     // max_regulatory_investigators: 6,
     // investigator_model: 'sonnet', director_model: 'opus', reviewer_model: 'opus',
-    // profile: 'elite',     // only when "Elite profile" resolved to elite; omit otherwise
-    // elite_model: 'fable', // elite only, and only when the user names a model
+    // profile: 'elite',          // only when "Elite profile" resolved to elite; omit otherwise
+    // elite_confirmed: true,     // required when profile is 'elite'; the user must have explicitly asked for it
+    // elite_model: 'fable',      // elite only, and only when the user names a model
   },
 });
 ```

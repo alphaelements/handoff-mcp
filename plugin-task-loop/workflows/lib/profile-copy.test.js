@@ -32,14 +32,14 @@ function loadCopy(workflow) {
   assert.equal(lines.filter((l) => l === END).length, 1, `${workflow}: exactly one END COPY marker`);
   const block = lines.slice(lines.indexOf(BEGIN) + 1, lines.indexOf(END)).join('\n');
   return new Function(
-    `${block}\nreturn { PROFILES, DEFAULT_PROFILE, SINGLE_AGENT_PROFILES, resolveProfile, isSingleAgentProfile };`,
+    `${block}\nreturn { PROFILES, DEFAULT_PROFILE, SINGLE_AGENT_PROFILES, resolveProfile, isSingleAgentProfile, requireEliteConfirmation };`,
   )();
 }
 
 /** What a call produced: its value, or the message it threw with. */
-function outcome(fn, input) {
+function outcome(fn, input, opts) {
   try {
-    return { value: fn(input) };
+    return { value: fn(input, opts) };
   } catch (e) {
     return { error: e.message };
   }
@@ -85,8 +85,26 @@ test('the guard itself notices a copy that falls behind the lib', () => {
   const copy = loadCopy(WORKFLOWS[0]);
   const stale = { ...copy, PROFILES: copy.PROFILES.filter((p) => p !== 'elite') };
   assert.notDeepEqual(stale.PROFILES, lib.PROFILES);
-  // An input the lib accepts and a profile-less copy would reject.
+  // resolveProfile('elite') succeeds (it only validates the name)
   assert.deepEqual(outcome(lib.resolveProfile, 'elite'), { value: 'elite' });
   assert.equal(copy.isSingleAgentProfile('elite'), true);
   assert.equal(copy.isSingleAgentProfile('full'), false);
+});
+
+test('requireEliteConfirmation blocks elite without user confirmation', () => {
+  // lib version
+  assert.throws(() => lib.requireEliteConfirmation('elite', false, 'test'), /elite profile requires explicit user confirmation/);
+  assert.throws(() => lib.requireEliteConfirmation('elite', undefined, 'test'), /elite profile requires explicit user confirmation/);
+  assert.doesNotThrow(() => lib.requireEliteConfirmation('elite', true, 'test'));
+  assert.doesNotThrow(() => lib.requireEliteConfirmation('standard', false, 'test'));
+  assert.doesNotThrow(() => lib.requireEliteConfirmation('full', undefined, 'test'));
+
+  // copy versions
+  for (const workflow of WORKFLOWS) {
+    const copy = loadCopy(workflow);
+    assert.ok(typeof copy.requireEliteConfirmation === 'function', `${workflow}: requireEliteConfirmation must be exported`);
+    assert.throws(() => copy.requireEliteConfirmation('elite', false, workflow), /elite profile requires explicit user confirmation/);
+    assert.doesNotThrow(() => copy.requireEliteConfirmation('elite', true, workflow));
+    assert.doesNotThrow(() => copy.requireEliteConfirmation('standard', false, workflow));
+  }
 });

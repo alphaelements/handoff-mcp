@@ -112,6 +112,7 @@ const {
   additional_instructions,
   profile,
   elite_model,
+  elite_confirmed,
   facets,
   investigator_assignments,
   verifier_assignments,
@@ -147,6 +148,16 @@ function resolveProfile(value) {
   );
 }
 
+function requireEliteConfirmation(resolvedProfile, eliteConfirmed, workflowName) {
+  if (resolvedProfile === 'elite' && eliteConfirmed !== true) {
+    throw new Error(
+      `${workflowName || 'workflow'}: elite profile requires explicit user confirmation. ` +
+        `Pass elite_confirmed: true in args to acknowledge that elite (Fable model, 3-5x cost) ` +
+        `was requested by the user. Without it, elite cannot be selected.`,
+    );
+  }
+}
+
 /** Does one agent run the whole research cycle under this profile? Throws on an unknown profile. */
 function isSingleAgentProfile(value) {
   return SINGLE_AGENT_PROFILES.includes(resolveProfile(value));
@@ -154,6 +165,7 @@ function isSingleAgentProfile(value) {
 // --- END COPY: profile-core ---
 
 const PROFILE = resolveProfile(profile);
+requireEliteConfirmation(PROFILE, elite_confirmed, 'research-execute');
 
 // Does ONE elite-researcher run the whole cycle (`elite`)? The other profiles
 // differ only in how deep a development session goes, which this workflow has no

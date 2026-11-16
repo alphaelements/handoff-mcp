@@ -290,7 +290,10 @@ export const WORKFLOW_NAMES = Object.keys(WORKFLOWS);
 /** Args of `workflow` under `profile`. `undefined` leaves the key out altogether. */
 export function argsFor(workflow, profile, over = {}) {
   const base = WORKFLOWS[workflow].args();
-  return profile === undefined ? { ...base, ...over } : { ...base, profile, ...over };
+  const profileArgs = profile === undefined ? {} : { profile };
+  const isElite = typeof profile === 'string' && profile.trim().toLowerCase() === 'elite';
+  const eliteArgs = isElite ? { elite_confirmed: true } : {};
+  return { ...base, ...profileArgs, ...eliteArgs, ...over };
 }
 
 /**

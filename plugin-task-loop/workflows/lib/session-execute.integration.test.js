@@ -179,7 +179,16 @@ async function runWorkflow(
     'args', 'agent', 'phase', 'parallel', 'log', 'pipeline', 'budget', 'workflow',
     src,
   );
-  const result = await fn(argsObj, agent, () => {}, parallel, () => {}, pipeline, null, null);
+  let effectiveArgs = argsObj;
+  if (typeof argsObj === 'string') {
+    const parsed = JSON.parse(argsObj);
+    if (typeof parsed.profile === 'string' && parsed.profile.trim().toLowerCase() === 'elite') {
+      effectiveArgs = JSON.stringify({ ...parsed, elite_confirmed: true });
+    }
+  } else if (typeof argsObj.profile === 'string' && argsObj.profile.trim().toLowerCase() === 'elite') {
+    effectiveArgs = { ...argsObj, elite_confirmed: true };
+  }
+  const result = await fn(effectiveArgs, agent, () => {}, parallel, () => {}, pipeline, null, null);
   return { ...result, calls, prompts, agentOpts };
 }
 
@@ -237,7 +246,16 @@ async function runWorkflowStaged(argsObj, { onTester, onReview } = {}, { onDev }
   const fn = new AsyncFunction(
     'args', 'agent', 'phase', 'parallel', 'log', 'pipeline', 'budget', 'workflow', src,
   );
-  const result = await fn(argsObj, agent, () => {}, parallel, () => {}, pipeline, null, null);
+  let effectiveArgs = argsObj;
+  if (typeof argsObj === 'string') {
+    const parsed = JSON.parse(argsObj);
+    if (typeof parsed.profile === 'string' && parsed.profile.trim().toLowerCase() === 'elite') {
+      effectiveArgs = JSON.stringify({ ...parsed, elite_confirmed: true });
+    }
+  } else if (typeof argsObj.profile === 'string' && argsObj.profile.trim().toLowerCase() === 'elite') {
+    effectiveArgs = { ...argsObj, elite_confirmed: true };
+  }
+  const result = await fn(effectiveArgs, agent, () => {}, parallel, () => {}, pipeline, null, null);
   return { ...result, calls, prompts };
 }
 

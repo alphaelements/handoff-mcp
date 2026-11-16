@@ -46,7 +46,7 @@ async function launchSchema() {
   const parallel = async (thunks) => Promise.all(thunks.map((t) => t()));
   await new AsyncFunction('args', 'agent', 'phase', 'parallel', 'log', src)(
     {
-      profile: 'elite', session_id: 's', research_topic: 't', output_type: 'technical_report',
+      profile: 'elite', elite_confirmed: true, session_id: 's', research_topic: 't', output_type: 'technical_report',
       facets: [{ id: 'f1', title: 'F', questions: ['q'] }],
     },
     agent, () => {}, parallel, () => {},

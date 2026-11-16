@@ -43,7 +43,7 @@ async function launchSchema() {
   };
   const parallel = async (thunks) => Promise.all(thunks.map((t) => t()));
   await new AsyncFunction('args', 'agent', 'phase', 'parallel', 'log', src)(
-    { profile: 'elite', brainstorm_id: 'bs-1', topic: 't', brainstorm_summary: 's' },
+    { profile: 'elite', elite_confirmed: true, brainstorm_id: 'bs-1', topic: 't', brainstorm_summary: 's' },
     agent, () => {}, parallel, () => {},
   );
   assert.ok(schema, 'the workflow must launch the elite-investigator with a schema');

@@ -136,7 +136,16 @@ async function run(argsObj, elite = okElite()) {
   };
   const parallel = async (thunks) => Promise.all(thunks.map((t) => t()));
   const fn = new AsyncFunction('args', 'agent', 'phase', 'parallel', 'log', src);
-  const result = await fn(argsObj, agent, (p) => phases.push(p), parallel, (m) => logs.push(m));
+  let effectiveArgs = argsObj;
+  if (typeof argsObj === 'string') {
+    const parsed = JSON.parse(argsObj);
+    if (typeof parsed.profile === 'string' && parsed.profile.trim().toLowerCase() === 'elite') {
+      effectiveArgs = JSON.stringify({ ...parsed, elite_confirmed: true });
+    }
+  } else if (typeof argsObj.profile === 'string' && argsObj.profile.trim().toLowerCase() === 'elite') {
+    effectiveArgs = { ...argsObj, elite_confirmed: true };
+  }
+  const result = await fn(effectiveArgs, agent, (p) => phases.push(p), parallel, (m) => logs.push(m));
   return { ...result, calls, logs, phases };
 }
 

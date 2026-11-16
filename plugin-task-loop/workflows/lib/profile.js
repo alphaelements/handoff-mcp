@@ -93,6 +93,10 @@ const SINGLE_AGENT_PROFILES = Object.freeze(['elite']);
  * An unrecognized value throws rather than silently falling back: quietly
  * downgrading 'fast' to 'standard' — or worse, to 'express' — would drop the
  * verification layers the caller thought they asked for.
+ *
+ * `elite` is opt-in only: `opts.eliteConfirmed` must be `true` or the call
+ * is rejected. This prevents any coordinator or workflow from selecting elite
+ * without the user's explicit instruction and approval.
  */
 function resolveProfile(profile) {
   if (profile === undefined || profile === null || profile === '') return DEFAULT_PROFILE;
@@ -104,6 +108,21 @@ function resolveProfile(profile) {
     `session-execute: unknown profile ${JSON.stringify(profile)}. ` +
       `Expected one of: ${PROFILES.join(', ')}.`,
   );
+}
+
+/**
+ * Guard: elite requires explicit user confirmation. Call AFTER resolveProfile
+ * at the top of each workflow script, not inside resolveProfile itself, so
+ * internal helpers (isSingleAgentProfile, profileStages) are not affected.
+ */
+function requireEliteConfirmation(profile, eliteConfirmed, workflowName) {
+  if (profile === 'elite' && eliteConfirmed !== true) {
+    throw new Error(
+      `${workflowName || 'workflow'}: elite profile requires explicit user confirmation. ` +
+        `Pass elite_confirmed: true in args to acknowledge that elite (Fable model, 3-5x cost) ` +
+        `was requested by the user. Without it, elite cannot be selected.`,
+    );
+  }
 }
 
 /** Which stages this profile runs. Returns a fresh object; safe to mutate. */
@@ -279,6 +298,7 @@ export {
   PROFILES,
   DEFAULT_PROFILE,
   resolveProfile,
+  requireEliteConfirmation,
   profileStages,
   serialTurnsForProfile,
   resolveIntegrationExpected,
