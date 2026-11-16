@@ -1,7 +1,9 @@
-//! REQ-PDF-031: `handoff_report generate` inserts Mermaid charts (burndown +
-//! velocity for weekly/monthly, coverage pie for verification, gantt for
-//! milestone, cumulative hours for effort) as ```mermaid blocks, controlled
-//! by `include_charts`.
+//! REQ-VIS-010 / REQ-VIS-011 / REQ-VIS-012: `handoff_report generate` inserts
+//! chart image references (via the file channel to VSCode) or fallback notes
+//! (when VSCode is not running), controlled by `include_charts`.
+//!
+//! In the test environment (no VSCode extension), all chart requests timeout
+//! and the reports contain fallback notes instead of images.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,6 +12,9 @@ use handoff_mcp::storage::tasks::{write_task, Schedule, TaskData};
 use handoff_mcp::storage::time_log::{append_time_log, TimeLogEntry};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+/// The fallback note text that appears when the VSCode extension is not running.
+const CHART_UNAVAILABLE_NOTE: &str = "VSCode拡張が未起動のためチャート画像を生成できませんでした";
 
 fn call(name: &str, arguments: Value) -> Value {
     let req = json!({
@@ -43,6 +48,8 @@ fn ok(name: &str, arguments: Value) -> Value {
 }
 
 fn setup() -> (TempDir, String) {
+    // Set timeout to 0 so chart requests fail instantly (no VSCode running).
+    std::env::set_var("HANDOFF_CHART_TIMEOUT_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let pd = dir.path().to_string_lossy().to_string();
     ok(
@@ -121,14 +128,6 @@ fn generate(
     (out, body)
 }
 
-/// Contents of every ```mermaid fence in `md`.
-fn mermaid_blocks(md: &str) -> Vec<String> {
-    md.split("```mermaid\n")
-        .skip(1)
-        .map(|rest| rest.split("```").next().unwrap().to_string())
-        .collect()
-}
-
 fn seed_progress(dir: &TempDir) {
     let h = handoff(dir);
     put_task(&h, "done", "t1", |d| {
@@ -141,7 +140,7 @@ fn seed_progress(dir: &TempDir) {
 }
 
 #[test]
-fn weekly_report_has_burndown_and_velocity_charts() {
+fn weekly_report_has_chart_fallback_notes_when_vscode_not_running() {
     let (dir, pd) = setup();
     seed_progress(&dir);
     let (_, md) = generate(
@@ -151,16 +150,15 @@ fn weekly_report_has_burndown_and_velocity_charts() {
         json!({ "period": "2026-W41" }),
         json!({}),
     );
-    let blocks = mermaid_blocks(&md);
-    assert_eq!(blocks.len(), 2, "{md}");
-    assert!(blocks[0].starts_with("xychart-beta\n"), "{md}");
-    assert!(blocks[0].contains("line [3, 2, 2, 1, 1, 1, 1]"), "{md}");
-    assert!(blocks[1].contains("bar [0, 0, 0, 2]"), "{md}");
+    // Without VSCode extension, fallback notes appear instead of images.
     assert!(md.contains("## Charts"), "{md}");
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+    // No mermaid fences should appear.
+    assert!(!md.contains("```mermaid"), "{md}");
 }
 
 #[test]
-fn monthly_report_has_burndown_and_velocity_charts() {
+fn monthly_report_has_chart_fallback_notes_when_vscode_not_running() {
     let (dir, pd) = setup();
     seed_progress(&dir);
     let (_, md) = generate(
@@ -170,10 +168,9 @@ fn monthly_report_has_burndown_and_velocity_charts() {
         json!({ "period": "2026-10" }),
         json!({}),
     );
-    let blocks = mermaid_blocks(&md);
-    assert_eq!(blocks.len(), 2, "{md}");
-    assert!(blocks[0].contains("title \"Burndown"), "{md}");
-    assert!(blocks[1].contains("\"2026-W40\", \"2026-W41\""), "{md}");
+    assert!(md.contains("## Charts"), "{md}");
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+    assert!(!md.contains("```mermaid"), "{md}");
 }
 
 #[test]
@@ -193,6 +190,7 @@ fn include_charts_false_leaves_the_report_without_charts() {
         );
         assert!(!md.contains("```mermaid"), "{md}");
         assert!(!md.contains("## Charts"), "{md}");
+        assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
     }
 }
 
@@ -215,20 +213,16 @@ fn include_charts_must_be_a_boolean_and_only_applies_to_generate() {
 }
 
 #[test]
-fn effort_report_has_a_cumulative_hours_chart() {
+fn effort_report_has_chart_fallback_note_when_vscode_not_running() {
     let (dir, pd) = setup();
     let h = handoff(&dir);
     put_task(&h, "done", "t1", |_| {});
     log(&h, "2026-10-06T10:00:00+00:00", "t1", 3.0);
     log(&h, "2026-10-08T10:00:00+00:00", "t1", 1.5);
     let (_, md) = generate(&dir, &pd, "effort", json!({}), json!({}));
-    let blocks = mermaid_blocks(&md);
-    assert_eq!(blocks.len(), 1, "{md}");
-    assert!(
-        blocks[0].contains("x-axis [\"2026-10-06\", \"2026-10-08\"]"),
-        "{md}"
-    );
-    assert!(blocks[0].contains("line [3, 4.5]"), "{md}");
+    assert!(md.contains("## Charts"), "{md}");
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+    assert!(!md.contains("```mermaid"), "{md}");
 
     let (_, md) = generate(
         &dir,
@@ -238,6 +232,7 @@ fn effort_report_has_a_cumulative_hours_chart() {
         json!({ "include_charts": false }),
     );
     assert!(!md.contains("```mermaid"), "{md}");
+    assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
 }
 
 #[test]
@@ -249,7 +244,7 @@ fn effort_report_without_time_logged_has_no_chart() {
 }
 
 #[test]
-fn milestone_report_has_a_gantt_chart() {
+fn milestone_report_has_chart_fallback_note_when_vscode_not_running() {
     let (dir, pd) = setup();
     let h = handoff(&dir);
     ok(
@@ -278,19 +273,9 @@ fn milestone_report_has_a_gantt_chart() {
         json!({ "milestone": "beta" }),
         json!({}),
     );
-    let blocks = mermaid_blocks(&md);
-    assert_eq!(blocks.len(), 1, "{md}");
-    let gantt = &blocks[0];
-    assert!(gantt.starts_with("gantt\n"), "{md}");
-    assert!(
-        gantt.contains("t1 Design API :done, t1, 2026-10-01, 2026-10-05"),
-        "{md}"
-    );
-    assert!(gantt.contains("t2 Title of t2 :t2, 2026-10-20, 1d"), "{md}");
-    assert!(
-        gantt.contains("beta :milestone, m1, 2026-10-31, 0d"),
-        "{md}"
-    );
+    assert!(md.contains("## Charts"), "{md}");
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+    assert!(!md.contains("```mermaid"), "{md}");
 
     let (_, md) = generate(
         &dir,
@@ -300,10 +285,11 @@ fn milestone_report_has_a_gantt_chart() {
         json!({ "include_charts": false }),
     );
     assert!(!md.contains("```mermaid"), "{md}");
+    assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
 }
 
 #[test]
-fn verification_report_has_a_coverage_pie() {
+fn verification_report_has_chart_fallback_note_when_vscode_not_running() {
     let (dir, pd) = setup();
     ok(
         "handoff_doc_save",
@@ -327,15 +313,11 @@ fn verification_report_has_a_coverage_pie() {
                 "ops": [{ "op": "record", "item": "AT-911", "result": "pass" }] }),
     );
     let scope = json!({ "layers": ["acceptance"] });
-    // The trace diagram (REQ-PDF-033) is a separate mermaid block.
     let no_diagram = json!({ "include_trace_diagram": false });
     let (_, md) = generate(&dir, &pd, "verification", scope.clone(), no_diagram);
-    let blocks = mermaid_blocks(&md);
-    assert_eq!(blocks.len(), 1, "{md}");
-    assert_eq!(
-        blocks[0],
-        "pie showData title Verification coverage\n    \"Pass\" : 1\n    \"Pending\" : 1\n"
-    );
+    // Fallback note for the coverage chart.
+    assert!(md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
+    assert!(!md.contains("```mermaid\npie"), "{md}");
 
     let (_, md) = generate(
         &dir,
@@ -345,6 +327,7 @@ fn verification_report_has_a_coverage_pie() {
         json!({ "include_charts": false, "include_trace_diagram": false }),
     );
     assert!(!md.contains("```mermaid"), "{md}");
+    assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
 }
 
 #[test]
@@ -356,12 +339,10 @@ fn caller_supplied_charts_in_data_win() {
         &pd,
         "weekly",
         json!({ "period": "2026-W41" }),
-        json!({ "data": { "charts": { "burndown": "pie title Custom\n    \"A\" : 1" } } }),
+        json!({ "data": { "charts": { "burndown": "![Custom](custom.png)" } } }),
     );
-    let blocks = mermaid_blocks(&md);
-    assert_eq!(
-        blocks,
-        vec!["pie title Custom\n    \"A\" : 1\n".to_string()],
-        "{md}"
-    );
+    // Caller-supplied chart data is used as-is.
+    assert!(md.contains("![Custom](custom.png)"), "{md}");
+    // Only burndown was supplied, so velocity should not appear.
+    assert!(!md.contains(CHART_UNAVAILABLE_NOTE), "{md}");
 }

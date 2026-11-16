@@ -475,6 +475,17 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 continue;
             }
 
+            // Reject `milestones.<name>.status`: milestone status changes
+            // must go through handoff_update_milestone, which enforces
+            // lifecycle transitions and the release guard (t454).
+            if is_milestone_status_key(key) {
+                anyhow::bail!(
+                    "Cannot set '{key}' via handoff_update_config. \
+                     Use handoff_update_milestone to change milestone status \
+                     (lifecycle transition and release_guard are enforced there)."
+                );
+            }
+
             // The generic raw-key path must enforce the same write-time
             // schedule_mode enum as handoff_update_calendar.
             if RAW_SCHEDULE_MODE_KEYS.contains(&key.as_str()) {
@@ -790,6 +801,16 @@ fn validate_trace_scalar_keys<'a>(
         }
     }
     Ok(())
+}
+
+/// Returns true when `key` matches the pattern `milestones.<name>.status`,
+/// i.e. it starts with `milestones.`, ends with `.status`, and has exactly
+/// three dot-separated parts.  Such keys must be rejected by
+/// `handoff_update_config` because writing them would bypass the lifecycle
+/// transition check and the release guard in `handoff_update_milestone`.
+fn is_milestone_status_key(key: &str) -> bool {
+    let parts: Vec<&str> = key.split('.').collect();
+    parts.len() == 3 && parts[0] == "milestones" && parts[2] == "status"
 }
 
 /// Deepest dotted key `handoff_update_config` accepts (`a.b.c.d`).
@@ -1121,6 +1142,73 @@ mod tests {
             assert!(err.contains(expected), "{updates}: {err}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{updates}");
         }
+    }
+
+    // --- milestones.*.status bypass guard (t454) ---
+
+    /// `milestones.<name>.status` must be rejected by `update_config` because
+    /// it bypasses the lifecycle transition check and the release guard that
+    /// `handoff_update_milestone` enforces. The error message should direct
+    /// the caller to use `handoff_update_milestone` instead.
+    #[test]
+    fn update_config_rejects_milestones_status_key() {
+        let (_tmp, ctx) = project();
+        // Seed a milestone so the table exists.
+        let path = ctx.handoff_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[project]\nname = \"p\"\n\n[milestones.v1]\ndate = \"2026-01-01\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for status_val in [json!("released"), json!("active"), json!("planning")] {
+            let err = handle_update(
+                &ctx,
+                &json!({ "updates": { "milestones.v1.status": status_val } }),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("handoff_update_milestone"),
+                "error should mention handoff_update_milestone: {msg}"
+            );
+            assert!(
+                msg.contains("milestones") && msg.contains("status"),
+                "error should mention the rejected key: {msg}"
+            );
+            // Config file must be untouched.
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "config must not be written for status_val={status_val}"
+            );
+        }
+    }
+
+    /// Other milestones subkeys (date, color, description, etc.) should still
+    /// pass through `update_config` without issue — only `status` is blocked.
+    #[test]
+    fn update_config_allows_non_status_milestone_keys() {
+        let (_tmp, ctx) = project();
+        let path = ctx.handoff_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[project]\nname = \"p\"\n\n[milestones.v1]\ndate = \"2026-01-01\"\n",
+        )
+        .unwrap();
+
+        let result = handle_update(
+            &ctx,
+            &json!({ "updates": { "milestones.v1.date": "2026-06-01" } }),
+        );
+        assert!(
+            result.is_ok(),
+            "non-status key should be accepted: {result:?}"
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("2026-06-01"), "date should be updated: {raw}");
     }
 
     /// A typed-key update re-serializes the whole config; `[release]` and the

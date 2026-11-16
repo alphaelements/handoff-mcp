@@ -41,6 +41,8 @@ fn ok(name: &str, arguments: Value) -> Value {
 }
 
 fn setup() -> (TempDir, String) {
+    // Skip file channel polling in tests (no VSCode extension running).
+    std::env::set_var("HANDOFF_CHART_TIMEOUT_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let pd = dir.path().to_string_lossy().to_string();
     ok(
@@ -161,8 +163,9 @@ fn verification_report_has_a_colour_coded_trace_diagram() {
     assert_eq!(node_class(&g, "AT-940"), "passing", "{g}");
     assert_eq!(node_class(&g, "AT-941"), "failing", "{g}");
     assert_eq!(node_class(&g, "REQ-941"), "not_run", "{g}");
-    // The coverage pie is still there next to it.
-    assert!(md.contains("pie showData"), "{md}");
+    // The coverage chart section is still there next to the diagram (as a
+    // fallback note when VSCode is not running).
+    assert!(md.contains("## Charts"), "{md}");
 }
 
 #[test]

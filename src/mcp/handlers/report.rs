@@ -338,9 +338,27 @@ fn generate(
     Ok(out)
 }
 
-/// Adds the report type's Mermaid charts (see [`charts`]) to `data.charts`
-/// for the templates to render. A `charts` key the caller passed in `data`
-/// is left alone, so a caller can supply or suppress charts themselves.
+/// Fallback note inserted when the VSCode extension is not running and chart
+/// images cannot be generated.
+const CHART_UNAVAILABLE_NOTE: &str = "VSCode拡張が未起動のためチャート画像を生成できませんでした";
+
+/// Chart name to [`ChartView`](crate::charts::file_channel::ChartView) mapping
+/// for the file channel request.
+fn chart_view_for_name(name: &str) -> crate::charts::file_channel::ChartView {
+    use crate::charts::file_channel::ChartView;
+    match name {
+        "burndown" | "velocity" | "cumulative_hours" | "coverage" => ChartView::Metrics,
+        "timeline" => ChartView::Gantt,
+        _ => ChartView::Metrics,
+    }
+}
+
+/// Adds the report type's charts to `data.charts` for the templates to render.
+/// Each chart value is either a `![](path)` image reference (when the VSCode
+/// extension rendered the chart) or a fallback note (when it did not respond).
+///
+/// A `charts` key the caller passed in `data` is left alone, so a caller can
+/// supply or suppress charts themselves.
 fn with_charts(
     ctx: &HandlerContext,
     report_type: ReportType,
@@ -363,9 +381,64 @@ fn with_charts(
     } else {
         Vec::new()
     };
-    let built = charts::build_charts(report_type, &data, &tasks, period);
-    if !built.is_empty() {
-        data["charts"] = Value::Object(built);
+    // Determine which charts this report type needs.
+    let needed = charts::build_charts(report_type, &data, &tasks, period);
+    if needed.is_empty() {
+        return Ok(data);
+    }
+
+    // Build file channel requests for each chart.
+    use crate::charts::file_channel::{self, ChartFormat, ChartRequest, ChartResult};
+    let charts_dir = ctx.handoff_dir.join("charts/output");
+    if !charts_dir.exists() {
+        std::fs::create_dir_all(&charts_dir)?;
+    }
+
+    let requests: Vec<(String, ChartRequest)> = needed
+        .keys()
+        .map(|name| {
+            let output_path = charts_dir
+                .join(format!("{name}.png"))
+                .to_string_lossy()
+                .to_string();
+            (
+                name.clone(),
+                ChartRequest {
+                    view: chart_view_for_name(name),
+                    format: ChartFormat::Png,
+                    filters: serde_json::json!({
+                        "report_type": report_type.as_str(),
+                        "chart_name": name,
+                    }),
+                    output_path,
+                },
+            )
+        })
+        .collect();
+
+    let req_list: Vec<ChartRequest> = requests.iter().map(|(_, r)| r.clone()).collect();
+    let per_timeout = file_channel::per_chart_timeout();
+    let tot_timeout = file_channel::total_timeout();
+    let results =
+        file_channel::request_charts(&ctx.handoff_dir, &req_list, per_timeout, tot_timeout)?;
+
+    let mut chart_values = serde_json::Map::new();
+    for ((name, _), result) in requests.iter().zip(results.iter()) {
+        let value = match result {
+            ChartResult::Success { output_paths } | ChartResult::Partial { output_paths, .. }
+                if !output_paths.is_empty() =>
+            {
+                format!("![{}]({})", name, output_paths[0])
+            }
+            _ => {
+                // Timeout or error: insert fallback note.
+                CHART_UNAVAILABLE_NOTE.to_string()
+            }
+        };
+        chart_values.insert(name.clone(), Value::String(value));
+    }
+    if !chart_values.is_empty() {
+        data["charts"] = Value::Object(chart_values);
     }
     Ok(data)
 }

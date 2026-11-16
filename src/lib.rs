@@ -1,3 +1,4 @@
+pub mod charts;
 pub mod cli;
 pub mod context;
 pub mod mcp;

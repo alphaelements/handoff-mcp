@@ -668,7 +668,11 @@ fn dashboard_milestones_section_aggregates_tasks_and_requirement_coverage() {
     ok(
         "handoff_add_milestone",
         json!({ "project_dir": &pd, "name": "v0-1", "version": "0.44.0",
-                "status": "active", "date": "2026-12-01", "order": 1 }),
+                "date": "2026-12-01", "order": 1 }),
+    );
+    ok(
+        "handoff_update_milestone",
+        json!({ "project_dir": &pd, "name": "v0-1", "status": "active" }),
     );
     ok(
         "handoff_add_milestone",

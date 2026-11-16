@@ -98,7 +98,8 @@ impl Sandbox {
             .env_remove("CLAUDE_PROJECT_DIR")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
+            .env_remove("GIT_INDEX_FILE")
+            .env("HANDOFF_CHART_TIMEOUT_MS", "0");
         command
     }
 

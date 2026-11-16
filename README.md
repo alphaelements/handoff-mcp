@@ -556,6 +556,8 @@ appends any missing line the first time it writes the matching kind of file
 /exports/
 # Transient mermaid render cache used by PDF export.
 .mermaid-cache/
+# Chart file channel: requests, responses, and rendered output.
+/charts/
 ```
 
 ### What to track

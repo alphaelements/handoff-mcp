@@ -76,6 +76,19 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
     }
     let fields = ValidatedFields::parse(arguments)?;
+    // New milestones must start at `planning` (the default). Any other status
+    // bypasses the lifecycle transition check and the release guard that
+    // handoff_update_milestone enforces (t454).
+    if let Some(status) = fields.status {
+        if status != MILESTONE_DEFAULT_STATUS {
+            anyhow::bail!(
+                "Cannot create milestone '{name}' with status '{status}'. \
+                 New milestones always start at '{MILESTONE_DEFAULT_STATUS}'. \
+                 Use handoff_update_milestone to transition to a different status \
+                 (lifecycle transition and release_guard are enforced there)."
+            );
+        }
+    }
     let mut sub = Table::new();
     fields.apply(&mut sub, arguments);
     let mut msg = format!("Added milestone '{name}'");

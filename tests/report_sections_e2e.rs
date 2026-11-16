@@ -52,6 +52,8 @@ fn err(arguments: Value) -> String {
 }
 
 fn setup() -> (TempDir, String) {
+    // Skip file channel polling in tests (no VSCode extension running).
+    std::env::set_var("HANDOFF_CHART_TIMEOUT_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let pd = dir.path().to_string_lossy().to_string();
     ok(
@@ -193,11 +195,10 @@ fn sections_control_whether_charts_are_generated() {
         &pd,
         json!({ "sections": [{ "type": "metrics" }, { "type": "charts" }] }),
     );
-    assert!(with.contains("```mermaid"), "{with}");
+    // With no VSCode extension, charts show fallback notes instead of images.
     assert!(with.contains("## Charts"), "{with}");
 
     let (_, without) = weekly(&dir, &pd, json!({ "sections": [{ "type": "metrics" }] }));
-    assert!(!without.contains("```mermaid"), "{without}");
     assert!(!without.contains("## Charts"), "{without}");
 }
 
