@@ -5,10 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.48.0] - 2026-11-17
 
 ### Added
 
+- **Report chart visuals**: weekly/monthly reports include all Metrics view charts (completion donut, velocity bar, burndown line, burn-up line, status donut) as SVG images via the VSCode extension file channel. Each chart has a title and, for donut charts, an embedded color legend. The `charts` parameter accepts an ID list to include specific charts, or `"none"` to suppress them.
 - `handoff-mcp setup` now prepares the whole `CLAUDE.md` the task-loop agents rely on: besides `Session Handoff` it adds the **Build & Test**, **Coding Rules**, **Project Structure** and **Documentation Contract** sections. Sections that already exist (matched by heading, case-insensitive) are never changed, existing content is kept byte for byte, and a second run changes nothing. Fields that could not be filled in are marked `TODO(handoff)`.
 - New `[commands]` section in `config.toml` (`install`, `build`, `test`, `lint`, `format`, `typecheck`, `smoke`, `audit`): the source of truth for the project's commands. `handoff-mcp setup` detects them from `package.json` scripts, `Cargo.toml` and `pyproject.toml` (pytest, ruff), writes the ones that have no value yet, and copies them into **Build & Test**. Other project layouts are not an error: write the commands by hand. `handoff_get_config` / `handoff_update_config` read and write the section (`commands.test`, ...); a command that is not a string is rejected.
 - `handoff-mcp setup --claude-md-scaffold`: add only the four project sections and the detected commands, without prompts and without touching hooks or `.mcp.json`.
