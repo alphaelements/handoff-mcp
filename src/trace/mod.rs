@@ -12,6 +12,7 @@ pub mod layer_status;
 pub mod lint;
 pub mod matrix;
 pub mod next;
+pub mod orphan;
 pub mod profile;
 pub mod quality;
 pub mod suspect;

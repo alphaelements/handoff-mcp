@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use toml_edit::{DocumentMut, Item, Value as TomlValue};
+use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 
 use super::config_crud::validate_work_hours_table;
 use super::HandlerContext;
-use crate::storage::config::{read_config, render_config, Config, DONE_GUARD_MODES};
+use crate::storage::config::{
+    ensure_table_like, read_config, render_config, CommandsConfig, Config, OnboardingConfig,
+    ReleaseConfig, DONE_GUARD_MODES, ONBOARDING_PRESETS, ORPHAN_GUARD_MODES,
+};
+use crate::storage::config_preset::plan_preset;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::trace::profile::BUILTIN_PROFILE_NAMES;
 
@@ -25,7 +29,96 @@ pub fn handle_get(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
     serde_json::to_string_pretty(&json_value).context("Failed to format config")
 }
 
+/// Is `key` present in `arguments` with a value (JSON `null` counts as absent)?
+fn has_argument(arguments: &Value, key: &str) -> bool {
+    arguments.get(key).is_some_and(|value| !value.is_null())
+}
+
+/// `handoff_update_config(preset: ..., confirm?: bool)` (SPEC-ONB-010): applies
+/// a config preset to an existing project.
+///
+/// Keys that had no value are simply set. When the preset would replace a
+/// value the project set itself, nothing is written unless `confirm` is true:
+/// the reply lists every change with its old and new value, so the caller can
+/// show them and ask. The reply is JSON
+/// `{preset, applied, changes: [{key, old, new}], overwrites: [key], message}`.
+fn handle_preset(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let name = arguments
+        .get("preset")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "'preset' must be a string: one of {}",
+                ONBOARDING_PRESETS.join("/")
+            )
+        })?;
+    if has_argument(arguments, "updates") {
+        anyhow::bail!(
+            "'preset' cannot be combined with 'updates': apply the preset first, then \
+             update individual keys in a second call"
+        );
+    }
+    let confirm = match arguments.get("confirm") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(confirm)) => *confirm,
+        Some(other) => anyhow::bail!("'confirm' must be a boolean, got {other}"),
+    };
+
+    let config_path = ctx.handoff_dir.join("config.toml");
+    let raw = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
+    let plan = plan_preset(&raw, name)?;
+    let overwrites: Vec<&str> = plan
+        .overwrites()
+        .iter()
+        .map(|change| change.key.as_str())
+        .collect();
+
+    let applied = overwrites.is_empty() || confirm;
+    if applied && !plan.changes.is_empty() {
+        crate::storage::atomic_write(&config_path, plan.rendered.as_bytes())
+            .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
+    }
+    let message = if !applied {
+        format!(
+            "Nothing was written: preset '{}' would replace {} value(s) this project already \
+             set ({}). Show the changes to the user, then call again with confirm=true to \
+             apply them.",
+            plan.preset,
+            overwrites.len(),
+            overwrites.join(", ")
+        )
+    } else if plan.changes.is_empty() {
+        format!(
+            "Preset '{}' is already applied; nothing changed.",
+            plan.preset
+        )
+    } else {
+        format!(
+            "Applied preset '{}' ({} key(s) set).",
+            plan.preset,
+            plan.changes.len()
+        )
+    };
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "preset": plan.preset,
+        "applied": applied,
+        "changes": plan.changes,
+        "overwrites": overwrites,
+        "message": message,
+    }))
+    .context("Failed to format preset reply")
+}
+
 pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    if has_argument(arguments, "preset") {
+        return handle_preset(ctx, arguments);
+    }
+    if has_argument(arguments, "confirm") {
+        anyhow::bail!("'confirm' is only used together with 'preset'");
+    }
+
     let handoff = &ctx.handoff_dir;
     let config_path = handoff.join("config.toml");
 
@@ -382,6 +475,17 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 continue;
             }
 
+            // Reject `milestones.<name>.status`: milestone status changes
+            // must go through handoff_update_milestone, which enforces
+            // lifecycle transitions and the release guard (t454).
+            if is_milestone_status_key(key) {
+                anyhow::bail!(
+                    "Cannot set '{key}' via handoff_update_config. \
+                     Use handoff_update_milestone to change milestone status \
+                     (lifecycle transition and release_guard are enforced there)."
+                );
+            }
+
             // The generic raw-key path must enforce the same write-time
             // schedule_mode enum as handoff_update_calendar.
             if RAW_SCHEDULE_MODE_KEYS.contains(&key.as_str()) {
@@ -411,6 +515,18 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         validate_trace_scalar_keys(updates.keys().map(String::as_str), &rendered)?;
         if updates.keys().any(|k| is_session_loop_key(k)) {
             validate_session_loop(&rendered)?;
+        }
+        if updates.keys().any(|k| is_section_key(k, COMMANDS_SECTION)) {
+            validate_commands(&rendered)?;
+        }
+        if updates
+            .keys()
+            .any(|k| is_section_key(k, ONBOARDING_SECTION))
+        {
+            validate_onboarding(&rendered)?;
+        }
+        if updates.keys().any(|k| is_section_key(k, RELEASE_SECTION)) {
+            validate_release(&rendered)?;
         }
         if updates
             .keys()
@@ -491,8 +607,76 @@ const SESSION_LOOP_SECTION: &str = "session_loop";
 /// Does this update key write the `[session_loop]` section, as a whole
 /// (`session_loop`) or one of its keys (`session_loop.profile`)?
 fn is_session_loop_key(key: &str) -> bool {
-    key.strip_prefix(SESSION_LOOP_SECTION)
+    is_section_key(key, SESSION_LOOP_SECTION)
+}
+
+/// Does this update key write the top-level `section`, as a whole (`section`)
+/// or one of its keys (`section.key`)?
+fn is_section_key(key: &str, section: &str) -> bool {
+    key.strip_prefix(section)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Top-level `[commands]` section (SPEC-ONB-001).
+const COMMANDS_SECTION: &str = "commands";
+
+/// Rejects (before anything is written) a config text whose `[commands]` is
+/// not a table of strings: a known key holding anything else would make the
+/// whole `config.toml` unreadable for every other tool. Only the section
+/// itself is looked at, and only when the update writes it, so a bad value
+/// elsewhere never blocks setting a command.
+fn validate_commands(rendered: &str) -> Result<()> {
+    let invalid = |e: &dyn std::fmt::Display| anyhow::anyhow!("invalid [{COMMANDS_SECTION}]: {e}");
+    let root: toml::Value = toml::from_str(rendered).map_err(|e| invalid(&e))?;
+    match root.get(COMMANDS_SECTION) {
+        None => Ok(()),
+        Some(section) => section
+            .clone()
+            .try_into::<CommandsConfig>()
+            .map(|_| ())
+            .map_err(|e| invalid(&format!("every command must be a string ({e})"))),
+    }
+}
+
+/// Top-level `[onboarding]` section (SPEC-ONB-091).
+const ONBOARDING_SECTION: &str = "onboarding";
+
+/// Rejects (before anything is written) a config text whose `[onboarding]`
+/// holds a value of the wrong type or a mode the readers would not honor.
+/// Like [`validate_commands`], it looks at that section alone and is only
+/// called when the update writes it.
+fn validate_onboarding(rendered: &str) -> Result<()> {
+    let invalid =
+        |e: &dyn std::fmt::Display| anyhow::anyhow!("invalid [{ONBOARDING_SECTION}]: {e}");
+    let root: toml::Value = toml::from_str(rendered).map_err(|e| invalid(&e))?;
+    let Some(section) = root.get(ONBOARDING_SECTION) else {
+        return Ok(());
+    };
+    let onboarding = section
+        .clone()
+        .try_into::<OnboardingConfig>()
+        .map_err(|e| invalid(&e))?;
+    onboarding.validate().map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Top-level `[release]` section (SPEC-ONB-040).
+const RELEASE_SECTION: &str = "release";
+
+/// Rejects (before anything is written) a config text whose `[release]`
+/// holds a value of the wrong type or a list of manual checks the readers
+/// would silently reduce. Like [`validate_commands`], it looks at that
+/// section alone and is only called when the update writes it.
+fn validate_release(rendered: &str) -> Result<()> {
+    let invalid = |e: &dyn std::fmt::Display| anyhow::anyhow!("invalid [{RELEASE_SECTION}]: {e}");
+    let root: toml::Value = toml::from_str(rendered).map_err(|e| invalid(&e))?;
+    let Some(section) = root.get(RELEASE_SECTION) else {
+        return Ok(());
+    };
+    let release = section
+        .clone()
+        .try_into::<ReleaseConfig>()
+        .map_err(|e| invalid(&e))?;
+    release.validate().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Rejects (before anything is written) a config text whose `[session_loop]`
@@ -508,9 +692,36 @@ fn validate_session_loop(rendered: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Dotted key of `[trace] orphan_guard` (SPEC-TRC-003).
+const ORPHAN_GUARD_KEY: &str = "trace.orphan_guard";
+
+/// Rejects a config text whose `[trace] orphan_guard` is not one of
+/// [`ORPHAN_GUARD_MODES`]. Looks at the raw value, so a value of the wrong
+/// type (a boolean, a number, a table) gets the same message naming the
+/// accepted modes as a misspelled one. An absent key is the default.
+fn validate_orphan_guard(rendered: &str) -> Result<()> {
+    let expected = ORPHAN_GUARD_MODES.join("/");
+    let root: toml::Value = toml::from_str(rendered).map_err(|e| {
+        anyhow::anyhow!("invalid {ORPHAN_GUARD_KEY}: {e} (expected one of {expected})")
+    })?;
+    let Some(value) = root.get("trace").and_then(|t| t.get("orphan_guard")) else {
+        return Ok(());
+    };
+    match value.as_str() {
+        Some(mode) if ORPHAN_GUARD_MODES.contains(&mode) => Ok(()),
+        Some(mode) => {
+            anyhow::bail!("invalid {ORPHAN_GUARD_KEY} '{mode}': expected one of {expected}")
+        }
+        None => anyhow::bail!(
+            "invalid {ORPHAN_GUARD_KEY} {value}: expected one of {expected} (a string)"
+        ),
+    }
+}
+
 /// Rejects (before anything is written) an update that sets `trace.profile`,
-/// `trace.layers` or `trace.done_guard` to a value the readers would not
-/// honor: `done_guard` must be one of [`DONE_GUARD_MODES`]; `profile` must be
+/// `trace.layers`, `trace.done_guard` or `trace.orphan_guard` to a value the
+/// readers would not honor: `done_guard` must be one of [`DONE_GUARD_MODES`]
+/// and `orphan_guard` one of [`ORPHAN_GUARD_MODES`]; `profile` must be
 /// empty ("auto"), a built-in profile or a `[trace.profiles.<name>]` entry in
 /// the resulting config; every `layers` entry must be a built-in layer or a
 /// valid `[[trace.layer]]` entry. Only the keys being written are checked, so
@@ -519,14 +730,22 @@ fn validate_trace_scalar_keys<'a>(
     keys: impl Iterator<Item = &'a str>,
     rendered: &str,
 ) -> Result<()> {
-    let (mut profile, mut layers, mut done_guard) = (false, false, false);
+    let (mut profile, mut layers, mut done_guard, mut orphan_guard) = (false, false, false, false);
     for key in keys {
         match key {
             "trace.profile" => profile = true,
             "trace.layers" => layers = true,
             k if k == "trace.done_guard" || k.starts_with("trace.done_guard.") => done_guard = true,
+            // A deeper key (`trace.orphan_guard.x`) turns the value into a
+            // table, which is not a mode either.
+            k if k == ORPHAN_GUARD_KEY || k.starts_with("trace.orphan_guard.") => {
+                orphan_guard = true
+            }
             _ => {}
         }
+    }
+    if orphan_guard {
+        validate_orphan_guard(rendered)?;
     }
     if !(profile || layers || done_guard) {
         return Ok(());
@@ -584,54 +803,33 @@ fn validate_trace_scalar_keys<'a>(
     Ok(())
 }
 
+/// Returns true when `key` matches the pattern `milestones.<name>.status`,
+/// i.e. it starts with `milestones.`, ends with `.status`, and has exactly
+/// three dot-separated parts.  Such keys must be rejected by
+/// `handoff_update_config` because writing them would bypass the lifecycle
+/// transition check and the release guard in `handoff_update_milestone`.
+fn is_milestone_status_key(key: &str) -> bool {
+    let parts: Vec<&str> = key.split('.').collect();
+    parts.len() == 3 && parts[0] == "milestones" && parts[2] == "status"
+}
+
+/// Deepest dotted key `handoff_update_config` accepts (`a.b.c.d`).
+const MAX_KEY_DEPTH: usize = 4;
+
 fn set_toml_value(doc: &mut DocumentMut, parts: &[&str], json_val: &Value) -> Result<()> {
     let toml_val = json_to_toml_value(json_val)?;
-
-    match parts.len() {
-        1 => {
-            doc[parts[0]] = Item::Value(toml_val);
-        }
-        2 => {
-            if !doc.contains_table(parts[0]) {
-                doc[parts[0]] = Item::Table(toml_edit::Table::new());
-            }
-            doc[parts[0]][parts[1]] = Item::Value(toml_val);
-        }
-        3 => {
-            if !doc.contains_table(parts[0]) {
-                doc[parts[0]] = Item::Table(toml_edit::Table::new());
-            }
-            let table = doc[parts[0]]
-                .as_table_mut()
-                .ok_or_else(|| anyhow::anyhow!("{} is not a table", parts[0]))?;
-            if !table.contains_table(parts[1]) {
-                table[parts[1]] = Item::Table(toml_edit::Table::new());
-            }
-            table[parts[1]][parts[2]] = Item::Value(toml_val);
-        }
-        4 => {
-            if !doc.contains_table(parts[0]) {
-                doc[parts[0]] = Item::Table(toml_edit::Table::new());
-            }
-            let t0 = doc[parts[0]]
-                .as_table_mut()
-                .ok_or_else(|| anyhow::anyhow!("{} is not a table", parts[0]))?;
-            if !t0.contains_table(parts[1]) {
-                t0[parts[1]] = Item::Table(toml_edit::Table::new());
-            }
-            let t1 = t0[parts[1]]
-                .as_table_mut()
-                .ok_or_else(|| anyhow::anyhow!("{}.{} is not a table", parts[0], parts[1]))?;
-            if !t1.contains_table(parts[2]) {
-                t1[parts[2]] = Item::Table(toml_edit::Table::new());
-            }
-            t1[parts[2]][parts[3]] = Item::Value(toml_val);
-        }
-        _ => {
-            anyhow::bail!("Key depth > 4 not supported");
-        }
+    let Some((leaf, parents)) = parts.split_last() else {
+        anyhow::bail!("Empty key");
+    };
+    if parts.len() > MAX_KEY_DEPTH {
+        anyhow::bail!("Key depth > {MAX_KEY_DEPTH} not supported");
     }
 
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    for parent in parents {
+        table = ensure_table_like(table, parent)?;
+    }
+    table.insert(leaf, Item::Value(toml_val));
     Ok(())
 }
 
@@ -754,5 +952,289 @@ mod tests {
             &json!({ "updates": { "calendar.schedule_mode": null } }),
         )
         .unwrap();
+    }
+
+    // --- [commands] (SPEC-ONB-001, SPEC-ONB-093) ---
+
+    #[test]
+    fn update_sets_a_command_and_get_reports_it() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": {
+                "commands.test": "make test | tee log && echo done",
+                "commands.e2e": "npm run e2e"
+            } }),
+        )
+        .unwrap();
+        let got: Value = serde_json::from_str(&handle_get(&ctx, &json!({})).unwrap()).unwrap();
+        assert_eq!(
+            got["commands"]["test"],
+            json!("make test | tee log && echo done")
+        );
+        assert_eq!(got["commands"]["e2e"], json!("npm run e2e"));
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(
+            config.commands.get("test"),
+            Some("make test | tee log && echo done")
+        );
+    }
+
+    #[test]
+    fn update_rejects_a_command_that_is_not_a_string_and_writes_nothing() {
+        for (key, bad) in [
+            ("commands.test", json!(123)),
+            ("commands.smoke", json!(true)),
+            ("commands.build", json!(["make"])),
+            ("commands", json!("make")),
+            ("commands", json!({ "test": 1 })),
+        ] {
+            let (_tmp, ctx) = project();
+            let before = std::fs::read_to_string(ctx.handoff_dir.join("config.toml")).unwrap();
+            let err = handle_update(&ctx, &json!({ "updates": { key: bad } })).unwrap_err();
+            assert!(err.to_string().contains("[commands]"), "{key} {bad}: {err}");
+            let after = std::fs::read_to_string(ctx.handoff_dir.join("config.toml")).unwrap();
+            assert_eq!(after, before, "{key} {bad}");
+        }
+    }
+
+    #[test]
+    fn update_of_a_command_is_not_blocked_by_a_bad_value_elsewhere() {
+        let (_tmp, ctx) = project();
+        let path = ctx.handoff_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[project]\nname = \"p\"\n\n[settings]\ndone_task_limit = \"many\"\n",
+        )
+        .unwrap();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "commands.test": "make test" } }),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("test = \"make test\""), "{raw}");
+    }
+
+    /// Setting the section as a whole stores an inline table; a later
+    /// single-key update must add to it, not replace it.
+    #[test]
+    fn single_key_update_keeps_commands_set_as_a_whole_object() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "commands": { "test": "make test", "smoke": "./smoke.sh" } } }),
+        )
+        .unwrap();
+        handle_update(&ctx, &json!({ "updates": { "commands.build": "make" } })).unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(config.commands.get("test"), Some("make test"));
+        assert_eq!(config.commands.get("smoke"), Some("./smoke.sh"));
+        assert_eq!(config.commands.get("build"), Some("make"));
+    }
+
+    /// The same holds for every section, not only the new ones.
+    #[test]
+    fn single_key_update_keeps_a_calendar_set_as_a_whole_object() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "calendar": {
+                "work_hours_per_day": 6,
+                "closed_weekdays": ["sat", "sun"]
+            } } }),
+        )
+        .unwrap();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "calendar.work_hours_per_day": 7 } }),
+        )
+        .unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(config.calendar.work_hours_per_day, Some(7.0));
+        assert_eq!(config.calendar.closed_weekdays, vec![6, 0]);
+    }
+
+    #[test]
+    fn update_with_null_clears_a_command() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "commands.test": "make test" } }),
+        )
+        .unwrap();
+        handle_update(&ctx, &json!({ "updates": { "commands.test": null } })).unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(config.commands.get("test"), None);
+    }
+
+    /// A typed-key update re-serializes the whole config; `[commands]` must
+    /// survive it.
+    #[test]
+    fn typed_key_update_keeps_the_commands_section() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "commands.test": "make test" } }),
+        )
+        .unwrap();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "settings.default_estimate_hours": 2.0 } }),
+        )
+        .unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(config.commands.get("test"), Some("make test"));
+    }
+
+    // --- [release] and [onboarding] secret_file_patterns (SPEC-ONB-040/050) ---
+
+    #[test]
+    fn update_sets_manual_checks_and_secret_file_patterns() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": {
+                "release.manual_checks": ["docs_updated", "changelog"],
+                "onboarding.secret_file_patterns": ["*.tfstate"],
+            } }),
+        )
+        .unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(
+            config.release.manual_checks(),
+            ["docs_updated", "changelog"]
+        );
+        assert_eq!(config.onboarding.secret_file_patterns(), ["*.tfstate"]);
+        let shown = handle_get(&ctx, &json!({})).unwrap();
+        assert!(shown.contains("docs_updated"), "{shown}");
+        assert!(shown.contains("*.tfstate"), "{shown}");
+    }
+
+    #[test]
+    fn update_rejects_invalid_release_and_pattern_values_without_writing() {
+        let (_tmp, ctx) = project();
+        let path = ctx.handoff_dir.join("config.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (updates, expected) in [
+            (
+                json!({ "release.manual_checks": ["a", "a"] }),
+                "more than once",
+            ),
+            (json!({ "release.manual_checks": ["a", " "] }), "blank"),
+            (
+                json!({ "release.manual_checks": "docs_updated" }),
+                "invalid [release]",
+            ),
+            (json!({ "release.manual_checks": [1] }), "invalid [release]"),
+            (
+                json!({ "onboarding.secret_file_patterns": [".env", ""] }),
+                "onboarding.secret_file_patterns",
+            ),
+            (
+                json!({ "onboarding.secret_file_patterns": ".env" }),
+                "invalid [onboarding]",
+            ),
+        ] {
+            let err = handle_update(&ctx, &json!({ "updates": updates }))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{updates}: {err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{updates}");
+        }
+    }
+
+    // --- milestones.*.status bypass guard (t454) ---
+
+    /// `milestones.<name>.status` must be rejected by `update_config` because
+    /// it bypasses the lifecycle transition check and the release guard that
+    /// `handoff_update_milestone` enforces. The error message should direct
+    /// the caller to use `handoff_update_milestone` instead.
+    #[test]
+    fn update_config_rejects_milestones_status_key() {
+        let (_tmp, ctx) = project();
+        // Seed a milestone so the table exists.
+        let path = ctx.handoff_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[project]\nname = \"p\"\n\n[milestones.v1]\ndate = \"2026-01-01\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for status_val in [json!("released"), json!("active"), json!("planning")] {
+            let err = handle_update(
+                &ctx,
+                &json!({ "updates": { "milestones.v1.status": status_val } }),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("handoff_update_milestone"),
+                "error should mention handoff_update_milestone: {msg}"
+            );
+            assert!(
+                msg.contains("milestones") && msg.contains("status"),
+                "error should mention the rejected key: {msg}"
+            );
+            // Config file must be untouched.
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "config must not be written for status_val={status_val}"
+            );
+        }
+    }
+
+    /// Other milestones subkeys (date, color, description, etc.) should still
+    /// pass through `update_config` without issue — only `status` is blocked.
+    #[test]
+    fn update_config_allows_non_status_milestone_keys() {
+        let (_tmp, ctx) = project();
+        let path = ctx.handoff_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[project]\nname = \"p\"\n\n[milestones.v1]\ndate = \"2026-01-01\"\n",
+        )
+        .unwrap();
+
+        let result = handle_update(
+            &ctx,
+            &json!({ "updates": { "milestones.v1.date": "2026-06-01" } }),
+        );
+        assert!(
+            result.is_ok(),
+            "non-status key should be accepted: {result:?}"
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("2026-06-01"), "date should be updated: {raw}");
+    }
+
+    /// A typed-key update re-serializes the whole config; `[release]` and the
+    /// patterns must survive it.
+    #[test]
+    fn typed_key_update_keeps_the_release_section_and_the_patterns() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": {
+                "release.manual_checks": ["docs_updated"],
+                "onboarding.secret_file_patterns": [],
+            } }),
+        )
+        .unwrap();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "settings.default_estimate_hours": 2.0 } }),
+        )
+        .unwrap();
+        let config = read_config(&ctx.handoff_dir.join("config.toml")).unwrap();
+        assert_eq!(config.release.manual_checks(), ["docs_updated"]);
+        assert_eq!(
+            config.onboarding.secret_file_patterns,
+            Some(Vec::new()),
+            "an explicitly empty list is kept"
+        );
     }
 }

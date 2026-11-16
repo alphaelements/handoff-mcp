@@ -73,7 +73,7 @@ fn add_stores_and_list_returns_extended_fields() {
         &dir,
         json!({
             "name": "v1", "date": "2026-11-01", "version": "1.0.0",
-            "status": "active", "order": 3, "depends_on": ["base"]
+            "order": 3, "depends_on": ["base"]
         }),
     );
     assert!(!is_error(&resp), "add error: {}", text(&resp));
@@ -82,6 +82,9 @@ fn add_stores_and_list_returns_extended_fields() {
         "known dependency must not warn: {}",
         text(&resp)
     );
+    // Transition to active via the proper path.
+    let resp = set_status(&dir, "v1", "active", false);
+    assert!(!is_error(&resp), "set active error: {}", text(&resp));
 
     let v = list(&dir, json!({}));
     let m = &v["milestones"]["v1"];
@@ -116,14 +119,35 @@ fn legacy_milestone_lists_with_defaults_and_is_not_rewritten() {
     assert_eq!(m["depends_on"], json!([]));
 }
 
-// AC2: all five statuses accepted, anything else rejected (add and update).
+// AC2: all five statuses accepted via update_milestone, anything else rejected.
+// add_milestone only accepts planning (or no status); non-planning statuses
+// must go through update_milestone (t454 bypass fix).
 #[test]
 fn status_accepts_five_values_and_rejects_others() {
     let dir = setup_project();
-    for s in ["planning", "active", "frozen", "released", "cancelled"] {
+    // planning is the only status accepted on add.
+    let resp = add(&dir, json!({ "name": "m-planning", "status": "planning" }));
+    assert!(!is_error(&resp), "planning: {}", text(&resp));
+    let resp = add(&dir, json!({ "name": "m-implicit" }));
+    assert!(!is_error(&resp), "implicit planning: {}", text(&resp));
+
+    // Non-planning statuses are rejected on add.
+    for s in ["active", "frozen", "released", "cancelled"] {
         let resp = add(&dir, json!({ "name": format!("m-{s}"), "status": s }));
-        assert!(!is_error(&resp), "{s}: {}", text(&resp));
+        assert!(is_error(&resp), "add with {s} should fail: {}", text(&resp));
     }
+
+    // But all statuses are reachable via update_milestone (forward transitions).
+    add(&dir, json!({ "name": "m-lifecycle" }));
+    for s in ["active", "frozen", "released"] {
+        let resp = set_status(&dir, "m-lifecycle", s, false);
+        assert!(!is_error(&resp), "update to {s}: {}", text(&resp));
+    }
+    // cancelled from released
+    let resp = set_status(&dir, "m-lifecycle", "cancelled", false);
+    assert!(!is_error(&resp), "cancelled: {}", text(&resp));
+
+    // Invalid status values are always rejected (add and update).
     let resp = add(&dir, json!({ "name": "bad", "status": "done" }));
     assert!(is_error(&resp));
     assert!(
@@ -243,9 +267,12 @@ fn update_null_clears_extended_fields() {
 #[test]
 fn list_status_filter() {
     let dir = setup_project();
-    add(&dir, json!({ "name": "a", "status": "active" }));
+    add(&dir, json!({ "name": "a" }));
+    set_status(&dir, "a", "active", false);
     add(&dir, json!({ "name": "p" }));
-    add(&dir, json!({ "name": "f", "status": "frozen" }));
+    add(&dir, json!({ "name": "f" }));
+    set_status(&dir, "f", "active", false);
+    set_status(&dir, "f", "frozen", false);
 
     let v = list(&dir, json!({ "status_filter": "active" }));
     let keys: Vec<&String> = v["milestones"].as_object().unwrap().keys().collect();
@@ -267,8 +294,11 @@ fn list_status_filter() {
 #[test]
 fn update_task_warns_on_frozen_milestone() {
     let dir = setup_project();
-    add(&dir, json!({ "name": "frozen-ms", "status": "frozen" }));
-    add(&dir, json!({ "name": "open-ms", "status": "active" }));
+    add(&dir, json!({ "name": "frozen-ms" }));
+    set_status(&dir, "frozen-ms", "active", false);
+    set_status(&dir, "frozen-ms", "frozen", false);
+    add(&dir, json!({ "name": "open-ms" }));
+    set_status(&dir, "open-ms", "active", false);
 
     let resp = call(
         &dir,
@@ -308,7 +338,14 @@ fn update_task_warns_on_frozen_milestone() {
 #[test]
 fn bulk_update_warns_on_frozen_milestone() {
     let dir = setup_project();
-    add(&dir, json!({ "name": "frozen-ms", "status": "frozen" }));
+    add(&dir, json!({ "name": "frozen-ms" }));
+    set_status(&dir, "frozen-ms", "active", false);
+    set_status(&dir, "frozen-ms", "frozen", false);
+    // Defined, like `open-ms` above: a name config.toml does not define gets
+    // its own warning (`UNKNOWN_MILESTONE`), which is not what this test is
+    // about.
+    add(&dir, json!({ "name": "other" }));
+    set_status(&dir, "other", "active", false);
     call(
         &dir,
         "handoff_update_task",
@@ -335,4 +372,103 @@ fn bulk_update_warns_on_frozen_milestone() {
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert_eq!(warnings[0]["task_id"], "t1");
     assert!(warnings[0]["warning"].as_str().unwrap().contains("frozen"));
+}
+
+// --- release_guard bypass prevention (t454) ---
+
+/// handoff_add_milestone must reject any status other than "planning". New
+/// milestones must start at planning; use handoff_update_milestone to
+/// transition.
+#[test]
+fn add_milestone_rejects_non_planning_status() {
+    let dir = setup_project();
+    for status in ["active", "frozen", "released", "cancelled"] {
+        let resp = add(
+            &dir,
+            json!({ "name": format!("ms-{status}"), "status": status }),
+        );
+        assert!(
+            is_error(&resp),
+            "add with status={status} should fail: {}",
+            text(&resp)
+        );
+        let msg = text(&resp);
+        assert!(
+            msg.contains("handoff_update_milestone"),
+            "error should direct to handoff_update_milestone: {msg}"
+        );
+        // The milestone should not have been created.
+        let listed = list(&dir, json!({}));
+        assert!(
+            listed["milestones"][format!("ms-{status}")].is_null(),
+            "milestone should not exist after rejection: status={status}"
+        );
+    }
+}
+
+/// handoff_add_milestone accepts status="planning" explicitly and also no
+/// status at all (which defaults to planning).
+#[test]
+fn add_milestone_accepts_planning_status() {
+    let dir = setup_project();
+    let resp = add(&dir, json!({ "name": "explicit", "status": "planning" }));
+    assert!(!is_error(&resp), "explicit planning: {}", text(&resp));
+
+    let resp = add(&dir, json!({ "name": "implicit" }));
+    assert!(!is_error(&resp), "no status: {}", text(&resp));
+
+    let listed = list(&dir, json!({}));
+    assert_eq!(listed["milestones"]["explicit"]["status"], "planning");
+    assert_eq!(listed["milestones"]["implicit"]["status"], "planning");
+}
+
+/// handoff_update_config rejects milestones.*.status keys, directing the
+/// caller to use handoff_update_milestone instead.
+#[test]
+fn update_config_rejects_milestone_status_bypass() {
+    let dir = setup_project();
+    add(&dir, json!({ "name": "v1" }));
+
+    for status in ["released", "active", "frozen", "planning"] {
+        let resp = call(
+            &dir,
+            "handoff_update_config",
+            json!({ "updates": { "milestones.v1.status": status } }),
+        );
+        assert!(
+            is_error(&resp),
+            "update_config milestones.v1.status={status} should fail: {}",
+            text(&resp)
+        );
+        let msg = text(&resp);
+        assert!(
+            msg.contains("handoff_update_milestone"),
+            "error should direct to handoff_update_milestone: {msg}"
+        );
+    }
+
+    // The milestone's status should still be planning (unchanged).
+    let listed = list(&dir, json!({}));
+    assert_eq!(listed["milestones"]["v1"]["status"], "planning");
+}
+
+/// The normal path (handoff_update_milestone) still works correctly with
+/// lifecycle transition and release_guard checks intact.
+#[test]
+fn update_milestone_normal_path_still_works() {
+    let dir = setup_project();
+    add(&dir, json!({ "name": "v1" }));
+
+    // Forward transitions work.
+    let resp = set_status(&dir, "v1", "active", false);
+    assert!(!is_error(&resp), "planning->active: {}", text(&resp));
+    let resp = set_status(&dir, "v1", "frozen", false);
+    assert!(!is_error(&resp), "active->frozen: {}", text(&resp));
+    let resp = set_status(&dir, "v1", "released", false);
+    assert!(!is_error(&resp), "frozen->released: {}", text(&resp));
+
+    assert_eq!(
+        list(&dir, json!({}))["milestones"]["v1"]["status"],
+        "released"
+    );
 }

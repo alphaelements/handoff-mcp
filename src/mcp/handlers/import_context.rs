@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
+use super::milestones::{requested_task_milestone, unknown_milestone_warnings};
 use super::save_context::{
     append_session_event, prune_sessions_per_config, transition_group_member,
 };
@@ -134,6 +135,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let mut tasks_created: u32 = 0;
     let mut top_level_count: u32 = 0;
     let mut nested_count: u32 = 0;
+    let mut created_top_level_ids: Vec<String> = Vec::new();
 
     if let Some(tasks) = arguments.get("tasks").and_then(|v| v.as_array()) {
         // Validate the whole payload before creating anything. Import writes many
@@ -173,6 +175,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             tasks_created += count;
             top_level_count += 1;
             nested_count += count - 1;
+            created_top_level_ids.push(task_id);
         }
     }
 
@@ -336,7 +339,46 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         msg.push_str("\n  Raw notes: saved as handoff_note (context)");
     }
 
+    // Advisory, as in `handoff_update_task`: each milestone name the imported
+    // tasks were given that config.toml does not define, once per name.
+    let mut milestones = Vec::new();
+    for task_val in arguments
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        collect_requested_milestones(task_val, &mut milestones);
+    }
+    for warning in unknown_milestone_warnings(handoff, milestones) {
+        msg.push_str("\n  ");
+        msg.push_str(&warning);
+    }
+
+    // Requirement-link guidance (REQ-TRC-003): an import cannot link its
+    // tasks, so it names the ones that ended up as orphans, in one line for
+    // the whole import. The tasks are already written, so a failure to work
+    // the list out is reported instead of failing the import.
+    match super::creation_guidance::summary_for_import(handoff, &created_top_level_ids) {
+        Ok(Some(line)) => {
+            msg.push_str("\n  ");
+            msg.push_str(&line);
+        }
+        Ok(None) => {}
+        Err(e) => msg.push_str(&format!(
+            "\n  Warning: requirement-link guidance check failed: {e:#}"
+        )),
+    }
+
     Ok(msg)
+}
+
+/// The milestone names the payload gives `task_val` and the tasks below it.
+fn collect_requested_milestones<'a>(task_val: &'a Value, out: &mut Vec<&'a str>) {
+    out.extend(requested_task_milestone(task_val));
+    for child in task_children(task_val).into_iter().flatten() {
+        collect_requested_milestones(child, out);
+    }
 }
 
 // The validating pass and the writing pass must read the payload identically, or

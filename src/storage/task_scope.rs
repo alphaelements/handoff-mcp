@@ -370,6 +370,7 @@ fn node_json(task: &TaskIndex, reason: Option<&str>, children: Vec<Value>) -> Re
         priority: None,
         lock: task.lock.clone(),
         task_links: Vec::new(),
+        labels: Vec::new(),
         children: Vec::new(),
     };
     let mut node = serde_json::to_value(&own).context("serialize task")?;
@@ -564,6 +565,7 @@ mod tests {
             priority: None,
             lock: None,
             task_links: Vec::new(),
+            labels: Vec::new(),
             children: Vec::new(),
         }
     }

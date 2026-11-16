@@ -146,6 +146,7 @@ fn missing_profile_layer_items(
         per_doc_sync_warnings: &[],
         resynced_doc_slugs: &resynced,
         tree_text: &tree_text,
+        orphan_tasks: &[],
     };
     let only: HashSet<String> = [MISSING_PROFILE_LAYER_RULE.to_string()].into();
     let mut items: Vec<String> =

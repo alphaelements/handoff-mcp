@@ -1,4 +1,6 @@
-//! Unknown-argument rejection for the `handoff_trace_*` tools.
+//! Unknown-argument rejection for the `handoff_trace_*` tools and the
+//! onboarding tools (`handoff_doctor`, `handoff_release_check`,
+//! `handoff_next_step`).
 //!
 //! A misspelled argument (`dryrun`, `layer`) or scope key (`item`) used to be
 //! dropped without a word, so a write ran with the wider default instead of
@@ -6,6 +8,13 @@
 //! this does the same for every trace tool, driven by the tool's own
 //! `input_schema` so the accepted keys can never drift from what the tool
 //! advertises.
+//!
+//! `handoff_doctor` writes nothing, but it answers `ready`: with a misspelled
+//! `results` dropped, it would answer for a run it was never shown.
+//! `handoff_release_check` answers `ok` the same way, and records the
+//! `results` and `confirm` it is given. `handoff_next_step` takes nothing but
+//! the project: an argument it does not know (a `milestone`, a `task_id`) is
+//! a caller expecting an answer about something narrower than it gives.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -16,14 +25,25 @@ use serde_json::Value;
 /// Tool-name prefix this check applies to.
 const TRACE_TOOL_PREFIX: &str = "handoff_trace_";
 
-/// `name -> input_schema` for every trace tool, built once: the definitions
+/// Tools outside that prefix this check applies to as well.
+const OTHER_CHECKED_TOOLS: &[&str] = &[
+    "handoff_doctor",
+    "handoff_release_check",
+    "handoff_next_step",
+];
+
+fn is_checked(tool: &str) -> bool {
+    tool.starts_with(TRACE_TOOL_PREFIX) || OTHER_CHECKED_TOOLS.contains(&tool)
+}
+
+/// `name -> input_schema` for every checked tool, built once: the definitions
 /// carry multi-kilobyte descriptions and are not worth rebuilding per call.
-fn trace_schemas() -> &'static HashMap<String, Value> {
+fn checked_schemas() -> &'static HashMap<String, Value> {
     static SCHEMAS: OnceLock<HashMap<String, Value>> = OnceLock::new();
     SCHEMAS.get_or_init(|| {
         crate::mcp::tools::all_tool_definitions()
             .into_iter()
-            .filter(|t| t.name.starts_with(TRACE_TOOL_PREFIX))
+            .filter(|t| is_checked(&t.name))
             .map(|t| (t.name, t.input_schema))
             .collect()
     })
@@ -31,13 +51,13 @@ fn trace_schemas() -> &'static HashMap<String, Value> {
 
 /// Errors when `arguments` carries a key the tool's schema does not declare,
 /// at the top level or inside a declared object (or array-of-object)
-/// property. A non-trace tool, or a schema node that declares no
-/// `properties`, is not checked.
+/// property. A tool this check does not apply to, or a schema node that
+/// declares no `properties`, is not checked.
 pub fn reject_unknown_arguments(tool: &str, arguments: &Value) -> Result<()> {
-    if !tool.starts_with(TRACE_TOOL_PREFIX) {
+    if !is_checked(tool) {
         return Ok(());
     }
-    let Some(schema) = trace_schemas().get(tool) else {
+    let Some(schema) = checked_schemas().get(tool) else {
         return Ok(());
     };
     let mut unknown = Vec::new();
@@ -154,10 +174,98 @@ mod tests {
         assert!(reject_unknown_arguments("handoff_list_tasks", &json!({"zzz": 1})).is_ok());
     }
 
+    /// `handoff_doctor` answers `ready`. A misspelled `results` that was
+    /// dropped would make it answer for a run it never judged.
+    #[test]
+    fn the_doctor_is_checked_too() {
+        let err = reject_unknown_arguments("handoff_doctor", &json!({"result": []}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown argument(s): result."), "{err}");
+        assert!(
+            err.contains("results"),
+            "the accepted keys are named: {err}"
+        );
+
+        let err = reject_unknown_arguments(
+            "handoff_doctor",
+            &json!({"results": [{"id": "cmd_test", "command": "x", "exitCode": 0}]}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("results[0].exitCode"), "{err}");
+
+        assert!(reject_unknown_arguments(
+            "handoff_doctor",
+            &json!({
+                "project_dir": "/p",
+                "checks": ["cmd_test"],
+                "results": [{
+                    "id": "cmd_test", "command": "x", "exit_code": 0,
+                    "duration_ms": 1, "output_tail": "", "error": "e"
+                }]
+            })
+        )
+        .is_ok());
+    }
+
+    /// `handoff_release_check` answers `ok` and records what it is given: a
+    /// misspelled `results` or `confirm` must not be dropped.
+    #[test]
+    fn the_release_check_is_checked_too() {
+        for (arguments, unknown) in [
+            (json!({"milestone": "v1", "result": []}), "result"),
+            (json!({"milestone": "v1", "confirmed": []}), "confirmed"),
+            (json!({"milestones": "v1"}), "milestones"),
+            (
+                json!({"milestone": "v1", "results": [{"id": "tests_pass", "command": "x", "exitCode": 0}]}),
+                "results[0].exitCode",
+            ),
+        ] {
+            let err = reject_unknown_arguments("handoff_release_check", &arguments)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("unknown argument(s): {unknown}.")),
+                "{arguments}: {err}"
+            );
+        }
+        assert!(reject_unknown_arguments(
+            "handoff_release_check",
+            &json!({
+                "project_dir": "/p",
+                "milestone": "v1",
+                "confirm": ["manual:docs_updated"],
+                "results": [{
+                    "id": "tests_pass", "command": "x", "exit_code": 0,
+                    "duration_ms": 1, "output_tail": "", "error": "e"
+                }]
+            })
+        )
+        .is_ok());
+    }
+
+    /// `handoff_next_step` answers for the whole project and nothing else.
+    #[test]
+    fn the_next_step_takes_only_the_project() {
+        let err = reject_unknown_arguments("handoff_next_step", &json!({"milestone": "v1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown argument(s): milestone."), "{err}");
+        assert!(reject_unknown_arguments("handoff_next_step", &json!({})).is_ok());
+        assert!(
+            reject_unknown_arguments("handoff_next_step", &json!({"project_dir": "/p"})).is_ok()
+        );
+    }
+
     #[test]
     fn every_trace_tool_declares_project_dir_and_has_a_schema() {
-        let schemas = trace_schemas();
-        assert!(schemas.len() >= 15, "trace schemas: {}", schemas.len());
+        let schemas = checked_schemas();
+        let trace_tools = schemas
+            .keys()
+            .filter(|name| name.starts_with(TRACE_TOOL_PREFIX))
+            .count();
+        assert!(trace_tools >= 15, "trace schemas: {trace_tools}");
         for (name, schema) in schemas {
             assert!(
                 schema["properties"]["project_dir"].is_object(),

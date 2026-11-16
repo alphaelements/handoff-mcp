@@ -20,8 +20,8 @@ implementation, adversarial testing, and architectural review.
   session-integration-tester (Sonnet), session-reviewer (Opus),
   session-spec-writer (Sonnet — Stage 0: derives missing basic_spec from requirements, scaffolds system_test (full: + detailed_spec/unit_test), self-checks with confidence + checker_result),
   session-spec-reconciler (Sonnet — Stage 3.5: syncs basic_spec/system_test with the implementation, reports contract_ambiguity),
-  session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
-  session-closer-verifier (Sonnet, read-only — reads each task back from disk after the closer so the workflow can compare status and checked criteria with the closer's claims),
+  session-closer (Sonnet — automates Step 6 close-out: done_criteria, trace_update, status; a task with no requirement link is closed as `review`, never `done`),
+  session-closer-verifier (Sonnet, read-only — reads each task back from disk after the closer so the workflow can compare status, checked criteria and the requirement-link state with the closer's claims),
   elite-developer (Fable — the single agent of the `elite` profile: implements with TDD, tests its own work adversarially, runs the full suite, reviews and fixes in one context, and reports seven stages per task; reads handoff state and never writes it. `session-execute` launches exactly one per round under `profile: 'elite'`, in place of the developers, the tester, and the reviewer),
   requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
   requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check, plus the opt-in ISO 29119 `test_spec` check of scaffolded test specifications; cross-document duplicate/contradiction/omission review),
@@ -49,7 +49,14 @@ implementation, adversarial testing, and architectural review.
   elite-requirement-author (Fable — the single agent of the `elite` profile: decomposes every scope, checks each document against ISO/IEC/IEEE 29148, reviews them across documents, fixes what it finds within `max_rounds`, and registers them in one context. `requirement-execute` launches exactly one under `profile: 'elite'`, in place of the workers, checkers, reviewer, registrar and test-spec-worker)
 - **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links; under `profile: 'elite'` one elite-requirement-author runs all four stages and its report is mapped onto the same result shape)
 - **Command** — `/requirement-loop` (requirements coordinator; Phase 0 imports the approved `/spec-loop` specification when one exists, else the brainstorm report or manual input; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
+- **Security minimum (opt-in)** — with `[onboarding] security_min_nfr = true` in `config.toml`, Phase 2 does not pass its gate until the user has decided three security items (handling of secrets, validation of external input, dependency updates): each becomes an `NFR-` requirement or is ruled out of scope with a reason, recorded in a `## Security minimum` section of the NFR document. Off by default; Phase 2 is unchanged without the key
 - **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered
+
+### Bug-fix loop
+- **Command** — `/bugfix-loop` (bug-fix coordinator). One run takes one bug through seven stages: **Record** (a task labelled `bug`, and a reproduction item in the project's single `bugfixes` document), **Reproduce** (the full suite before the fix, then a test that fails because of the bug), **Impact** (the requirements and verification items that reference the files to change; their tests join the re-run set), **Gate** (the user chooses "Proceed with the fix / Revise the diagnosis / Abort"), **Fix**, **Verify** (the same test passes) and **Regress** (the full suite shows no new failure)
+- **Arguments** — a symptom in free text, or `task: <id>` to work on an existing bug task (for example the `[smoke]` task `/session-loop` files when the smoke check fails); `delegate` skips the question at the Gate
+- **Agents** — none of its own: the reproduction test and the fix are written by session-developer, and the fix is checked by session-tester. No Workflow is launched
+- **Guarantees** — product code is not changed before the Gate is passed (only test code and `.handoff/` state); a symptom that cannot be reproduced leaves the product untouched and sets the task to `blocked`; a new failure in the full suite keeps the task `in_progress`; the task notes of a fixed bug hold, in order, the failing run before the fix, the passing run after it and the full-suite result. It needs `[commands] test` in `config.toml`, and it never pushes
 
 ### Spec loop
 - **Agents** — spec-architect (Sonnet — Phase 1: Mermaid `flowchart` / `C4Context` architecture), spec-gui-designer (Sonnet — Phase 2: one HTML mock per screen and a `stateDiagram-v2` of the transitions), spec-usecase-analyst (Sonnet — Phase 3: use cases with `sequenceDiagram`),
@@ -95,6 +102,23 @@ Session Manager (main agent, /loop /session-loop)
  |   commits
  +-- Hands off to next session
 ```
+
+### Checks before a session (opt-in)
+
+Two `[onboarding]` keys of `config.toml` make `/session-loop` check the project
+right after it establishes the session, before it fetches a task. Both are off
+by default, and the loop runs unchanged without them.
+
+- `preflight = "check"` or `"run"` (Step 0b): the manager calls `handoff_doctor`.
+  With `run` it also runs the project's install, build, test, lint, typecheck
+  and audit commands and reports the results back. A project that is not ready
+  ends the session: each failed check is shown with its `next_step`.
+- `smoke_check = true` (Step 0c): the manager runs `[commands] smoke` (stopped
+  after `smoke_timeout_sec`, default 120 seconds). A failure ends the session,
+  files one `bug` task titled `[smoke] Smoke check failed` (never a second one
+  while it is unfinished) and proposes `/bugfix-loop task: <id>`.
+
+A session that ends at either check plans nothing and launches no Workflow.
 
 ### Document-aware agents
 
@@ -253,6 +277,10 @@ After installation:
 
 # Requirements authoring workflow (resumes automatically if a suspended flow exists)
 /requirement-loop
+
+# Fix one bug: failing test first, approval, fix, same test, full suite
+/bugfix-loop add returns 3 for -1 and -2
+/bugfix-loop task: t12
 ```
 
 ## How it works with your project
@@ -267,7 +295,10 @@ The task loop **does not hardcode any language or framework**. Instead:
 ### Required CLAUDE.md sections
 
 The task loop agents look for the following in your project's `CLAUDE.md`.
-Copy this template and fill in your project's specifics:
+`handoff-mcp setup` (or `handoff-mcp setup --claude-md-scaffold` for these
+sections only) appends the missing ones, with the commands it can detect filled
+in and every other field marked `TODO(handoff)`. To write them by hand, copy this
+template and fill in your project's specifics:
 
 ```markdown
 ## Build & Test

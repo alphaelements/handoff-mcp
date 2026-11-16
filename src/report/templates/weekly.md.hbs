@@ -23,22 +23,12 @@
 {{#if data.charts}}
 ## Charts
 
-{{#if data.charts.burndown}}
-### Burndown
+{{#each data.charts}}
+### {{chart_title @key}}
 
-```mermaid
-{{{data.charts.burndown}}}
-```
+{{{this}}}
 
-{{/if}}
-{{#if data.charts.velocity}}
-### Velocity
-
-```mermaid
-{{{data.charts.velocity}}}
-```
-
-{{/if}}
+{{/each}}
 {{/if}}
 
 ## Completed Tasks
@@ -139,3 +129,4 @@ Nothing scheduled.
 - {{this}}
 {{/each}}
 {{/if}}
+{{> orphan_tasks}}

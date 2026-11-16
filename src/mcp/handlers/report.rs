@@ -16,17 +16,17 @@ use serde_json::{json, Value};
 use super::doc_export::{self, PdfOptions, PdfSource, FORMAT_PDF};
 use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
-use crate::report::period::{parse_date, Period};
 use crate::report::sections::{self, SectionSpec};
 use crate::report::store::{self, RenderOptions};
 use crate::report::trace_diagram::{self, TraceDiagram};
 use crate::report::verification::{build_verification_data, VerificationInputs};
 use crate::report::{
-    charts, completion, daily, defect, effort, milestone, monthly, rollup, weekly,
+    charts, completion, daily, defect, effort, milestone, monthly, orphan, rollup, weekly,
 };
 use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::docs::pdf::template::CoverMeta;
+use crate::storage::orphan_tasks::load_orphan_tasks;
 use crate::storage::runs;
 use crate::storage::tasks::{collect_all_tasks, find_task_dir_by_id, task_status_only};
 use crate::storage::test_runs::find_test_run;
@@ -94,11 +94,51 @@ fn generate_flag(arguments: &Value, key: &str, action: &str) -> Result<Option<bo
     }
 }
 
+/// Parse the `charts` argument (SPEC-VIS-006/007).
+///
+/// - Absent/null: `None` (caller decides default)
+/// - `"none"`: [`ChartFilter::None`]
+/// - `[]` (empty array): [`ChartFilter::None`]
+/// - `["burndown", "velocity"]`: [`ChartFilter::Ids`]
+/// - anything else: error
+fn parse_charts_param(arguments: &Value, action: &str) -> Result<Option<ChartFilter>> {
+    match generate_only(arguments, "charts", action)? {
+        None => Ok(None),
+        Some(Value::String(s)) if s == "none" => Ok(Some(ChartFilter::None)),
+        Some(Value::String(s)) => bail!("'charts' string value must be \"none\", got \"{s}\""),
+        Some(Value::Array(arr)) => {
+            if arr.is_empty() {
+                return Ok(Some(ChartFilter::None));
+            }
+            let mut ids = Vec::with_capacity(arr.len());
+            for (i, v) in arr.iter().enumerate() {
+                match v.as_str() {
+                    Some(s) => ids.push(s.to_string()),
+                    None => bail!("'charts[{i}]' must be a string"),
+                }
+            }
+            Ok(Some(ChartFilter::Ids(ids)))
+        }
+        Some(_) => bail!("'charts' must be \"none\", an array of chart ID strings, or null"),
+    }
+}
+
+/// Which charts the `charts` parameter selects (SPEC-VIS-006/007).
+#[derive(Clone, Debug, PartialEq)]
+enum ChartFilter {
+    /// Absent/null: include all available charts (default).
+    All,
+    /// The string `"none"` or an empty array: exclude all charts.
+    None,
+    /// An array of chart ID strings: include only those charts.
+    Ids(Vec<String>),
+}
+
 /// Which generated content `generate` inserts into the report.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Inserts {
-    /// Mermaid charts (REQ-PDF-031).
-    charts: bool,
+    /// Chart filter (SPEC-VIS-006/007): which charts to include.
+    charts: ChartFilter,
     /// The traceability link diagram (REQ-PDF-033).
     trace_diagram: bool,
 }
@@ -113,7 +153,8 @@ struct Compose {
 
 impl Compose {
     fn from_arguments(arguments: &Value, action: &str) -> Result<Self> {
-        let charts = generate_flag(arguments, "include_charts", action)?;
+        let include_charts = generate_flag(arguments, "include_charts", action)?;
+        let charts_param = parse_charts_param(arguments, action)?;
         let trace_diagram = generate_flag(arguments, "include_trace_diagram", action)?;
         let template = match generate_only(arguments, "report_template", action)? {
             None => None,
@@ -127,7 +168,12 @@ impl Compose {
         let sections = generate_only(arguments, "sections", action)?
             .map(SectionSpec::parse_list)
             .transpose()?;
-        let inserts = resolve_inserts(sections.as_deref(), charts, trace_diagram)?;
+        let inserts = resolve_inserts(
+            sections.as_deref(),
+            charts_param.as_ref(),
+            include_charts,
+            trace_diagram,
+        )?;
         Ok(Self {
             template,
             sections,
@@ -136,36 +182,64 @@ impl Compose {
     }
 }
 
-/// What `generate` inserts. Without `sections` the `include_*` flags decide
-/// (default: on). With `sections`, a section is generated only when selected;
-/// `include_*: true` additionally generates it for a `custom` section's
-/// template to use, and `include_*: false` together with the section that
-/// shows it is a contradiction.
+/// What `generate` inserts. Without `sections` the chart filter / legacy
+/// bool and `include_trace_diagram` flag decide (defaults: all charts,
+/// diagram on). With `sections`, a section is generated only when selected;
+/// explicitly requesting charts additionally generates them for a `custom`
+/// section's template to use, and requesting none together with the section
+/// that shows charts is a contradiction.
+///
+/// `charts_param` is the new `charts` argument (`"none"` / `["id",...]`).
+/// `include_charts` is the legacy boolean. `charts_param` wins when present.
 fn resolve_inserts(
     sections: Option<&[SectionSpec]>,
-    charts: Option<bool>,
+    charts_param: Option<&ChartFilter>,
+    include_charts: Option<bool>,
     trace_diagram: Option<bool>,
 ) -> Result<Inserts> {
+    // Reconcile the two chart arguments into a single ChartFilter.
+    // charts_param takes precedence over the legacy boolean.
+    let (chart_filter, chart_explicit) = match (charts_param, include_charts) {
+        (Some(f), _) => (f.clone(), true),
+        (None, Some(true)) => (ChartFilter::All, true),
+        (None, Some(false)) => (ChartFilter::None, true),
+        (None, None) => (ChartFilter::All, false), // default
+    };
+
     let Some(sections) = sections else {
         return Ok(Inserts {
-            charts: charts.unwrap_or(true),
+            charts: chart_filter,
             trace_diagram: trace_diagram.unwrap_or(true),
         });
     };
-    let resolve = |flag: Option<bool>, selected: bool, flag_name: &str, section: &str| {
+
+    // Sections-aware resolution: mirror the old bool logic.
+    let charts_selected = sections::selects_charts(sections);
+    let charts_filter = match (&chart_filter, charts_selected, chart_explicit) {
+        (ChartFilter::None, true, _) => {
+            bail!(
+                "'charts': \"none\" (or 'include_charts': false) contradicts \
+                 the 'charts' entry in 'sections'"
+            );
+        }
+        // Section selected: use the caller's chart filter.
+        (_, true, _) => chart_filter,
+        // Section not selected but caller explicitly wants charts (for custom
+        // template usage): generate them.
+        (_, false, true) if chart_filter != ChartFilter::None => chart_filter,
+        // Not selected, not explicitly requested: no charts.
+        _ => ChartFilter::None,
+    };
+
+    let resolve_flag = |flag: Option<bool>, selected: bool, flag_name: &str, section: &str| {
         if flag == Some(false) && selected {
             bail!("'{flag_name}': false contradicts the '{section}' entry in 'sections'");
         }
         Ok(selected || flag == Some(true))
     };
     Ok(Inserts {
-        charts: resolve(
-            charts,
-            sections::selects_charts(sections),
-            "include_charts",
-            "charts",
-        )?,
-        trace_diagram: resolve(
+        charts: charts_filter,
+        trace_diagram: resolve_flag(
             trace_diagram,
             sections::selects_trace_diagram(sections),
             "include_trace_diagram",
@@ -300,10 +374,10 @@ fn generate(
         ReportType::Inspection => inspection_data(ctx, &scope, data)?,
         _ => data,
     };
-    let data = if inserts.charts {
-        with_charts(ctx, report_type, &scope, data)?
-    } else {
-        data
+    let data = with_orphan_tasks(ctx, report_type, data)?;
+    let data = match &inserts.charts {
+        ChartFilter::None => data,
+        filter => with_charts(ctx, report_type, &scope, data, filter)?,
     };
     let data = if inserts.trace_diagram {
         with_trace_diagram(ctx, report_type, &scope, data)?
@@ -336,34 +410,141 @@ fn generate(
     Ok(out)
 }
 
-/// Adds the report type's Mermaid charts (see [`charts`]) to `data.charts`
-/// for the templates to render. A `charts` key the caller passed in `data`
-/// is left alone, so a caller can supply or suppress charts themselves.
+/// Fallback note inserted when the VSCode extension is not running and chart
+/// images cannot be generated.
+const CHART_UNAVAILABLE_NOTE: &str = "VSCode拡張が未起動のためチャート画像を生成できませんでした";
+
+/// Adds the report type's charts to `data.charts` for the templates to render.
+/// Each chart value is either a `![](path)` image reference (when the VSCode
+/// extension rendered the chart) or a fallback note (when it did not respond).
+///
+/// `filter` controls which charts are generated (SPEC-VIS-006/007):
+/// - [`ChartFilter::All`]: all charts the report type needs (default).
+/// - [`ChartFilter::Ids`]: only the named charts; unknown IDs are warned.
+/// - [`ChartFilter::None`]: caller should not call this function.
+///
+/// A `charts` key the caller passed in `data` is left alone, so a caller can
+/// supply or suppress charts themselves.
 fn with_charts(
     ctx: &HandlerContext,
     report_type: ReportType,
-    scope: &ReportScope,
+    _scope: &ReportScope,
     mut data: Value,
+    filter: &ChartFilter,
 ) -> Result<Value> {
     if data.get("charts").is_some() {
         return Ok(data);
     }
+
+    // Check whether the report type + data warrant charts at all.
+    // This reuses build_charts' data checks so report types without
+    // meaningful data (e.g. effort with no time logged) skip the file
+    // channel entirely.
     let progress = matches!(report_type, ReportType::Weekly | ReportType::Monthly);
-    // Weekly/monthly generation resolved the period into scope.from/to.
-    let period = match (&scope.from, &scope.to) {
-        (Some(from), Some(to)) if progress => {
-            Some(Period::new(parse_date(from)?, parse_date(to)?)?)
-        }
-        _ => None,
-    };
     let tasks = if progress {
         all_tasks(ctx)?
     } else {
         Vec::new()
     };
-    let built = charts::build_charts(report_type, &data, &tasks, period);
-    if !built.is_empty() {
-        data["charts"] = Value::Object(built);
+    let needed = charts::build_charts(report_type, &data, &tasks, None);
+    if needed.is_empty() && !progress {
+        return Ok(data);
+    }
+
+    // Determine which view to request from the VSCode extension.
+    let view = match report_type {
+        ReportType::Weekly
+        | ReportType::Monthly
+        | ReportType::Effort
+        | ReportType::Completion
+        | ReportType::Daily
+        | ReportType::Quarterly
+        | ReportType::Yearly => crate::charts::file_channel::ChartView::Metrics,
+        ReportType::Verification => crate::charts::file_channel::ChartView::Metrics,
+        ReportType::Milestone => crate::charts::file_channel::ChartView::Gantt,
+        ReportType::Inspection | ReportType::Defect => {
+            return Ok(data);
+        }
+    };
+
+    use crate::charts::file_channel::{self, ChartFormat, ChartRequest, ChartResult};
+    let charts_dir = ctx.handoff_dir.join("charts/output");
+    if !charts_dir.exists() {
+        std::fs::create_dir_all(&charts_dir)?;
+    }
+
+    // Send one SVG request per view; the extension returns all charts for that
+    // view in a single response (each as a separate file in output_paths).
+    let request = ChartRequest {
+        view,
+        format: ChartFormat::Svg,
+        filters: serde_json::json!({
+            "report_type": report_type.as_str(),
+        }),
+        output_path: charts_dir.to_string_lossy().to_string(),
+    };
+    let per_timeout = file_channel::per_chart_timeout();
+    let result = file_channel::request_chart(&ctx.handoff_dir, &request, per_timeout)?;
+
+    let output_paths = match &result {
+        ChartResult::Success { output_paths } | ChartResult::Partial { output_paths, .. }
+            if !output_paths.is_empty() =>
+        {
+            output_paths.clone()
+        }
+        _ => {
+            // Timeout or error: no charts available.
+            let mut chart_values = serde_json::Map::new();
+            chart_values.insert(
+                "unavailable".to_string(),
+                Value::String(CHART_UNAVAILABLE_NOTE.to_string()),
+            );
+            data["charts"] = Value::Object(chart_values);
+            if let ChartFilter::Ids(ids) = filter {
+                for id in ids {
+                    crate::report::push_data_warning(
+                        &mut data,
+                        format!("Unknown chart ID '{id}' ignored (no charts available)"),
+                    )?;
+                }
+            }
+            return Ok(data);
+        }
+    };
+
+    // Build chart map from all returned SVG files, keyed by file stem
+    // (e.g. "burndown_line.svg" → key "burndown_line").
+    let mut chart_values = serde_json::Map::new();
+    let mut chart_warnings: Vec<String> = Vec::new();
+    for path in &output_paths {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        chart_values.insert(
+            stem.to_string(),
+            Value::String(format!("![{}]({})", stem, path)),
+        );
+    }
+
+    // Apply the chart filter.
+    if let ChartFilter::Ids(ids) = filter {
+        for id in ids {
+            if !chart_values.contains_key(id) {
+                chart_warnings.push(format!(
+                    "Unknown chart ID '{id}' ignored (available: {})",
+                    chart_values.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        chart_values.retain(|name, _| ids.iter().any(|id| id == name));
+    }
+    if !chart_values.is_empty() {
+        data["charts"] = Value::Object(chart_values);
+    }
+    // Push chart warnings into data.warnings.
+    for w in &chart_warnings {
+        crate::report::push_data_warning(&mut data, w.clone())?;
     }
     Ok(data)
 }
@@ -393,17 +574,31 @@ fn with_trace_diagram(
             data["trace_diagram"] = Value::String(graph.trim_end().to_string());
         }
         TraceDiagram::Empty => {}
-        TraceDiagram::TooLarge { nodes } => {
-            let note = json!(format!(
+        TraceDiagram::TooLarge { nodes } => crate::report::push_data_warning(
+            &mut data,
+            format!(
                 "The traceability diagram was left out: {nodes} items exceed the limit of {} (narrow scope.layers / scope.items)",
                 trace_diagram::MAX_NODES
-            ));
-            match data.get_mut("warnings") {
-                None | Some(Value::Null) => data["warnings"] = json!([note]),
-                Some(Value::Array(warnings)) => warnings.push(note),
-                Some(_) => bail!("'data.warnings' must be an array"),
-            }
-        }
+            ),
+        )?,
+    }
+    Ok(data)
+}
+
+/// Adds the orphan-task list (see [`orphan`]) to `data.orphan_tasks` of the
+/// periodic reports: the tasks the shared orphan predicate reports, the same
+/// set as the `task_orphan` lint rule. The key stays absent when there is no
+/// orphan, so such a report is unchanged. An `orphan_tasks` key the caller
+/// passed in `data` is left alone, so a caller can supply or suppress the
+/// section themselves. A check that fails is reported in `data.warnings`
+/// instead of failing the report or passing for "no orphan".
+fn with_orphan_tasks(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    mut data: Value,
+) -> Result<Value> {
+    if orphan::needs_collection(report_type, &data) {
+        orphan::apply(&mut data, load_orphan_tasks(&ctx.handoff_dir))?;
     }
     Ok(data)
 }

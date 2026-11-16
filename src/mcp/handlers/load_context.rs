@@ -654,7 +654,37 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     result["requirements_health"] = requirements_health;
     result["docs_health"] = docs_health;
 
+    // SPEC-ONB-011: opt-in, and read last, so that it describes the project
+    // as this call leaves it (a session it activated counts) and equals what
+    // `handoff_next_step` answers right after. Without the setting nothing
+    // is read and no key is added.
+    if config.onboarding.next_step() {
+        match super::next_step::for_project(project_dir, Some(handoff)) {
+            Ok(step) => {
+                result["next_step"] = serde_json::to_value(&step).context("serialize next_step")?;
+            }
+            // Guidance that cannot be worked out must not cost the caller
+            // its context: say so and leave the key out.
+            Err(e) => push_warning(
+                &mut result,
+                format!(
+                    "next_step could not be determined: {e:#}. Call handoff_next_step once \
+                     the cause is fixed."
+                ),
+            ),
+        }
+    }
+
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// Appends `message` to the `warnings` array of the response, creating the
+/// array when the call produced no warning before.
+fn push_warning(result: &mut Value, message: String) {
+    match result.get_mut("warnings").and_then(Value::as_array_mut) {
+        Some(warnings) => warnings.push(Value::String(message)),
+        None => result["warnings"] = serde_json::json!([message]),
+    }
 }
 
 /// The instruction that goes with `ambiguous: true`: the server could not tell

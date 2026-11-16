@@ -140,6 +140,7 @@ missing `estimate_hours` is refused, costing a round trip.
 - [ ] `priority` — `low` / `medium` / `high`
 - [ ] `labels` — at least one, so the task is findable by filter
 - [ ] `assignee` — matches a key in `config.toml [assignees.<key>]`
+- [ ] `requirement_ids` — the requirement(s) the task implements, or the label `no-trace`; without either, a project with layer documents answers with `Info [REQUIREMENT_LINK_MISSING]` and a `handoff_trace_propose` hint ([references/requirement-links.md](references/requirement-links.md))
 
 A minimal accepted payload:
 
@@ -303,20 +304,20 @@ Before assigning dates to tasks, check available capacity:
 
 ### Milestone Management
 
-- `handoff_list_milestones` — list all milestones (`name → {date, color, description}`).
+- `handoff_list_milestones` — list all milestones (`name → {date, color, description}`); takes `status_filter`.
 - `handoff_add_milestone` — add a milestone: `name` (required), `date`, `color`, `description`.
 - `handoff_update_milestone` — patch an existing milestone (partial).
 - `handoff_remove_milestone` — remove a milestone.
-
-The lifecycle fields below are also accepted by the add/update tools: `status`, `order`, `depends_on` (plus `version`); `handoff_list_milestones` takes `status_filter`.
+- The add/update tools also accept the lifecycle fields below: `status`, `order`, `depends_on` (plus `version`).
 
 #### Milestone lifecycle
 
 `planning` (default when unset) → `active` → `completed` → `frozen` → `released`. `cancelled` is allowed from any status.
 
 - `handoff_update_milestone(status=...)` only accepts forward moves. A backward move (e.g. `frozen` → `active`) or leaving `cancelled` is rejected unless `force: true`.
-- **Frozen guard**: assigning a task (`schedule.milestone`) to a `frozen` milestone still succeeds but returns a warning, which guards against scope creep. Move the task elsewhere, or unfreeze deliberately with `force: true`.
+- **Frozen guard**: assigning a task (`schedule.milestone`) to a `frozen` milestone still succeeds but returns a warning, which guards against scope creep. Move the task elsewhere, or unfreeze deliberately with `force: true`. **Unknown milestone**: assigning a task (`schedule.milestone` in `handoff_update_task`, `handoff_bulk_update_tasks`, `handoff_import_context`, or the `default_milestone` of `handoff_trace_tasks`) to a name that has no `[milestones.<name>]` definition also succeeds but returns a `Warning [UNKNOWN_MILESTONE]`. Check the spelling, or define the milestone with `handoff_add_milestone`: the milestone list and the release check only know defined milestones.
 - `depends_on` lists the milestones that must finish first. A name that is undefined or the milestone itself is saved with a warning.
+- **Release guard**: with `[onboarding] release_guard = "warn"` or `"block"`, `handoff_update_milestone(status: "released")` consults the items of `handoff_release_check` without running a command (`tests_pass` / `smoke_pass` / `dependencies_audited` come from the last recorded result; no record means not verified). `warn` releases and returns one `Warning: release check: <id> [<status>] <detail>` line per item that did not pass (show them to the user); `block` rejects the call unless `force: true` (pass it only when the user decided to release anyway). Run `handoff_release_check` and report fresh results first; with `off` (the default) nothing is checked. Details: [references/onboarding.md](references/onboarding.md).
 
 #### Reading the Dashboard Milestones section
 
@@ -328,7 +329,7 @@ The lifecycle fields below are also accepted by the add/update tools: `status`, 
 2. Set `depends_on` for ordering constraints between milestones.
 3. When scope is settled, move it to `active`.
 4. When scope is locked, move it to `frozen`; later task additions warn.
-5. After shipping, move it to `released`.
+5. Before shipping, run `handoff_release_check(milestone)` until `ok` is true. After shipping, move it to `released` (see Release guard above).
 6. Run `handoff_auto_schedule` (dry run) and check `milestone_summary` for overdue milestones; fix any `depends_on` cycle it reports.
 7. Generate the milestone report with `handoff_report(action="generate", report_type="milestone", scope={milestone: "<name>"})`.
 
@@ -427,13 +428,13 @@ see the `handoff-docs` skill for the distinction. For V-model layer documents
 `handoff_get_config()` returns the whole `config.toml` as JSON.
 `handoff_update_config(updates: {"<dotted.key>": value, ...})` writes keys
 (up to 4 segments; arrays and objects are accepted):
-- **V-model**: `trace.profile`, `trace.done_guard`, `trace.auto_layer`,
-  `trace.id_prefixes.<layer>` — every key is listed in the `handoff-trace`
-  skill's `references/config.md`. `trace.*` values are not validated on
-  write; check with `handoff_trace_report()` afterwards.
+- **V-model**: `trace.profile`, `trace.done_guard`, `trace.orphan_guard`, `trace.auto_layer`,
+  `trace.id_prefixes.<layer>` — every key is listed in the `handoff-trace` skill's
+  `references/config.md`; check the result with `handoff_trace_report()` afterwards.
 - **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`, `calendar.work_start_hour` (0-23), `calendar.work_end_hour` (1-24), `calendar.max_parallel_tasks` (>= 1). Work-hour keys are range-checked on write (start < end), including when `calendar` is set as a whole object. The same rules apply to raw `assignees.<key>.work_start_hour` / `work_end_hour` keys.
 - **Per-weekday hours**: `calendar.day_hours.fri` (number)
 - **Budget**: `effort_budget.total_hours`
+- **Next step, readiness, release check, commands and onboarding**: `handoff_next_step()` names the project's state (one of nine, from `not_initialized` to `all_done`) and the one operation to do next (`action.command`: a slash command, a tool call or a sentence); read-only, and with `onboarding.next_step = true` `handoff_load_context` carries the same answer as its `next_step` key (it is not `handoff_trace_next`, the worklist of verification items); `handoff_doctor()` diagnoses whether the project is ready for agent-driven work, and `handoff_release_check(milestone)` whether a milestone is ready to ship (neither ever runs commands: run their `commands_to_run` yourself and report the `results`; a `skip` is never a pass); both report `secrets_untracked` (a secrets file tracked by Git, matched by file name only) and `dependencies_audited`; `release.manual_checks` lists the items a person confirms; `commands.<install|build|test|lint|format|typecheck|smoke|audit>` (shell command lines, the source of truth for the project's commands), `onboarding.*`, and the `beginner` preset (`handoff_init(preset: "beginner")` / `handoff_update_config(preset: "beginner")`) — see [references/onboarding.md](references/onboarding.md)
 - **Assignees**: `assignees.<key>.display_name`, `assignees.<key>.color`, `assignees.<key>.work_hours_per_day`, `assignees.<key>.closed_weekdays`, `assignees.<key>.work_start_hour`, `assignees.<key>.work_end_hour`
 - **Gantt view**: `gantt_view.sort`, `gantt_view.zoom`, `gantt_view.mode`, `gantt_view.group_by_milestone`, `gantt_view.show_workload`
 

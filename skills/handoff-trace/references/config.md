@@ -19,6 +19,7 @@ configured, the effective behavior is:
 | used layers | auto-detected: every registered layer that has at least one item |
 | project profile | none (so no implicit acceptance items, no `default_needs` gating) |
 | `done_guard` | `warn` |
+| `orphan_guard` | `warn`, but silent until the project has a layer document (§5) |
 | `auto_layer` | `false` (documents only become layer documents when you pass `layer=`) |
 | lint | every built-in rule at its default severity, no policy rules |
 
@@ -121,6 +122,7 @@ coverage and state (lint `layer_outside_profile`, info).
 | `[[trace.layer]]` | array of tables | none | declares a custom layer (§4.2) | see §4.2 |
 | `[trace] profile` | string | unset (auto) | project default profile: a built-in name or a `[trace.profiles.<name>]` key | `profile = "standard"` |
 | `[trace] done_guard` | `"warn"` \| `"block"` \| `"off"`, or a `[trace.done_guard]` table (`mode`, `check_suspects`, `check_profile_layers`, `check_code_drift`) | `"warn"` | what happens when a task with outstanding verification moves to review/done (§5) | `done_guard = "block"` |
+| `[trace] orphan_guard` | `"warn"` \| `"block"` \| `"off"` | `"warn"` | what happens when a task with no requirement link moves to review/done (§5) | `orphan_guard = "block"` |
 | `[trace.profiles.<name>]` | table | none | custom profile (§4.4) | `[trace.profiles.web]` |
 | `[trace.lint.rules]` `<rule> = "<sev>"` | table of strings | `{}` | per-rule severity override (§7) | `unverified = "error"` |
 | `[[trace.lint.require]]` | array of tables | none | project policy rules (§7) | see §7 |
@@ -363,7 +365,7 @@ list and how to clear each: `verification.md` → done guard.
 | `off` | no check |
 
 Any other value is treated as `warn`. Tasks without requirement links are
-never affected.
+never affected by `done_guard`; they are what `orphan_guard` below looks at.
 
 `done_guard` also accepts a table that switches individual checks off
 (each defaults to `true`; the bare-string form keeps them all on):
@@ -385,6 +387,54 @@ rejected into `errors[]` (the others still apply) unless the call carries
 `force: true`; in `warn` mode it is applied and a `warnings[]` entry
 (`{task_id, warning}`) is returned. Edits made outside the MCP tools — a UI
 that writes task files directly — still bypass the guard.
+
+### `orphan_guard`
+
+Applies when `handoff_update_task` moves a task to `review` or `done`, or
+creates one directly in either status, and the task is an **orphan**: it has
+no requirement link (`requirement_ids` was never set; a document link does
+not count). It is independent of `done_guard`: one looks at tasks without a
+link, the other at tasks with one.
+
+| value | behavior |
+|---|---|
+| `warn` (default) | the transition applies and a `Warning [ORPHAN_TASK]: ...` line is appended to the response, saying how to link the task or exclude it |
+| `block` | the call is rejected and nothing is changed, unless `force: true` |
+| `off` | no check; the response is the same as without the guard |
+
+Never affected, under any value:
+
+- a task labelled `no-trace` (the label may be added in the same call);
+- a task that gets its link in the same call (`requirement_ids` that
+  resolve), and a task that keeps at least one link;
+- a parent task whose leaf tasks are all linked, `no-trace` or `skipped`;
+- every task of a project that has **no layer document**: such a project
+  does not use requirement traceability.
+
+The judgement is the one the `task_orphan` lint rule makes
+(`lint-rules.md`), so lint and guard always agree. Only a status *change*
+into `review`/`done` is checked: editing a task that stays there is not.
+`handoff_bulk_update_tasks` applies the guard per update: in `block` mode an
+orphan's update goes to `errors[]` (the others still apply) unless the call
+carries `force: true`; in `warn` mode it is applied with a `warnings[]`
+entry. `handoff_import_context` is an import of existing state and is not
+guarded; run `trace_lint` afterwards. A value other than the three above is
+rejected by `handoff_update_config`; in a hand-edited file it reads as
+`warn`.
+
+A document whose frontmatter cannot be parsed does not count as a layer
+document. When no readable document declares a layer but some document is
+unreadable, the guard cannot tell whether the project uses requirement
+traceability, and it does not guess: `block` rejects the call with
+`orphan_guard check failed: ...` (`force: true` overrides), `warn` applies it
+and appends `Warning: orphan_guard check failed: ...`. Repair the document
+with `handoff_doc_repair_frontmatter`; `trace_lint` lists it as
+`frontmatter_invalid`.
+
+```toml
+[trace]
+orphan_guard = "block"       # warn | block | off
+```
 
 ## 6. `auto_layer` and `plan_default_layer`
 
@@ -464,6 +514,7 @@ silently skipped.
 # layers = ["requirement", "basic_spec", "acceptance", "system_test"]
 profile = "web"
 done_guard = "block"                 # review/done needs passing verification (force: true overrides)
+orphan_guard = "block"               # review/done needs a requirement link or the no-trace label
 auto_layer = true                    # spec -> requirement, design/plan -> layer below
 plan_default_layer = "basic_spec"
 

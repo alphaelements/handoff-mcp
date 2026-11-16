@@ -1940,6 +1940,43 @@ mod tests {
         }
     }
 
+    /// The generated tasks go through `handoff_update_task`'s creation, so a
+    /// `default_milestone` that config.toml does not define is reported, once
+    /// for the whole call; a defined one is not.
+    #[test]
+    fn an_undefined_default_milestone_is_reported_once() {
+        let unknown_lines = |default_milestone: &str| -> Vec<String> {
+            let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+            std::fs::write(
+                handoff.join("config.toml"),
+                "[project]\nname = \"t\"\n\n[milestones.v0-1]\n",
+            )
+            .unwrap();
+            let mut args = apply_args();
+            args["default_milestone"] = json!(default_milestone);
+            let out = run(&c, args);
+            assert_eq!(out["created"].as_array().unwrap().len(), 2, "{out}");
+            out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|w| w.as_str())
+                .filter(|w| w.contains("UNKNOWN_MILESTONE"))
+                .map(String::from)
+                .collect()
+        };
+
+        assert_eq!(
+            unknown_lines("v0-9"),
+            [
+                "Warning [UNKNOWN_MILESTONE]: Milestone 'v0-9' does not match any milestone \
+              defined in config.toml. Check the milestone name spelling or define it with \
+              handoff_add_milestone. The assignment was still saved."
+            ]
+        );
+        assert_eq!(unknown_lines("v0-1"), Vec::<String>::new());
+    }
+
     #[test]
     fn no_default_milestone_leaves_tasks_without_milestone() {
         let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);

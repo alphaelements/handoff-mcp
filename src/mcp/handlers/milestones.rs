@@ -11,10 +11,12 @@ use super::config_crud::{
     config_path, ensure_subtable, ensure_table, load_doc, require_str, save_doc, set_opt_i64,
     set_opt_str, set_string_array,
 };
+use super::release_check::check_against_record;
 use super::HandlerContext;
+use crate::release::guard::{judge, GuardMode, Verdict};
 use crate::storage::config::{
     is_forward_milestone_transition, read_config_lenient, MILESTONE_DEFAULT_STATUS,
-    MILESTONE_FROZEN_STATUS, MILESTONE_STATUSES,
+    MILESTONE_FROZEN_STATUS, MILESTONE_RELEASED_STATUS, MILESTONE_STATUSES,
 };
 
 /// handoff_list_milestones — return every `[milestones.*]` entry, ordered by
@@ -74,6 +76,19 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
     }
     let fields = ValidatedFields::parse(arguments)?;
+    // New milestones must start at `planning` (the default). Any other status
+    // bypasses the lifecycle transition check and the release guard that
+    // handoff_update_milestone enforces (t454).
+    if let Some(status) = fields.status {
+        if status != MILESTONE_DEFAULT_STATUS {
+            anyhow::bail!(
+                "Cannot create milestone '{name}' with status '{status}'. \
+                 New milestones always start at '{MILESTONE_DEFAULT_STATUS}'. \
+                 Use handoff_update_milestone to transition to a different status \
+                 (lifecycle transition and release_guard are enforced there)."
+            );
+        }
+    }
     let mut sub = Table::new();
     fields.apply(&mut sub, arguments);
     let mut msg = format!("Added milestone '{name}'");
@@ -86,7 +101,8 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
 /// handoff_update_milestone — patch an existing `[milestones.<name>]` entry.
 /// A `status` change must follow the lifecycle (see
-/// `is_forward_milestone_transition`) unless `force` is true.
+/// `is_forward_milestone_transition`) unless `force` is true. A move to
+/// `released` is also put to the release guard (see [`release_guard_warnings`]).
 pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let path = config_path(ctx)?;
     let name = require_str(arguments, "name")?;
@@ -102,6 +118,7 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     };
 
     let fields = ValidatedFields::parse(arguments)?;
+    let mut release_warnings = Vec::new();
     if let Some(target) = fields.status {
         let force = arguments
             .get("force")
@@ -115,16 +132,51 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                  from any status). Pass force: true to override."
             );
         }
+        if target == MILESTONE_RELEASED_STATUS && current != MILESTONE_RELEASED_STATUS {
+            release_warnings = release_guard_warnings(ctx, &doc, name, force)?;
+        }
     }
 
     let milestones = ensure_table(&mut doc, "milestones")?;
     let mut msg = format!("Updated milestone '{name}'");
     append_dependency_warnings(&mut msg, name, &fields.depends_on, milestones);
+    for warning in &release_warnings {
+        msg.push_str(&format!("\nWarning: {warning}"));
+    }
     let sub = ensure_subtable(&mut doc, "milestones", name)?;
     fields.apply(sub, arguments);
 
     save_doc(&path, &doc)?;
     Ok(msg)
+}
+
+/// The release guard (SPEC-ONB-041), asked when milestone `name` is about to
+/// become `released`. With `[onboarding] release_guard` off (the default)
+/// nothing is read and nothing is returned, so the reply is what it has
+/// always been. Otherwise the milestone's pre-release check is read with the
+/// command items answered from the record (no command is run, nothing is
+/// written): `warn` returns a line for everything that did not pass, `block`
+/// fails the call instead unless `force` is set.
+fn release_guard_warnings(
+    ctx: &HandlerContext,
+    doc: &toml_edit::DocumentMut,
+    name: &str,
+    force: bool,
+) -> Result<Vec<String>> {
+    let setting = doc
+        .get("onboarding")
+        .and_then(|section| section.get("release_guard"))
+        .and_then(|value| value.as_str());
+    let mode = GuardMode::from_setting(setting);
+    if mode == GuardMode::Off {
+        return Ok(Vec::new());
+    }
+    let check = check_against_record(&ctx.project_dir, &ctx.handoff_dir, name)
+        .map_err(|e| format!("{e:#}"));
+    match judge(mode, force, name, check.as_ref().map_err(String::as_str)) {
+        Verdict::Release { warnings } => Ok(warnings),
+        Verdict::Refuse { message } => anyhow::bail!(message),
+    }
 }
 
 /// handoff_remove_milestone — delete a `[milestones.<name>]` entry.
@@ -250,6 +302,61 @@ fn append_dependency_warnings(msg: &mut String, name: &str, depends_on: &[&str],
             ));
         }
     }
+}
+
+/// Machine-readable code of the warning for a task milestone that has no
+/// `[milestones.<name>]` definition. Plain-text responses carry it in brackets,
+/// like `DANGLING_DEPENDENCY`, so consumers can match on it without parsing
+/// the prose.
+pub const UNKNOWN_MILESTONE_CODE: &str = "UNKNOWN_MILESTONE";
+
+/// The milestone name a task payload asks for: `schedule.milestone` of a
+/// `handoff_update_task` task, a `handoff_bulk_update_tasks` update or a
+/// `handoff_import_context` task. `None` when the payload does not pass one.
+pub fn requested_task_milestone(task: &Value) -> Option<&str> {
+    task.get("schedule")?.get("milestone")?.as_str()
+}
+
+/// Advisory warnings for the milestone names a call assigns tasks to: one
+/// line per distinct name, in name order, that has no `[milestones.<name>]`
+/// definition in config.toml. Such a name is most often a typing mistake, and
+/// its tasks are missed by everything that works from the definitions (the
+/// milestone list, the release check).
+///
+/// `requested` holds the names the call itself passed. A name a task already
+/// had is not reported by a call that does not pass it, and a name that is
+/// passed again is reported again, as it is still undefined. An empty string
+/// is not a name. Never blocks: the name is stored as given.
+///
+/// A missing or unreadable config.toml yields no warning, because nobody can
+/// then tell which milestones are defined. The config problem itself is
+/// reported by [`frozen_assignment_warning`] and by the tools that own the
+/// config.
+pub fn unknown_milestone_warnings<'a>(
+    handoff_dir: &Path,
+    requested: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let names: std::collections::BTreeSet<&str> = requested
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let (Some(config), _) = read_config_lenient(handoff_dir) else {
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter(|name| !config.milestones.contains_key(*name))
+        .map(|name| {
+            format!(
+                "Warning [{UNKNOWN_MILESTONE_CODE}]: Milestone '{name}' does not match any \
+                 milestone defined in config.toml. Check the milestone name spelling or define \
+                 it with handoff_add_milestone. The assignment was still saved."
+            )
+        })
+        .collect()
 }
 
 /// Advisory warning for moving a task into a frozen milestone (REQ-MS-CFG-002).

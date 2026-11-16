@@ -262,8 +262,9 @@ handoff_trace_lint(action?: "lint"|"quality_prompt"|"nfr_check"="lint",
 **`action="lint"`**
 
 ```
--> {findings:[{rule, severity, item?, task?, doc?, message}], counts:{error, warning, info},
-    exit_code, warnings, text?}
+-> {findings:[{rule, severity, item?, task?, doc?, message,
+               task_id?, title?, suggested_action?}],      # the last three: task_orphan only
+    counts:{error, warning, info}, exit_code, warnings, text?}
 ```
 
 - Evaluates the built-in rules together with the project's `[[trace.lint.require]]` policy rules. The full rule list, default severities and policy syntax are in `lint-rules.md`. Per-rule severity overrides (`[trace.lint.rules]`) are in `config.md`.
@@ -904,7 +905,7 @@ handoff_report(action: "generate"|"templates"|"list"|"get"|"submit"|"approve"|"r
 | `{type: "charts"}`, `{type: "trace_diagram"}` | the Mermaid charts / the traceability diagram; they are only generated when an entry shows them |
 | `{type: "ai_summary"}`, `ai_analysis`, `ai_risks`, `ai_recommendations`, `ai_sections` | the `data.ai_*` sections (`ai_sections` = all four) |
 | `{type: "task_list"}` | `Completed Tasks`, `In Progress`, `Blockers`, `Tasks`, `Defects` (whichever the report has) |
-| `{type: "section", heading: "Next Week"}` | any section of the report by heading (case-insensitive) |
+| `{type: "section", heading: "Next Week"}` | any section of the report by heading (case-insensitive), for example `Orphan Tasks` |
 | `{type: "custom", title?, body?, template?}` | literal Markdown and/or a registered template rendered with `{report, data}` |
 
 `sections` supersedes `include_charts` / `include_trace_diagram`: setting one of them to `false` together with the entry that shows it is an error. An entry that matches nothing is listed in `section_warnings` with the headings the report does have.
@@ -925,6 +926,27 @@ handoff_report(action: "generate"|"templates"|"list"|"get"|"submit"|"approve"|"r
 | `milestone` | `milestone` (**required**), `label`. Any other field is an error. | The milestone must exist in `config.toml` or in some task's `schedule.milestone` | Planned vs actual date with a status (`achieved|achieved_late|overdue|on_track|no_date|no_tasks`), tasks with delays and hours, bug counts and open bugs, and project verification state. |
 | `defect` | `period`/`from`/`to` (by bug `created_at`), `assignee`, `layers`, `items` | `layers`/`items` need a buildable trace graph | The defect register (described below). |
 | `completion` | `label` only | The trace report's `project_status` must be **`complete`** (every layer `approved`). Otherwise the call is refused and nothing is written. | Project dates and task totals, per-layer verification, milestones, the defect register, effort vs estimate by assignee, and the approved reports. |
+
+**Orphan Tasks section.** The periodic reports (`daily`, `weekly`, `monthly`, `quarterly`, `yearly`) end with an `Orphan Tasks` section, after every other section including `Warnings`:
+
+```
+## Orphan Tasks
+
+2 task(s) have no requirement link. Link each one with `requirement_ids`, or label it `no-trace`.
+
+| ID | Title | Status |
+| --- | --- | --- |
+| t12 | Fix the parser | in_progress |
+| t15 | Add the export | todo |
+```
+
+- It lists the tasks the `task_orphan` lint rule reports (`lint-rules.md`), in the same order: never a `no-trace` task, a `skipped` task or a parent traced through its children, and nothing in a project with no layer document.
+- It shows the project as it is when the report is generated. It is not narrowed to the report's period.
+- With no orphan task the section is absent, heading included, and the report is exactly what it was without it.
+- The data is `data.orphan_tasks` (`{count, tasks:[{id, title, status}]}`). A key you pass in `data` is left alone: pass your own list, or `orphan_tasks: null` to leave the section out. With `sections`, name it with `{type: "section", heading: "Orphan Tasks"}`.
+- If the check cannot be made, the report is still generated and says so in its `Warnings` section.
+- `verification`, `inspection`, `effort`, `milestone`, `defect` and `completion` reports never carry it.
+- A project template that replaces a built-in one gets the section by including the built-in partial `{{> orphan_tasks}}` (listed by `action: "templates"` under `partials`).
 
 - `effort` and `monthly`, like `inspection`, `milestone`, `defect` and `completion`, reject scope fields they do not use.
 - `verification` and `weekly` reject them too: `verification` takes `layers`, `items`, `campaign`, `statuses`; `weekly` takes `period` or `from`+`to`.

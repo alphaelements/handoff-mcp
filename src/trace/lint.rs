@@ -12,6 +12,7 @@ use crate::storage::config::{TraceLintConfig, TraceLintRequireRule};
 use crate::storage::docs::{DocMetadata, UnreadableDoc};
 
 use super::engine::TraceGraph;
+use super::orphan::OrphanTask;
 use super::tree::TreeKind;
 use super::types::{GapKind, ItemState, SuspectKind, TaskLinkRole, TraceInput, WaiverAxis};
 use crate::storage::docs::layer::LayerSide;
@@ -108,7 +109,21 @@ pub struct LintFinding {
     pub task: Option<String>,
     pub doc: Option<String>,
     pub message: String,
+    /// Set by the task-scoped rules that describe the task itself
+    /// (`task_orphan`); `None` for every other finding.
+    pub task_detail: Option<TaskFindingDetail>,
 }
+
+/// What a task-scoped finding says about its task beyond the id in
+/// [`LintFinding::task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFindingDetail {
+    pub title: String,
+    pub suggested_action: String,
+}
+
+/// Rule id of the orphan-task rule (REQ-TRC-001).
+pub const TASK_ORPHAN_RULE: &str = "task_orphan";
 
 /// Every built-in rule id and its default severity (wiki/260 §4.3's table),
 /// overridable per id via `[trace.lint.rules]`.
@@ -117,6 +132,11 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("unrefined", Severity::Warning),
     ("orphan", Severity::Warning),
     ("task_unlinked", Severity::Warning),
+    // REQ-TRC-001: a task outside requirement traceability altogether (no
+    // `requirement`-type link, not `no-trace`, not skipped, not traced
+    // through its children). Unrelated to `task_unlinked`, which is about a
+    // task that links a layer document but none of its items.
+    (TASK_ORPHAN_RULE, Severity::Warning),
     ("dangling", Severity::Error),
     ("invalid_link", Severity::Error),
     ("cycle", Severity::Error),
@@ -192,6 +212,12 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("shallow_leaf", Severity::Info),
     ("id_parent_mismatch", Severity::Info),
 ];
+
+/// The id of every built-in rule, in registry order — what the rule
+/// reference shipped to users must cover.
+pub fn builtin_rule_ids() -> impl Iterator<Item = &'static str> {
+    BUILTIN_RULES.iter().map(|(id, _)| *id)
+}
 
 /// Every `need` value `[[trace.lint.require]]` rules recognize (§4.3's
 /// table) — shared between `require_need_satisfied`'s `match` arms and
@@ -349,6 +375,19 @@ fn effective_severity(
     resolve_severity(default, rule_id, overrides)
 }
 
+/// Whether the built-in rule `rule_id` can produce a finding in a run with
+/// this `rules_filter` and config: named by the filter (or no filter at all)
+/// and not switched `"off"`. Lets a caller skip gathering a rule's input
+/// when the rule is not going to run.
+pub fn builtin_rule_is_active(
+    rule_id: &str,
+    config: &TraceLintConfig,
+    rules_filter: Option<&HashSet<String>>,
+) -> bool {
+    let wants = |id: &str| rules_filter.is_none_or(|f| f.contains(id));
+    effective_severity(rule_id, &wants, &config.rules).is_some()
+}
+
 fn suspect_kind_rule_id(kind: SuspectKind) -> &'static str {
     match kind {
         SuspectKind::Link => "suspect_link",
@@ -389,6 +428,11 @@ pub struct LintContext<'a> {
     /// the requirement-tree rules' source-text input. An item absent from the
     /// map simply has no text-derived tree findings.
     pub tree_text: &'a HashMap<String, ItemTreeText>,
+    /// The project's orphan tasks (`crate::trace::orphan::orphan_tasks`, the
+    /// predicate shared with the orphan guard and the report), already in
+    /// natural task-id order — the `task_orphan` rule's input. Empty when
+    /// the caller has no task tree to judge.
+    pub orphan_tasks: &'a [OrphanTask],
 }
 
 /// Runs every applicable rule (built-in + `[[trace.lint.require]]`) and
@@ -421,6 +465,7 @@ pub fn evaluate(
         };
         out.push(LintFinding {
             rule: id.to_string(),
+            task_detail: None,
             severity,
             item: gap
                 .item
@@ -489,6 +534,7 @@ pub fn evaluate(
         };
         out.push(LintFinding {
             rule: id.to_string(),
+            task_detail: None,
             severity,
             item: Some(s.item.clone()),
             task: s.task.clone(),
@@ -502,6 +548,7 @@ pub fn evaluate(
             for l in graph.unbaselined_links() {
                 out.push(LintFinding {
                     rule: "unbaselined".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(l.item.clone()),
                     task: None,
@@ -515,6 +562,7 @@ pub fn evaluate(
             for t in graph.unbaselined_tasks() {
                 out.push(LintFinding {
                     rule: "unbaselined".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(t.item.clone()),
                     task: Some(t.task_id.clone()),
@@ -539,6 +587,7 @@ pub fn evaluate(
             for (item_id, verifier_id) in graph.unwanted_coverage() {
                 out.push(LintFinding {
                     rule: "unwanted_coverage".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(item_id.clone()),
                     task: None,
@@ -584,6 +633,7 @@ pub fn evaluate(
                     {
                         out.push(LintFinding {
                             rule: rule_waiver.to_string(),
+                            task_detail: None,
                             severity,
                             item: Some(item.stable_id.clone()),
                             task: None,
@@ -604,6 +654,7 @@ pub fn evaluate(
                     {
                         out.push(LintFinding {
                             rule: rule_redundant.to_string(),
+                            task_detail: None,
                             severity,
                             item: Some(item.stable_id.clone()),
                             task: None,
@@ -643,6 +694,7 @@ pub fn evaluate(
                     {
                         out.push(LintFinding {
                             rule: "unknown_acceptance_ref".to_string(),
+                            task_detail: None,
                             severity,
                             item: Some(item.stable_id.clone()),
                             task: None,
@@ -663,6 +715,7 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "layer_outside_profile".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(item.stable_id.clone()),
                     task: None,
@@ -689,6 +742,7 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "missing_acceptance".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(item.stable_id.clone()),
                     task: None,
@@ -714,6 +768,7 @@ pub fn evaluate(
                     {
                         out.push(LintFinding {
                             rule: "ambiguous_word".to_string(),
+                            task_detail: None,
                             severity,
                             item: Some(item.stable_id.clone()),
                             task: None,
@@ -732,6 +787,7 @@ pub fn evaluate(
                 {
                     out.push(LintFinding {
                         rule: "passive_voice_hint".to_string(),
+                        task_detail: None,
                         severity,
                         item: Some(item.stable_id.clone()),
                         task: None,
@@ -759,6 +815,7 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "unlabeled_acceptance".to_string(),
+                    task_detail: None,
                     severity,
                     item: None,
                     task: None,
@@ -775,6 +832,7 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "invalid_waiver".to_string(),
+                    task_detail: None,
                     severity,
                     item: None,
                     task: None,
@@ -788,6 +846,7 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "id_like_heading".to_string(),
+                    task_detail: None,
                     severity,
                     item: None,
                     task: None,
@@ -803,6 +862,7 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "attribute_after_body".to_string(),
+                    task_detail: None,
                     severity,
                     item: None,
                     task: None,
@@ -822,6 +882,7 @@ pub fn evaluate(
             for slug in slugs {
                 out.push(LintFinding {
                     rule: "unsynced_body".to_string(),
+                    task_detail: None,
                     severity,
                     item: None,
                     task: None,
@@ -856,6 +917,7 @@ pub fn evaluate(
             for (task_id, stable_id) in dangling {
                 out.push(LintFinding {
                     rule: "task_link_dangling".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(stable_id.to_string()),
                     task: Some(task_id.to_string()),
@@ -863,6 +925,29 @@ pub fn evaluate(
                     message: format!("task {task_id} links {stable_id}, which does not exist"),
                 });
             }
+        }
+    }
+
+    // --- Orphan tasks (REQ-TRC-001) ---
+    if let Some(severity) = effective_severity(TASK_ORPHAN_RULE, &wants, &config.rules) {
+        for task in ctx.orphan_tasks {
+            out.push(LintFinding {
+                rule: TASK_ORPHAN_RULE.to_string(),
+                task_detail: Some(TaskFindingDetail {
+                    title: task.title.clone(),
+                    suggested_action: super::orphan::suggested_action(&task.id),
+                }),
+                severity,
+                item: None,
+                task: Some(task.id.clone()),
+                doc: None,
+                message: format!(
+                    "task {} ({}) has no requirement link and is not labelled \"{}\"",
+                    task.id,
+                    task.status,
+                    super::orphan::NO_TRACE_LABEL
+                ),
+            });
         }
     }
 
@@ -884,6 +969,7 @@ pub fn evaluate(
                 };
                 out.push(LintFinding {
                     rule: "task_ids_drift".to_string(),
+                    task_detail: None,
                     severity,
                     item,
                     task: None,
@@ -913,6 +999,7 @@ pub fn evaluate(
                         };
                         out.push(LintFinding {
                             rule: "orphaned_legacy".to_string(),
+                            task_detail: None,
                             severity,
                             item: Some(id.clone()),
                             task: None,
@@ -944,6 +1031,7 @@ pub fn evaluate(
             for id in ids {
                 out.push(LintFinding {
                     rule: "orphan_run".to_string(),
+                    task_detail: None,
                     severity,
                     item: Some(id.clone()),
                     task: None,
@@ -961,6 +1049,7 @@ pub fn evaluate(
             for u in ctx.unreadable {
                 out.push(LintFinding {
                     rule: "frontmatter_invalid".to_string(),
+                    task_detail: None,
                     severity,
                     item: None,
                     task: None,
@@ -1002,6 +1091,7 @@ pub fn evaluate(
             }
             out.push(LintFinding {
                 rule: rule.id.clone(),
+                task_detail: None,
                 severity,
                 item: Some(item.stable_id.clone()),
                 task: None,
@@ -1043,6 +1133,7 @@ fn evaluate_tree_rules(
         };
         out.push(LintFinding {
             rule: rule.to_string(),
+            task_detail: None,
             severity,
             item: Some(gap.item.clone()),
             task: None,
@@ -1084,6 +1175,7 @@ fn evaluate_tree_rules(
         let push = |out: &mut Vec<LintFinding>, rule: &str, severity: Severity, message: String| {
             out.push(LintFinding {
                 rule: rule.to_string(),
+                task_detail: None,
                 severity,
                 item: Some(id.to_string()),
                 task: None,
@@ -1298,6 +1390,7 @@ fn evaluate_missing_profile_layer(
             }
             out.push(LintFinding {
                 rule: RULE.to_string(),
+                task_detail: None,
                 severity,
                 item: Some(item.stable_id.clone()),
                 task: None,
@@ -1358,6 +1451,7 @@ fn evaluate_low_confidence_spec(
         }
         out.push(LintFinding {
             rule: RULE.to_string(),
+            task_detail: None,
             severity,
             item: Some(item.stable_id.clone()),
             task: None,
@@ -1470,7 +1564,7 @@ fn sort_findings(findings: &mut [LintFinding]) {
 mod tests;
 
 /// See [`sort_findings`]'s doc comment.
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(super) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
     let mut ai = a.chars().peekable();

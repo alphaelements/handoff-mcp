@@ -146,8 +146,9 @@ with `HANDOFF_MCP_BINARY_PATH=/path/to/handoff-mcp`.
 ```
 
 Adds `/session-loop` (parallel TDD implementation, adversarial testing, Opus
-review) and `/research-loop` (multi-agent investigation, verification, spec
-drafting). See [plugin-task-loop/README.md](plugin-task-loop/README.md).
+review), `/research-loop` (multi-agent investigation, verification, spec
+drafting) and `/bugfix-loop` (one bug: failing test first, approval, fix, the
+same test, the full suite). See [plugin-task-loop/README.md](plugin-task-loop/README.md).
 
 **Optional: memory auto-injection hooks**
 
@@ -392,20 +393,67 @@ handoff-mcp setup
 
 This installs Claude Code hooks into `~/.claude/settings.json` and adds a
 `handoff` server entry to the project's `.mcp.json` (required for hooks to
-connect). The command is interactive by default — use `-y` to skip prompts:
+connect). It also prepares the project's `CLAUDE.md` and records the project's
+commands (see [Project sections and commands](#project-sections-and-commands)).
+The command is interactive by default — use `-y` to skip prompts:
 
 ```bash
-handoff-mcp setup -y           # non-interactive (auto-approve everything)
-handoff-mcp setup --mcp-json   # only add .mcp.json entry (skip hooks)
-handoff-mcp setup --check      # check if hooks and .mcp.json are configured
+handoff-mcp setup -y                    # non-interactive (auto-approve everything)
+handoff-mcp setup --mcp-json            # only add .mcp.json entry (skip hooks)
+handoff-mcp setup --claude-md-scaffold  # only add the CLAUDE.md project sections and [commands]
+handoff-mcp setup --check               # check hooks, .mcp.json, CLAUDE.md and [commands] (see Readiness check)
 ```
 
-Restart Claude Code after running setup.
+Restart Claude Code after running setup. An argument `setup` does not know is
+rejected (`handoff-mcp setup --help` lists them).
+
+### Project sections and commands
+
+`handoff-mcp setup` runs in the project directory and, besides the
+`Session Handoff` section, adds the sections the task-loop agents read from
+`CLAUDE.md`: **Build & Test**, **Coding Rules**, **Project Structure** and
+**Documentation Contract**.
+
+- A section counts as present when `CLAUDE.md` has a heading with that title
+  (any heading level, case-insensitive; headings inside fenced code blocks do
+  not count). A section that is present is never
+  changed; only missing ones are appended, after the existing content. Running
+  setup again changes nothing.
+- Without a `CLAUDE.md`, setup creates one.
+- Every field setup cannot fill in is marked `TODO(handoff)`. Replace each marker
+  with the real value, or with `n/a` when the project has no such step.
+
+The commands themselves live in the `[commands]` section of
+`.handoff/config.toml`, which is their source of truth; **Build & Test** is a
+copy for people and agents to read. Setup detects commands from the project's
+manifests and writes them to `[commands]`, leaving any key that already has a
+value untouched:
+
+| Manifest | Detected |
+|----------|----------|
+| `package.json` | `build` / `test` / `lint` / `format` / `typecheck`, one per script of that name, as `npm run <name>` (`pnpm` / `yarn` / `bun` when `packageManager` or a lockfile says so). The placeholder `test` script written by `npm init` is not counted. |
+| `Cargo.toml` | `build` = `cargo build`, `test` = `cargo test`, `lint` = `cargo clippy`, `format` = `cargo fmt` |
+| `pyproject.toml` | `test` = `pytest` when pytest is configured or listed as a dependency; `lint` = `ruff check .` and `format` = `ruff format .` likewise for ruff (prefixed with `uv run` / `poetry run` when the project has that lockfile) |
+
+When several manifests offer the same key, the first in this order wins.
+`install`, `smoke` and `audit` are never guessed. Any other project layout
+(a `Makefile`, Gradle, ...) is not an error: nothing is detected, every field is
+marked, and you write the commands yourself:
+
+```toml
+[commands]
+test = "make test"
+smoke = "./scripts/smoke.sh"
+```
+
+`[commands]` is only written to a project that is already initialized
+(`handoff_init`). On a project that is not, setup still fills **Build & Test**
+with what it detected; run it again after initializing to record the commands.
 
 You can check the current status or remove the hooks:
 
 ```bash
-handoff-mcp setup --check      # Show hook status
+handoff-mcp setup --check      # Show hook status and the readiness check
 handoff-mcp setup --uninstall  # Remove handoff hooks
 ```
 
@@ -419,6 +467,32 @@ manual configuration alternative.
 
 ## Quick Start
 
+### First project
+
+The `handoff-getting-started` skill walks you from an empty directory to one
+finished task. With the plugins installed (see
+[Installation](#installation); the loop commands come with `handoff-task-loop`),
+open Claude Code in the directory and say "getting started", or type
+`/handoff-getting-started`. Claude then takes you through these steps, telling
+you before each one what is about to happen:
+
+| Step | Operation | What you get |
+|------|-----------|--------------|
+| 1 | Install | The `handoff-mcp` program and the `handoff-mcp` and `handoff-task-loop` plugins |
+| 2 | `handoff_init(project_name: "<name>", preset: "beginner")` | A `.handoff/` directory, with the [beginner preset](#beginner-preset-and-onboarding) applied |
+| 3 | `handoff-mcp setup` | `CLAUDE.md` with the project sections, and the server entry in `.mcp.json` |
+| 4 | `handoff_doctor` | The [readiness check](#readiness-check): what is still missing, and what to do about it |
+| 5 | `/brainstorm-loop` | A brainstorm report: what to build and for whom |
+| 6 | `/requirement-loop` | Requirements with acceptance criteria, and the tasks to work on |
+| 7 | `/session-loop` | Tasks implemented and tested by agents, ending in `done` |
+
+Lost on the way? `handoff_next_step` (or `handoff-mcp next-step` in a terminal)
+names the one operation to do next; see [Next step](#next-step).
+
+### The session cycle
+
+Adding handoff to work you already do takes only the session cycle:
+
 1. **Initialize** a project:
 
    The agent calls `handoff_init` with your project name. This creates a `.handoff/` directory:
@@ -426,8 +500,8 @@ manual configuration alternative.
    ```
    .handoff/
    ├── config.toml      # Project settings
-   ├── sessions/        # Session history (TOML files)
-   └── tasks/           # Task tree (directories + TOML files)
+   ├── sessions/        # Session history (JSON files)
+   └── tasks/           # Task tree (directories + JSON files)
    ```
 
 2. **Load context** at session start — the agent calls `handoff_load_context`. If `session_guidance` is returned, the agent establishes an active session via `handoff_save_context` with `session_status: "active"` before starting work.
@@ -482,6 +556,8 @@ appends any missing line the first time it writes the matching kind of file
 /exports/
 # Transient mermaid render cache used by PDF export.
 .mermaid-cache/
+# Chart file channel: requests, responses, and rendered output.
+/charts/
 ```
 
 ### What to track
@@ -543,7 +619,7 @@ For a subtask, rename the directory inside its parent's directory the same way.
 
 | Tool | Purpose |
 |------|---------|
-| `handoff_init` | Initialize `.handoff/` directory for a project |
+| `handoff_init` | Initialize `.handoff/` directory for a project (`preset: "beginner"` starts with the [beginner preset](#beginner-preset-and-onboarding)) |
 | `handoff_load_context` | Load session context, tasks, and git state at session start |
 | `handoff_save_context` | Save session state — establish an active session or close it with handoff data |
 | `handoff_update_session` | Incrementally update active session (toggle checklist, add decisions/notes/pointers) |
@@ -557,7 +633,7 @@ For a subtask, rename the directory inside its parent's directory the same way.
 | Tool | Purpose |
 |------|---------|
 | `handoff_list_tasks` | List tasks with filters (status, assignee, milestone, priority, label) |
-| `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.) |
+| `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.); `include_orphan: true` adds `orphan` (whether the task has no requirement link, by the `task_orphan` rule) |
 | `handoff_update_task` | Create, update, or move tasks; supports `notes_append` for safe incremental notes and `requirement_ids` for linking to requirement SubItems |
 | `handoff_check_criterion` | Toggle a single done_criteria item by index |
 | `handoff_log_time` | Log hours worked — adds to `actual_hours`, deducts from `remaining_hours` |
@@ -580,14 +656,17 @@ For a subtask, rename the directory inside its parent's directory the same way.
 | Tool | Purpose |
 |------|---------|
 | `handoff_get_config` | Read project configuration (full TOML as JSON) |
-| `handoff_update_config` | Update config: settings, calendar, assignees, effort budget, gantt view |
+| `handoff_update_config` | Update config: settings, calendar, assignees, effort budget, gantt view, commands, onboarding; or apply a preset (`preset: "beginner"`) |
+| `handoff_next_step` | Tell which of nine states the project is in (`not_initialized` ... `all_done`) and the one operation to do next. Read-only. Not `handoff_trace_next`, which lists verification items. See [Next step](#next-step) |
+| `handoff_doctor` | Diagnose whether the project is ready for agent-driven work (handoff initialized, MCP registered, `CLAUDE.md` sections filled in, `[commands]` defined and succeeding, no secrets file tracked by Git, dependency audit passing). Never runs commands: returns `commands_to_run` and judges the `results` you report. See [Readiness check](#readiness-check) |
+| `handoff_release_check` | Pre-release check of a milestone: tasks done, no open bugs, requirements verified, tests / smoke / dependency audit passing, no secrets file tracked by Git, and the items a person confirms. Never runs commands: returns `commands_to_run`, judges the `results` you report and records them with the confirmations. See [Release check](#release-check) |
 | `handoff_list_assignees` | List team members with task counts and effort stats |
 | `handoff_add_assignee` | Add a team member (`[assignees.<key>]`) |
 | `handoff_update_assignee` | Update a team member's fields (partial; null clears a field) |
 | `handoff_remove_assignee` | Remove a team member and unassign them from every task |
 | `handoff_list_milestones` | List milestones (`[milestones.*]`) |
 | `handoff_add_milestone` | Add a milestone (date, color, description) |
-| `handoff_update_milestone` | Update a milestone (partial) |
+| `handoff_update_milestone` | Update a milestone (partial). With `[onboarding] release_guard`, a move to `released` consults the release check (see [Release guard](#release-guard)) |
 | `handoff_remove_milestone` | Remove a milestone |
 | `handoff_update_calendar` | Patch the project `[calendar]` (work hours, closed days, `day_hours`, schedule_mode) |
 | `handoff_update_labels` | Set the project-level label vocabulary |
@@ -764,6 +843,54 @@ roll up their leaves' verification and progress; `handoff_trace_tree` (CLI
 `trace tree`) shows the nested view, and lint reports structural and
 missing-label problems.
 
+**Orphan tasks.** Once a project has a layer document, every task is expected
+to trace back to a requirement. `handoff_trace_lint` reports a task with no
+requirement link as a `task_orphan` warning, with its `task_id`, `title` and a
+`suggested_action`: link it with `handoff_update_task(task: {id,
+requirement_ids: [...]})`, or add the label `no-trace` when it is deliberately
+outside traceability. A `skipped` task, a `no-trace` task, and a parent task
+whose leaves are all linked, `no-trace` or `skipped` are not reported. Switch
+the rule off with `[trace.lint.rules] task_orphan = "off"`.
+
+| Lint rule | Default | Reports |
+|-----------|---------|---------|
+| `task_orphan` | warning | a task with no requirement link (see above) |
+| `task_unlinked` | warning | a task that links a layer document but none of its items |
+
+The full rule table is in the `handoff-trace` skill (`references/lint-rules.md`).
+
+`[trace] orphan_guard` decides what happens when such a task is moved to
+`review` or `done` with `handoff_update_task` or `handoff_bulk_update_tasks`:
+
+| `orphan_guard` | Effect |
+|----------------|--------|
+| `warn` (default) | the change applies and the response carries a `Warning [ORPHAN_TASK]: ...` line |
+| `block` | the call is rejected and nothing is changed, unless `force: true` is passed |
+| `off` | no check; the response is the same as without the guard |
+
+It uses the same rule as `task_orphan`, so a `no-trace` task, a parent traced
+through its children, and every task of a project without a layer document are
+never affected. Set it with `handoff_update_config(updates: {"trace.orphan_guard": "block"})`;
+any other value is rejected.
+
+`handoff_get_task(task_id, include_orphan: true)` answers the same question for
+one task: its response then carries `orphan: true` or `false`. The task-loop
+plugin's session-closer uses it: a task that still has no requirement link at
+the end of a `/session-loop` session is closed as `review` instead of `done`,
+with a `Requirement link missing: ...` note, and every developer report says in
+its `### Requirements addressed` section which requirements the work addressed,
+or why none applies.
+
+The periodic reports of `handoff_report` (`daily`, `weekly`, `monthly`,
+`quarterly`, `yearly`) end with an **Orphan Tasks** section: how many such
+tasks the project has, and the id, title and status of each. It lists the
+tasks `task_orphan` reports, as they are when the report is generated. With no
+orphan task the section is left out altogether, so those reports are unchanged.
+The other report types (`verification`, `inspection`, `effort`, `milestone`,
+`defect`, `completion`) never carry it. A project template gets the section
+with `{{> orphan_tasks}}`; pass `data: {"orphan_tasks": null}` to leave it out
+of one report.
+
 Full guide: the **`handoff-trace`** skill (overview, setup, workflow, and
 references for every trace tool, config key and lint rule, plus a runnable
 end-to-end walkthrough) and the **`handoff-requirements`** skill (how to write
@@ -924,10 +1051,270 @@ mode = "compare"           # plan, actual, compare
 
 [trace]
 profile = "standard"
+orphan_guard = "warn"      # off, warn, block: a task with no requirement link entering review/done
 # See `handoff-trace` skill for layers/done_guard/id_prefixes/custom profiles.
+
+[commands]                 # Project commands; any shell command line. All keys optional.
+install = "npm install"
+build = "npm run build"
+test = "npm run test"
+lint = "npm run lint"
+format = "npm run format"
+typecheck = "npm run typecheck"
+smoke = "./scripts/smoke.sh"   # One command that shows the app still starts and works
+audit = "npm audit"            # Dependency audit
+
+[release]                  # Pre-release check (see Release check)
+manual_checks = ["docs_updated", "store_listing"]   # Items a person confirms: manual:<name>
 ```
 
+`[commands]` is the source of truth for the project's commands; `handoff-mcp setup`
+fills it from the project's manifests (see
+[Project sections and commands](#project-sections-and-commands)). The MCP server
+never runs these commands itself.
+
 All configuration sections can be updated via `handoff_update_config` with dot-notation keys (e.g., `"calendar.work_hours_per_day": 7`).
+
+### Next step
+
+`handoff_next_step()` (MCP) and `handoff-mcp next-step` (terminal) answer "what
+should happen next in this project?" with the project's state and **one**
+recommended operation: `{state, action: {title, command, reason}, facts}`.
+
+The states are checked in this order, and the first that applies is returned:
+
+| # | State | Applies when | Recommended operation |
+|---|-------|--------------|-----------------------|
+| 1 | `not_initialized` | the project has no `.handoff/` | `handoff_init` |
+| 2 | `not_ready` | the [readiness check](#readiness-check) (without results) is not ready | what its first failed check says to do |
+| 3 | `review_pending` | a task is in `review` | confirm that task (`handoff_get_task`) |
+| 4 | `in_progress` | a task is `in_progress`, or a session is active | resume it |
+| 5 | `no_brainstorm` | no finalized brainstorm report and no requirement item | `/brainstorm-loop` |
+| 6 | `no_requirements` | the requirement layer has no item | `/requirement-loop` |
+| 7 | `ready_tasks` | a `todo` task whose dependencies are all done or skipped | `/session-loop` |
+| 8 | `release_ready` | no unfinished task, and a milestone that is neither released nor cancelled | `handoff_release_check` (see [Release check](#release-check)) |
+| 9 | `all_done` | none of the above | plan what comes next (`/brainstorm-loop`); when unfinished tasks remain that cannot start, clear what blocks them |
+
+- `action.command` is a slash command, a tool call or a sentence to act on.
+- `facts` holds the counts the decision looked at (`doctor`, `tasks`,
+  `active_sessions`, `brainstorm_reports`, `requirement_items`, `milestones`). A
+  group the decision did not need is left out.
+- The tool is read-only: it writes nothing, runs no command and starts no
+  process. It works on a project that is not initialized yet.
+- With `[onboarding] next_step = true`, `handoff_load_context` carries the same
+  answer as its `next_step` key. Without the setting the key is absent and the
+  response is unchanged.
+- `handoff_trace_next` is a different tool: it lists the verification items of
+  the trace graph that still need attention.
+
+### Readiness check
+
+`handoff_doctor` (MCP) and `handoff-mcp setup --check` (terminal) give the same
+diagnosis of whether the project is ready for the task loop:
+
+| Check | Passes when |
+|-------|-------------|
+| `handoff_initialized` | `.handoff/config.toml` exists and can be read |
+| `mcp_registered` | a handoff server entry is found in `.mcp.json`, `~/.claude/settings.json`, `~/.claude.json`, the Claude Code plugin list or `~/.codex/config.toml` (`skip` when none is found: other clients are not inspected) |
+| `claude_md_sections` | `CLAUDE.md` has the four [project sections](#project-sections-and-commands) |
+| `claude_md_todo` | no `TODO(handoff)` marker is left in `CLAUDE.md` |
+| `commands_defined` | `[commands]` defines at least one command |
+| `cmd_install` / `cmd_build` / `cmd_test` / `cmd_lint` / `cmd_typecheck` | that command ran with exit code 0 |
+| `smoke_defined` | `[commands] smoke` is defined (`skip`, never a failure, when it is not) |
+| `secrets_untracked` | Git tracks no file whose name matches a secrets pattern (`skip` outside a Git repository). See [Secrets files and the dependency audit](#secrets-files-and-the-dependency-audit) |
+| `dependencies_audited` | `[commands] audit` ran with exit code 0 (`skip` when it is not defined or no result was given) |
+
+Each check is `pass`, `fail` or `skip` (`manual`, a person has to confirm, is
+part of the same vocabulary for the release check). `skip` means the check was
+not carried out and is never counted as a pass. Every `fail` comes with a
+`next_step`. The project is **ready** when nothing failed.
+
+Commands are only run when you ask for it, and never by the MCP server:
+
+- **`handoff_doctor()`** returns the defined commands in `commands_to_run`
+  (`{id, command, timeout_sec}`) and marks their checks `skip`. The agent runs
+  them and calls again with
+  `results: [{id, command, exit_code?, duration_ms?, output_tail?, error?}]`;
+  the tool judges those (`source: "reported"`). A result for a command that is
+  not the current `[commands]` value is not used and fails the check. A call
+  with an argument or result field the tool does not know, or with an empty
+  `error`, is rejected instead of being judged.
+- **`handoff-mcp setup --check --run`** runs the commands itself, in the project
+  directory, through the shell (`sh -c`; `cmd /C` on Windows), and judges the
+  results (`source: "executed"`). A command that cannot be found, or that runs
+  longer than `[onboarding] command_timeout_sec` (default 600), fails. It runs
+  `install`, `build`, `test`, `lint`, `typecheck` and `audit`; `format` and
+  `smoke` are not run.
+- Once commands were run, a project without `[commands] test` is not ready.
+
+`handoff-mcp setup --check` prints the hook status followed by the diagnosis;
+add `--json` to print only the JSON that `handoff_doctor` returns. The exit code
+is 0 when the project is ready and 1 when it is not.
+
+#### Secrets files and the dependency audit
+
+Two checks are shared by the readiness check and the
+[release check](#release-check):
+
+- **`secrets_untracked`** fails when Git tracks a file whose name matches one
+  of `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`,
+  `credentials.json` or `secrets.*`, in any directory. `.env.example`,
+  `.env.sample` and `.env.template` are never reported. The `detail` lists the
+  matching paths.
+  - Only **file names** are matched. File contents are not scanned, so a `pass`
+    does not mean the repository holds no secret.
+  - The list of tracked files is read from the Git index file; `git` is not
+    started. Outside a Git repository, or when the index cannot be read
+    completely (a split or sparse index), the check is `skip`.
+  - A project in a subdirectory of a larger repository is checked for its own
+    files.
+  - Replace the patterns with `[onboarding] secret_file_patterns = ["*.tfstate", ...]`.
+    `*` matches any run of characters and `?` one; letter case is ignored. A
+    pattern without `/` applies to the file name in every directory, one with
+    `/` to the whole path. An empty list switches the check to `skip`.
+- **`dependencies_audited`** judges the result of `[commands] audit` (for
+  example `npm audit` or `cargo audit`), handed out in `commands_to_run` and
+  judged like the other commands. Its `detail` quotes the end of the command's
+  output (up to 20 lines). It is `skip` when the command is not defined or no
+  result was given, never a pass.
+
+### Release check
+
+`handoff_release_check(milestone)` (MCP) and
+`handoff-mcp release-check <milestone>` (terminal) answer one question before a
+milestone ships: is everything it promised done, verified and safe to release?
+
+| Item | Passes when |
+|------|-------------|
+| `tasks_done` | every leaf task of the milestone is `done` or `skipped` (`refs` lists the others). A subtask without a milestone of its own belongs to its parent's |
+| `no_open_bugs` | no task of the milestone labelled `bug` is still open |
+| `requirements_verified` | every requirement-layer item planned for the milestone is `passing` (`refs` lists the others; `skip` when the milestone has no requirement) |
+| `tests_pass` / `smoke_pass` | `[commands] test` / `smoke` ran with exit code 0 |
+| `secrets_untracked` / `dependencies_audited` | see [Secrets files and the dependency audit](#secrets-files-and-the-dependency-audit) |
+| `manual:<name>` | a person confirmed it; one item per entry of `[release] manual_checks` (`manual` until then) |
+
+The answer is `{milestone, ok, items: [{id, status, detail, refs?, source?,
+checked_at?}], commands_to_run}`. **`ok` is true only when every item is
+`pass`**: an item that was skipped (not carried out) or still waits for a person
+keeps it false, so a project without a smoke command, an audit command or
+requirements for the milestone does not get `ok: true`.
+
+As with the readiness check, the MCP tool never runs a command:
+
+1. `handoff_release_check(milestone: "v1.0")` reports the command items as
+   `skip` and lists the defined commands in `commands_to_run`.
+2. The agent runs them and calls again with `results` (the same shape as for
+   `handoff_doctor`, with the ids `tests_pass`, `smoke_pass`,
+   `dependencies_audited`).
+3. When a person has confirmed a manual item, pass
+   `confirm: ["manual:docs_updated"]`. It stays confirmed for that milestone.
+
+Results and confirmations passed in are recorded in
+`.handoff/release/<milestone>.json` (per command: status, exit code, who ran it,
+when). A call with neither writes nothing. A call without `results` never falls
+back on a recorded result: those items are `skip` again, so an old run cannot
+make today's check pass. An unknown milestone is an error.
+
+In a terminal:
+
+```bash
+handoff-mcp release-check v1.0                                 # print the check as JSON
+handoff-mcp release-check v1.0 --run                           # also run test / smoke / audit and judge them
+handoff-mcp release-check v1.0 --confirm manual:docs_updated   # record a confirmation
+```
+
+The exit code is 0 when the check is `ok`, 1 when it is not, and 2 when it could
+not be carried out (a usage error, an unknown milestone).
+
+#### Release guard
+
+`[onboarding] release_guard` puts the release check in front of the moment a
+milestone becomes `released`
+(`handoff_update_milestone(name, status: "released")`,
+`handoff-mcp milestone update --name <name> --status released`):
+
+| `release_guard` | When an item of the check is not `pass` |
+|-----------------|------------------------------------------|
+| `off` (default) | Nothing is checked. The reply is the same as without the setting |
+| `warn` | The milestone is released, and the reply lists the items: one `Warning: release check: <id> [<status>] <detail>` line each |
+| `block` | The call is rejected with the same list and nothing changes. `force: true` releases anyway, with the items as warnings |
+
+Releasing a milestone never runs a command. The items that follow from the
+project's data (`tasks_done`, `no_open_bugs`, `requirements_verified`,
+`secrets_untracked`, `manual:<name>`) are judged on the spot. The command items
+(`tests_pass`, `smoke_pass`, `dependencies_audited`) are read from the last
+result recorded in `.handoff/release/<milestone>.json`; without a record, or
+when `[commands]` has changed since, the item counts as not verified (`skip`).
+Because a record may be out of date, the warnings and the error say when each
+recorded result was judged. Run the release check and report fresh results
+before releasing.
+
+When every item passes, the reply carries no release warning. Only the move to
+`released` is guarded: other status changes, and edits to a milestone that is
+already released, are not.
+
+### Beginner preset and `[onboarding]`
+
+The `[onboarding]` section switches on guidance and checks aimed at first-time
+users. Every key is off by default, and a `config.toml` without the section is
+read as all-off and is never rewritten because of it, so existing projects
+behave exactly as before.
+
+```toml
+[onboarding]
+preset = "beginner"        # Name of the preset that was applied
+preflight = "run"          # "off" (default) | "check" | "run": readiness check before a session is planned
+next_step = true           # handoff_load_context carries the answer of handoff_next_step as `next_step` (default false; see Next step)
+smoke_check = true         # Run [commands] smoke before implementation starts (default false)
+release_guard = "warn"     # "off" (default) | "warn" | "block": consult the release check when a milestone is released (see Release guard)
+security_min_nfr = true    # Require a decision on the minimum security requirements (default false)
+command_timeout_sec = 600  # Seconds a [commands] command may run in the readiness and release checks (default 600)
+smoke_timeout_sec = 120    # Seconds the smoke command may run in the smoke check of /session-loop (default 120)
+secret_file_patterns = [".env", "*.pem"]   # Replaces the default secrets patterns (see Readiness check)
+```
+
+handoff-mcp stores and validates these values; the task-loop commands read them
+to decide which checks to run (`next_step` and `release_guard` are applied by
+handoff-mcp itself).
+
+`preflight` and `smoke_check` act at the start of `/session-loop`, before a task
+is fetched. With `preflight = "check"` the session manager calls
+`handoff_doctor()`; with `"run"` it also runs the commands the tool hands out
+(the dependency audit included) and reports the results. A project that is not
+ready ends the session there: the failed checks are shown with their
+`next_step`, and no Workflow is launched. With `smoke_check = true` the manager
+runs `[commands] smoke`; when it fails, the session ends, one task labelled `bug`
+and titled `[smoke] Smoke check failed` is filed (launching again does not file
+a second one) and `/bugfix-loop task: <id>` is proposed. Without a smoke command
+the check is recorded as `skip`.
+
+`security_min_nfr` acts in `/requirement-loop`: before the NFR gate of Phase 2 the
+user decides, for each of three items (handling of secrets, validation of
+external input, dependency updates), whether it becomes an `NFR-` requirement or
+is out of scope, with a reason. The decisions are kept in the NFR document, and
+an undecided item keeps the gate closed.
+
+The **`beginner` preset** sets everything for one person building a first
+application, in one step:
+
+| Key | Value |
+|-----|-------|
+| `trace.profile` | `minimal` |
+| `trace.done_guard` | `warn` |
+| `session_loop.profile` | `standard` |
+| `onboarding.*` | the values shown above |
+
+- **New project**: `handoff_init(project_name: "...", preset: "beginner")`, or
+  `handoff-mcp init --project-name <name> --preset beginner`. Without `preset`
+  the new `config.toml` is the same as it has always been.
+- **Existing project**: `handoff_update_config(preset: "beginner")`, or
+  `handoff-mcp config update --preset beginner`. The reply is JSON
+  `{preset, applied, changes: [{key, old, new}], overwrites: [key], message}`.
+  Keys without a value are set immediately. If the preset would replace a value
+  the project already set, nothing is written and `overwrites` names those
+  keys; repeat the call with `confirm: true` (`--confirm`) to apply it.
+- An unknown preset name is an error that lists the accepted names and changes
+  nothing. `preset` and `updates` cannot be combined in one call.
 
 ### Estimates and AI effort
 
@@ -965,6 +1352,17 @@ from the **AI-effort hours** used in scheduling and metrics:
 - A dependency on a task ID that does not exist yet is accepted with a
   `DANGLING_DEPENDENCY` warning, which also notes that the dependency may become
   circular if that ID is later assigned to a different task.
+- A task milestone (`schedule.milestone`) that has no `[milestones.<name>]`
+  definition in `config.toml` is accepted with an `UNKNOWN_MILESTONE` warning.
+  Check the spelling, or define the milestone with `handoff_add_milestone`.
+- In a project with at least one V-model layer document, creating a task
+  without `requirement_ids` is accepted, and `handoff_update_task` ends its
+  response with two information lines: `Info [REQUIREMENT_LINK_MISSING]` (link
+  the task to a requirement, or add the missing requirement) and
+  `Info [TRACE_PROPOSE]` (`handoff_trace_propose(task_id)` lists candidates).
+  They are not added when an existing task is updated, or when the new task
+  carries `requirement_ids` or the label `no-trace`. `handoff_import_context`
+  reports the imported tasks without a link in one such line.
 
 Both keys are set with `handoff_update_config` (for example
 `settings.schedule_stale_notice`) and must be booleans.
@@ -1219,8 +1617,9 @@ handoff-mcp dashboard
 ```
 
 **Available groups:** `init`, `task`, `session`, `config`, `memory`,
-`referral`, `assignee`, `milestone`, `calendar`, `labels`, `project`,
-`metrics`, `capacity`, `schedule`, `dashboard`, `timer`, `trace`.
+`referral`, `assignee`, `milestone`, `release-check`, `calendar`, `labels`,
+`project`, `metrics`, `capacity`, `schedule`, `dashboard`, `next-step`,
+`timer`, `trace`.
 
 Run `handoff-mcp --help` to see all groups, or `handoff-mcp <group> --help`
 for actions within a group. See the
@@ -1236,7 +1635,7 @@ on the wiki for the full command list.
 
 ## Recommended CLAUDE.md Setup
 
-Copy the template from [`templates/claude-md-section.md`](templates/claude-md-section.md) into your project's `CLAUDE.md`. It declares that the project uses handoff-mcp and points to the `handoff` skill for the full procedure. Plugin users get the skill automatically; non-plugin users should copy `skills/` to `~/.claude/skills/`.
+Run `handoff-mcp setup` in the project (see [Project sections and commands](#project-sections-and-commands)), or copy the templates by hand: [`templates/claude-md-section.md`](templates/claude-md-section.md) declares that the project uses handoff-mcp and points to the `handoff` skill for the full procedure, and the `templates/claude-md-*.md` files hold the Build & Test, Coding Rules, Project Structure and Documentation Contract sections. Plugin users get the skill automatically; non-plugin users should copy `skills/` to `~/.claude/skills/`.
 
 ## Skills
 
@@ -1245,10 +1644,12 @@ This repository includes skill files that make handoff behavior automatic in Cla
 | Skill | Purpose |
 |-------|---------|
 | `handoff` | Core session lifecycle, task management, metrics, scheduling |
+| `handoff-getting-started` | First steps: from an empty directory to one finished task, in seven steps |
 | `handoff-load` | Quick session-start procedure |
 | `handoff-docs` | Document management — save, search, verify, import, family tree |
 | `handoff-trace` | V-model traceability — setup, coverage, suspects, verification campaigns, approval, baselines, reports |
 | `handoff-requirements` | Writing V-model items — IDs, attributes, acceptance criteria, templates, requirement trees |
+| `handoff-gui-requirements` | GUI requirements — from brainstorm to a recorded visual regression verdict |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
 | `handoff-report-schedule` | Recurring weekly / monthly reports via `/schedule` (cloud agents), cron examples, PDF re-rendering of past reports |
 | `handoff-refer` | Cross-project referrals |

@@ -10,6 +10,7 @@
 //! ranking function from [`injection`].
 
 pub mod injection;
+pub mod next_step;
 
 use std::sync::{Mutex, OnceLock};
 

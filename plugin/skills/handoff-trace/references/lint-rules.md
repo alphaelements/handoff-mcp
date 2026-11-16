@@ -12,7 +12,7 @@ quiet is covered by the `handoff-requirements` skill.
 
 ```
 handoff_trace_lint(action?: "lint", rules?: [id], fail_on?: "error"|"warning", format?: "json"|"text", limit?)
--> {findings: [{rule, severity, item, task, doc, message}], counts: {error, warning, info}, exit_code, warnings, text?}
+-> {findings: [{rule, severity, item, task, doc, message, task_id?, title?, suggested_action?}], counts: {error, warning, info}, exit_code, warnings, text?}
 ```
 
 ## 1. Built-in rules
@@ -54,6 +54,7 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 | `redundant_waiver` | info | the item is already covered or partial on a waived axis, so the waiver is unused. For a composite, "covered" means through its children: the waiver stands while no child is covered | remove the waiver |
 | `layer_outside_profile` | info | the item's layer is not in its effective used-layer set, so it is left out of coverage and state | change the profile or `layers`, or move the item |
 | `missing_profile_layer` | warning | the item's effective profile `default_needs` (its document's `trace_profile`, else the project default; or the item's own `- needs:`) requires a layer such as `basic_spec`, `system_test`, `detailed_spec` or `unit_test` that has no refining (left side) or verifying (right side) item for it. Per item, not per document; `acceptance` is left to `unverified`/`missing_acceptance`; composites, `waive-refine`/`waive-verify` and `needs: []` are skipped. `minimal`/`bugfix` never fire | add the missing layer item (`refines`/`verifies` this one), or change the profile |
+| `low_confidence_spec` | warning | a `basic_spec`/`detailed_spec` item whose title or body still carries the `(要確認)` marker, which a generated spec keeps on every item it had to guess | confirm the item (correct it if the guess was wrong), then remove the marker |
 
 ### Drift (stored data versus documents and tasks)
 
@@ -66,6 +67,17 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 | `orphaned_legacy` | info | an item ended up under "(orphaned legacy items)" because its section heading no longer exists | restore the heading or remove the item |
 | `orphan_run` | info | a recorded test run refers to an item ID that no longer exists | ignore it, or re-record under the new ID |
 | `id_like_heading` | info | a heading looks like an ID but uses a prefix the layer does not allow (for example `HTTP-2`), so it was left as a plain heading | add the prefix in `[trace.id_prefixes]` or reword the heading |
+
+### Tasks outside traceability
+
+| rule | default | fires when | how to fix |
+|---|---|---|---|
+| `task_orphan` | warning | a task has no requirement link at all (`requirement_ids` was never set; a document link does not count). One finding per task, whatever its status, `done` included. Not reported: a `skipped` task, a task labelled `no-trace`, and a parent task whose subtree is accounted for (every leaf task below it is linked, `no-trace` or `skipped`). A parent with an unlinked leaf anywhere below it is reported, and so is that leaf. A project with no layer document reports nothing | link the task with `handoff_update_task(task: {id, requirement_ids: [...]})` (`handoff_trace_propose` suggests candidates), or add the label `no-trace` when the task is deliberately outside requirement traceability |
+
+`task_orphan` findings carry three more fields: `task_id` (the same id as
+`task`), `title`, and `suggested_action`. It is a different rule from
+`task_unlinked`, which is about a task that links a layer document but none
+of its items.
 
 ### Format
 
@@ -156,7 +168,8 @@ accepts these ids too.
   then item in natural order (`FR-2` before `FR-10`).
 - `item`, `task`, and `doc` are `null` when they do not apply. Parse-time
   and `unsynced_body` findings carry only `doc`. `task_unlinked` carries
-  only `task`.
+  only `task`. `task_orphan` carries `task` plus `task_id`, `title` and
+  `suggested_action`; no other rule has those three keys.
 - `format: "text"` adds a `text` field with one line per finding:
   `severity[rule] subject: message`.
 

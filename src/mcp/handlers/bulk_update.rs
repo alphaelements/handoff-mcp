@@ -2,7 +2,9 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use super::milestones::frozen_assignment_warning;
+use super::milestones::{
+    frozen_assignment_warning, requested_task_milestone, unknown_milestone_warnings,
+};
 use super::update_task::{
     done_guard_blocker_message, load_done_guard_block_check, log_direct_actual_hours_change,
     non_empty, resolve_done_guard,
@@ -158,9 +160,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "applied": applied,
         "errors": errors,
     });
-    // Present only when a `warn`-mode guard, an actual_hours log failure or a
-    // frozen-milestone assignment produced one, so the response shape for
-    // every other call is unchanged.
+    // Present only when a `warn`-mode guard, an actual_hours log failure, a
+    // frozen-milestone assignment or an undefined milestone name produced
+    // one, so the response shape for every other call is unchanged.
     if !warnings.is_empty() {
         result["warnings"] = Value::Array(warnings);
     }
@@ -289,6 +291,30 @@ fn apply_single_update(
         }
     }
 
+    // Orphan guard (`[trace] orphan_guard`, REQ-TRC-002), same predicate and
+    // same `force` as `handoff_update_task`: `block` rejects this one update
+    // into `errors[]`, `warn` adds a `warnings[]` entry. A bulk update carries
+    // neither labels nor `requirement_ids`, so the stored task is judged.
+    let orphan_warning = if transitioning_to_guarded_status {
+        super::orphan_guard::check_entering(
+            handoff_dir,
+            force,
+            super::orphan_guard::Entering::StatusChange,
+            &super::orphan_guard::EnteringTask {
+                id: task_id,
+                title: &data.title,
+                status: new_status,
+                labels: &data.labels,
+                task_dir: Some(&task_dir),
+            },
+            crate::trace::orphan::has_requirement_link(&data.task_links),
+            // A bulk update adds no link.
+            |_docs| false,
+        )?
+    } else {
+        None
+    };
+
     // Guard the same invariant handoff_update_task enforces, or a bulk patch
     // becomes a way around it. The check is on the task as it would be written —
     // status and schedule already merged — not on the patch. Parent tasks (with
@@ -335,9 +361,15 @@ fn apply_single_update(
         data.schedule.as_ref().and_then(|s| s.milestone.as_deref()),
     );
 
-    let warnings: Vec<String> = [guard_warning, log_warning, frozen_warning]
+    // Advisory as well: a milestone name this update passed that config.toml
+    // does not define, as in `handoff_update_task`.
+    let unknown_milestone =
+        unknown_milestone_warnings(handoff_dir, requested_task_milestone(update));
+
+    let warnings: Vec<String> = [guard_warning, orphan_warning, log_warning, frozen_warning]
         .into_iter()
         .flatten()
+        .chain(unknown_milestone)
         .collect();
     Ok((!warnings.is_empty()).then(|| warnings.join("\n")))
 }

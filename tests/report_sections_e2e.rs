@@ -52,6 +52,8 @@ fn err(arguments: Value) -> String {
 }
 
 fn setup() -> (TempDir, String) {
+    // Skip file channel polling in tests (no VSCode extension running).
+    std::env::set_var("HANDOFF_CHART_TIMEOUT_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let pd = dir.path().to_string_lossy().to_string();
     ok(
@@ -193,11 +195,10 @@ fn sections_control_whether_charts_are_generated() {
         &pd,
         json!({ "sections": [{ "type": "metrics" }, { "type": "charts" }] }),
     );
-    assert!(with.contains("```mermaid"), "{with}");
+    // With no VSCode extension, charts show fallback notes instead of images.
     assert!(with.contains("## Charts"), "{with}");
 
     let (_, without) = weekly(&dir, &pd, json!({ "sections": [{ "type": "metrics" }] }));
-    assert!(!without.contains("```mermaid"), "{without}");
     assert!(!without.contains("## Charts"), "{without}");
 }
 
@@ -474,7 +475,11 @@ fn templates_action_lists_builtin_and_project_templates() {
         assert!(builtin.contains(&t.to_string()), "{builtin:?}");
     }
     assert!(!builtin.contains(&"ai_sections".to_string()), "{builtin:?}");
-    assert_eq!(names("partials"), vec!["ai_sections"], "{out}");
+    assert_eq!(
+        names("partials"),
+        vec!["ai_sections", "orphan_tasks"],
+        "{out}"
+    );
     let custom = out["custom"].as_array().unwrap();
     assert_eq!(custom.len(), 2, "{out}");
     let weekly = custom.iter().find(|c| c["name"] == "weekly").unwrap();

@@ -9,6 +9,7 @@ pub mod check_criterion;
 pub mod claim_release;
 pub mod config;
 pub mod config_crud;
+mod creation_guidance;
 pub mod dashboard;
 pub mod doc_export;
 mod doc_export_enrich;
@@ -16,6 +17,7 @@ mod doc_export_task;
 pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
+pub mod doctor;
 mod done_guard;
 pub mod events;
 pub mod fork_session;
@@ -34,10 +36,13 @@ pub mod memory;
 pub mod merge_sessions;
 pub mod metrics;
 pub mod milestones;
+pub mod next_step;
+mod orphan_guard;
 pub mod overview;
 pub(crate) mod plan_links;
 pub mod refer;
 pub mod referrals;
+pub mod release_check;
 pub mod report;
 pub mod save_context;
 pub mod task_checklist;
@@ -100,6 +105,34 @@ pub fn resolve_project_path(project_dir: &std::path::Path, raw: &str) -> PathBuf
     }
 }
 
+/// Tools that work on a project with no `.handoff/` yet. For these the
+/// dispatch layers only compute where `.handoff/` would be instead of
+/// requiring it to exist.
+const TOOLS_USABLE_BEFORE_INIT: &[&str] = &["handoff_init", "handoff_load_context"];
+
+/// Tools that find the project's `.handoff/` themselves, by reading files
+/// only. The dispatch layers must not resolve it for them: the usual
+/// resolution asks `git` about worktrees, and these tools guarantee that
+/// they start no process.
+const SELF_LOCATING_TOOLS: &[&str] = &[
+    "handoff_doctor",
+    "handoff_release_check",
+    "handoff_next_step",
+];
+
+/// The `.handoff/` path a tool call is given as `HandlerContext::handoff_dir`,
+/// shared by the MCP and CLI dispatch layers. Every tool except the ones
+/// listed above requires `.handoff/` to exist.
+pub fn handoff_dir_for_tool(tool: &str, project_dir: &std::path::Path) -> Result<PathBuf> {
+    if SELF_LOCATING_TOOLS.contains(&tool) {
+        Ok(project_dir.join(".handoff"))
+    } else if TOOLS_USABLE_BEFORE_INIT.contains(&tool) {
+        Ok(crate::storage::handoff_dir(project_dir))
+    } else {
+        crate::storage::ensure_handoff_exists(project_dir)
+    }
+}
+
 /// Shared per-call context threaded through every handler. Carries the
 /// resolved project/handoff directories (computed once by the MCP/CLI
 /// dispatch layer) plus the calling agent's identity, so handlers no longer
@@ -132,6 +165,9 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_dashboard" => dashboard::handle(ctx, arguments),
         "handoff_get_config" => config::handle_get(ctx, arguments),
         "handoff_update_config" => config::handle_update(ctx, arguments),
+        "handoff_doctor" => doctor::handle(ctx, arguments),
+        "handoff_release_check" => release_check::handle(ctx, arguments),
+        "handoff_next_step" => next_step::handle(ctx, arguments),
         "handoff_get_task" => get_task::handle(ctx, arguments),
         "handoff_check_criterion" => check_criterion::handle(ctx, arguments),
         "handoff_import_context" => import_context::handle(ctx, arguments),

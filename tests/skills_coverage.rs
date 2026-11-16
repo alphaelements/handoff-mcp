@@ -12,7 +12,9 @@
 //! 3. no skill cites internal artifacts (design-wiki pages, internal
 //!    requirement/task ids, milestone names, private repos/skills),
 //! 4. every skill is structurally sound (frontmatter, Codex metadata,
-//!    `references/` links resolve and nothing is orphaned, size budget).
+//!    `references/` links resolve and nothing is orphaned, size budget),
+//! 5. every skill is listed where users look for skills (the README skills
+//!    table, the plugin README).
 
 use handoff_mcp::mcp::tools::all_tool_definitions;
 use handoff_mcp::storage::config::{
@@ -117,8 +119,9 @@ fn every_mcp_tool_is_documented_in_a_skill() {
 /// Tools that no longer exist but are named on purpose (migration tables).
 const REMOVED_TOOLS: &[&str] = &["handoff_doc_req_test_sync"];
 
-/// `handoff_`-prefixed identifiers that are not tools (session fields).
-const NOT_TOOLS: &[&str] = &["handoff_notes", "handoff_note"];
+/// `handoff_`-prefixed identifiers that are not tools (session fields, and
+/// the `handoff_initialized` check id of `handoff_doctor`).
+const NOT_TOOLS: &[&str] = &["handoff_notes", "handoff_note", "handoff_initialized"];
 
 /// Every identifier in `text` starting at a word boundary with `prefix`,
 /// extended over identifier characters (`handoff_trace_report`).
@@ -188,6 +191,7 @@ fn trace_config_keys() -> Vec<&'static str> {
         layer: _,
         profile: _,
         done_guard: _,
+        orphan_guard: _,
         profiles: _,
         lint: _,
         auto_layer: _,
@@ -240,6 +244,7 @@ fn trace_config_keys() -> Vec<&'static str> {
         "[[trace.layer]]",
         "profile",
         "done_guard",
+        "orphan_guard",
         "[trace.profiles.",
         "[trace.lint.rules]",
         "[[trace.lint.require]]",
@@ -285,6 +290,55 @@ fn every_trace_config_key_is_documented() {
         "[trace] config keys missing from {}: {missing:?}",
         path.display()
     );
+}
+
+/// Every built-in `trace_lint` rule has a row in the rule reference, so a
+/// rule added to the registry cannot ship undocumented.
+#[test]
+fn every_builtin_lint_rule_is_documented() {
+    let path = skills_dir().join("handoff-trace/references/lint-rules.md");
+    let body =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} must exist: {e}", path.display()));
+    let missing: Vec<_> = handoff_mcp::trace::lint::builtin_rule_ids()
+        .filter(|id| !body.contains(&format!("| `{id}` |")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "built-in lint rules with no table row in {}: {missing:?}",
+        path.display()
+    );
+}
+
+/// The README names the orphan-task rule next to the lint entry point, and
+/// the rule reference says what its findings carry and how to exclude a task.
+#[test]
+fn task_orphan_rule_is_listed_in_the_readme_and_the_rule_reference() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .expect("README.md");
+    assert!(
+        readme.contains("| `task_orphan` | warning |"),
+        "README rule table"
+    );
+    assert!(
+        readme.contains("`no-trace`"),
+        "README names the exclusion label"
+    );
+
+    let reference = fs::read_to_string(skills_dir().join("handoff-trace/references/lint-rules.md"))
+        .expect("lint-rules.md");
+    let row = reference
+        .lines()
+        .find(|l| l.starts_with("| `task_orphan` | warning |"))
+        .expect("task_orphan row with its default severity");
+    for needle in ["`skipped`", "`no-trace`", "parent", "requirement_ids"] {
+        assert!(
+            row.contains(needle),
+            "task_orphan row lacks {needle}: {row}"
+        );
+    }
+    for field in ["`task_id`", "`title`", "`suggested_action`"] {
+        assert!(reference.contains(field), "rule reference lacks {field}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,4 +586,43 @@ fn report_schedule_skill_documents_the_cloud_scheduling_recipe() {
         "{} is missing required guidance: {missing:?}",
         path.display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Listing
+// ---------------------------------------------------------------------------
+
+/// A skill nobody can find is not shipped: each skill directory has its row
+/// in the README skills table and is named in the plugin README's list.
+#[test]
+fn every_skill_is_listed_in_the_readmes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    let table = readme
+        .split_once("\n## Skills\n")
+        .expect("README has a Skills section")
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let plugin_readme = fs::read_to_string(root.join("plugin/README.md")).unwrap();
+    let listed = plugin_readme
+        .lines()
+        .find(|line| line.starts_with("- **Skills**"))
+        .expect("plugin/README.md has a Skills line");
+    let listed: Vec<&str> = listed
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .collect();
+
+    let mut problems = Vec::new();
+    for dir in skill_dirs() {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        if !table.contains(&format!("| `{name}` |")) {
+            problems.push(format!("{name}: no row in the README skills table"));
+        }
+        if !listed.contains(&name.as_str()) {
+            problems.push(format!("{name}: not in the plugin/README.md skills list"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

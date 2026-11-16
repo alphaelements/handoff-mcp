@@ -1,6 +1,8 @@
+pub mod charts;
 pub mod cli;
 pub mod context;
 pub mod mcp;
+pub mod release;
 pub mod report;
 pub mod scheduling;
 pub mod semantic;

@@ -62,7 +62,8 @@ tool to call. Details live in reference files — read the one you need:
 ## 2. First-time setup
 
 `handoff_init` writes **no `[trace]` section**: no profile, layers
-auto-detected from whatever layer documents exist, `done_guard = "warn"`.
+auto-detected from whatever layer documents exist, `done_guard = "warn"`,
+`orphan_guard = "warn"`.
 `handoff_load_context`'s `trace_health` shows `has_data: false` until the
 first layer document exists.
 
@@ -81,9 +82,16 @@ first layer document exists.
 handoff_update_config(updates: {
   "trace.profile": "standard",
   "trace.id_prefixes.requirement": ["SYS", "UI"],   # only if you use scope prefixes
-  "trace.done_guard": "warn"                        # "block" to enforce
+  "trace.done_guard": "warn",                       # "block" to enforce
+  "trace.orphan_guard": "warn"                      # tasks with no requirement link; "block" to enforce
 })
 ```
+
+From the first layer document on, every task is expected to trace back to a
+requirement. A task with no requirement link is an **orphan**: `trace_lint`
+reports it (`task_orphan`), and moving it to `review`/`done` warns (or is
+rejected under `orphan_guard = "block"`). Link it with `requirement_ids`, or
+label it `no-trace` when it is deliberately outside traceability.
 
 Optional: `"trace.auto_layer": true` makes `doc_save` infer a layer from
 `doc_type` for documents saved without one (`spec` → requirement, `plan` →
@@ -277,4 +285,9 @@ call. An unknown rule id in `rules` is an error, not a warning.
 - `handoff-docs` — the generic document tools layer documents are built on.
 - `handoff` — sessions, tasks, time tracking.
 - The `handoff-task-loop` plugin's session-loop consumes `trace_slice` /
-  `trace_propose` / `trace_next` / `trace_update` across a session.
+  `trace_propose` / `trace_next` / `trace_update` across a session. Every
+  developer report there has a `### Requirements addressed` section (ids, or
+  `- None — <reason>`), and the session-closer closes a task that still has no
+  requirement link as `review` instead of `done`. The rule and what to do
+  about such a task are in the `handoff` skill's
+  `references/requirement-links.md`.

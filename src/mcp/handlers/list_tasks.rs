@@ -626,6 +626,7 @@ fn filter_tree(
                     priority: node.priority.clone(),
                     lock: node.lock.clone(),
                     task_links: node.task_links.clone(),
+                    labels: node.labels.clone(),
                     children,
                 })
             } else {

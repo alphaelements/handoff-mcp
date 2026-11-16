@@ -45,14 +45,12 @@ Coverage: {{percent data.summary.coverage_pct}} (pass / (total - waived))
 {{#if data.charts}}
 ## Charts
 
-{{#if data.charts.coverage}}
-### Verdicts
+{{#each data.charts}}
+### {{chart_title @key}}
 
-```mermaid
-{{{data.charts.coverage}}}
-```
+{{{this}}}
 
-{{/if}}
+{{/each}}
 {{/if}}
 
 {{#if data.trace_diagram}}

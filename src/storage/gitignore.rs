@@ -46,6 +46,8 @@ pub(crate) const EXPORTS_DIR: &str = "/exports/";
 /// Transient mermaid render cache (under `exports/`; listed on its own for
 /// setups that ignore it without ignoring the exports).
 pub(crate) const MERMAID_CACHE_DIR: &str = ".mermaid-cache/";
+/// Chart file channel: requests, responses, and rendered output.
+pub(crate) const CHARTS_DIR: &str = "/charts/";
 
 /// Every line of the recommended `.handoff/.gitignore`, verbatim and in file
 /// order. Paths are relative to `.handoff/`; a leading `/` anchors to it.
@@ -62,6 +64,7 @@ pub const RECOMMENDED_GITIGNORE_ENTRIES: &[&str] = &[
     TRACE_BASELINES_INDEX,
     EXPORTS_DIR,
     MERMAID_CACHE_DIR,
+    CHARTS_DIR,
 ];
 
 /// UTF-8 byte order mark an editor may have put in front of the first line.

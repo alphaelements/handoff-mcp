@@ -490,7 +490,12 @@ statuses is checked too.
 | `block` | the call is rejected unless `force: true` |
 | `off` | no check |
 
-A task without requirement links is never checked. The blocker tally is the
+A task without requirement links is never checked by the done guard. Such a
+task is the business of the separate **orphan guard** (`[trace]
+orphan_guard`, default `warn`): moving it to `review`/`done` adds a
+`Warning [ORPHAN_TASK]` line, or is rejected under `block`, unless the task
+is labelled `no-trace` or is a parent traced through its children. Details
+are in `config.md` §5. The blocker tally is the
 same one `handoff_get_task` shows under `trace.blockers`. Per requirement
 link:
 
@@ -589,6 +594,12 @@ handoff_report {"action": "reject",  "report_id": "<id>", "reviewer": "qa-lead",
   `_trace_report.json` rewrite, layer demotion).
 - Override a template with `.handoff/templates/<report_type>.md.hbs`. A
   template that fails to compile is an error, not a silent fallback.
+- The periodic reports (`daily`, `weekly`, `monthly`, `quarterly`, `yearly`)
+  end with an `Orphan Tasks` section: the count and an ID / Title / Status
+  table of the tasks with no requirement link, the same tasks the
+  `task_orphan` lint rule reports. With no such task the section is absent.
+  The other report types never carry it. Details: `tools.md` →
+  `handoff_report`.
 
 ## 11. Release verification checklist
 

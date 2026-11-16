@@ -1,0 +1,12 @@
+{{#if data.orphan_tasks}}
+
+## Orphan Tasks
+
+{{cell data.orphan_tasks.count}} task(s) have no requirement link. Link each one with `requirement_ids`, or label it `no-trace`.
+
+| ID | Title | Status |
+| --- | --- | --- |
+{{#each data.orphan_tasks.tasks}}
+| {{cell id}} | {{cell title}} | {{cell status}} |
+{{/each}}
+{{/if}}

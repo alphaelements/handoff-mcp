@@ -803,6 +803,12 @@ const CLOSER_SCHEMA = {
           hours_logged: { type: 'number' },
           trace_updated: { type: 'boolean' },
           requirement_ids_linked: { type: 'array', items: { type: 'string' } },
+          // True when the closer left the task in `review` because it has no
+          // requirement link (handoff_get_task include_orphan answered
+          // `orphan: true`). A finished close-out, not a failure: the
+          // verifier confirms it on disk and the task goes to `warnings`,
+          // not to closer_failed_tasks.
+          requirement_link_missing: { type: 'boolean' },
           // Plan SubItem dev_stage updates applied from update_task's
           // `plan_update_needed` (absent/empty when the task has no plan links).
           plan_updates: {
@@ -853,8 +859,10 @@ const CLOSER_SCHEMA = {
 
 // The closer-verifier's structured result: what is on disk for each task, read
 // back with handoff_get_task. `checked_indices` are the 0-based done_criteria
-// indices whose `checked` is true. A task that could not be read is reported
-// with `error` (and status '' / checked_indices []), never guessed.
+// indices whose `checked` is true. `orphan` is the task's `orphan` field
+// (include_orphan: true), left out when the server did not return one. A task
+// that could not be read is reported with `error` (and status '' /
+// checked_indices []), never guessed.
 const CLOSER_VERIFIER_SCHEMA = {
   type: 'object',
   properties: {
@@ -866,6 +874,7 @@ const CLOSER_VERIFIER_SCHEMA = {
           task_id: { type: 'string' },
           status: { type: 'string' },
           checked_indices: { type: 'array', items: { type: 'integer' } },
+          orphan: { type: 'boolean' },
           error: { type: 'string' },
         },
         required: ['task_id', 'status', 'checked_indices'],
@@ -1794,16 +1803,29 @@ function buildWorkGroups(devAssignments, testAssignments) {
  *  - every index in `criteria_checked` must be checked on disk. Criteria that
  *    are checked on disk but not claimed are NOT a mismatch.
  *
+ *  - the requirement-link rule: the closer leaves a task with no requirement
+ *    link in `review` and says so with `requirement_link_missing: true`; the
+ *    verifier reads the task's `orphan` value back (`handoff_get_task` with
+ *    `include_orphan`). A missing-link claim needs `status_set: 'review'` and
+ *    `orphan: true` on disk — a task that is not an orphan was left in review
+ *    for nothing — and a claim that cannot be confirmed (no boolean `orphan`)
+ *    is 'unverified'. The other way round, a task claimed `done` that is an
+ *    orphan on disk broke the rule. An `orphan` the verifier did not report
+ *    (a server without that field) is held against nothing but a missing-link
+ *    claim. A task left in `review` for any other reason is not judged here.
+ *
  * A claim with something checkable but no usable observation (missing, an
  * `error`, or no `status`) is 'unverified' — the check fails closed instead of
  * passing silently.
  *
- * @param {Array<{task_id: string, status_set?: string, criteria_checked?: number[]}>} claims
+ * @param {Array<{task_id: string, status_set?: string, criteria_checked?: number[],
+ *   requirement_link_missing?: boolean}>} claims
  *   the closer's `tasks_processed` entries
- * @param {Array<{task_id: string, status?: string, checked_indices?: number[], error?: string}>|null} observed
+ * @param {Array<{task_id: string, status?: string, checked_indices?: number[], orphan?: boolean,
+ *   error?: string}>|null} observed
  *   what the verifier read back from disk
- * @returns {Array<{task_id: string, kind: 'status'|'criterion'|'unverified', message: string,
- *   expected?: string, actual?: string, index?: number}>}
+ * @returns {Array<{task_id: string, kind: 'status'|'criterion'|'requirement_link'|'unverified',
+ *   message: string, expected?: string, actual?: string, index?: number}>}
  */
 function compareCloserClaimsWithDisk(claims, observed) {
   const byTask = new Map();
@@ -1850,6 +1872,34 @@ function compareCloserClaimsWithDisk(claims, observed) {
         kind: 'criterion',
         index,
         message: `criterion index ${index} claimed checked but unchecked on disk`,
+      });
+    }
+    // The requirement-link rule: at most one finding per task.
+    if (claim.requirement_link_missing === true) {
+      if (claimedStatus !== 'review') {
+        mismatches.push({
+          task_id: id,
+          kind: 'requirement_link',
+          message: `requirement link missing but status_set is ${claimedStatus === null ? 'not set' : claimedStatus} (expected review)`,
+        });
+      } else if (typeof o.orphan !== 'boolean') {
+        mismatches.push({
+          task_id: id,
+          kind: 'unverified',
+          message: 'requirement-link claim could not be read back from disk (no orphan value)',
+        });
+      } else if (o.orphan === false) {
+        mismatches.push({
+          task_id: id,
+          kind: 'requirement_link',
+          message: 'left in review for a missing requirement link, but the task is not an orphan on disk',
+        });
+      }
+    } else if (claimedStatus === 'done' && o.orphan === true) {
+      mismatches.push({
+        task_id: id,
+        kind: 'requirement_link',
+        message: 'status done but the task has no requirement link on disk (expected review)',
       });
     }
   }
@@ -2040,7 +2090,7 @@ function buildElitePrompt(taskList, context, maxRounds, currentRound = 1) {
     `Return one \`## dev result: <task_id> <task_title>\` block per task, in the order you processed them.`,
     `Each block is your full Return format for that one task: the status and summary lines, the \`### Task:\``,
     `block with its seven stage sections, and every closing section (\`### pendingFollowups\`,`,
-    `\`### Actual time\`, \`### done_criteria progress\`, \`### Requirements addressed\` when tracked,`,
+    `\`### Actual time\`, \`### done_criteria progress\`, \`### Requirements addressed\`,`,
     `\`### Discovered issues\`).`,
     `\nThe workflow cuts your report at these headings and hands each block, alone, to the session-closer:`,
     `- Start each heading with the exact task id from "Assigned tasks", and never put two tasks under one`,
@@ -2049,6 +2099,10 @@ function buildElitePrompt(taskList, context, maxRounds, currentRound = 1) {
     `  task, not a total: the closer logs each block's figure against its task, so the blocks add up to your total.`,
     `- Keep headings, field names, and status values exactly as the Return format spells them, in English,`,
     `  whatever the response language. Write \`- None\` under \`### pendingFollowups\` when nothing is open.`,
+    `- \`### Requirements addressed\` is required in every block, whether or not the task tracks requirements:`,
+    `  the requirement ids the task addressed, one line per fact, or the single line \`- None — <reason>\` when no`,
+    `  requirement applies (\`new requirement needed\`, or \`no-trace\` for work outside requirement traceability).`,
+    `  Never leave the section out or empty: the closer leaves a task with no requirement link in review.`,
     `- The verdicts are read from each block: the \`#### full_suite\` status, the \`#### review\` status,`,
     `  \`fix_loop\` unresolved, and \`### pendingFollowups\`. Anything left open relaunches an elite-developer with`,
     `  those findings while rounds remain, and is filed as a follow-up task after the last round.`,
@@ -2288,6 +2342,14 @@ function buildReviewPrompt(opts) {
 // ============================================================
 // Helper: build closer prompt (Stage 4 — automated Step 6)
 // ============================================================
+// The note the closer appends (notes_append) to a task it leaves in `review`
+// because it has no requirement link. Fixed wording, the same as in
+// agents/session-closer.md (pinned by lib/session-closer.agent.test.js).
+const REQUIREMENT_LINK_MISSING_NOTE =
+  'Requirement link missing: this task has no requirement link, so it was left in review instead of done. '
+  + 'Link it to the requirement it implements (handoff_update_task requirement_ids; handoff_trace_propose suggests candidates), '
+  + 'or add the label no-trace if it is deliberately outside requirement traceability, then mark it done.';
+
 function renderPendingFollowupsForCloser() {
   if (pendingFollowups.length === 0) return 'None';
   return pendingFollowups
@@ -2298,11 +2360,11 @@ function renderPendingFollowupsForCloser() {
 // Read-only prompt: the verifier reports what is on disk and never judges or fixes.
 function buildCloserVerifierPrompt(taskIds) {
   return [
-    `You are a session-closer-verifier. Read each task below back from disk and report its status and checked done_criteria. Do not change anything.`,
+    `You are a session-closer-verifier. Read each task below back from disk and report its status, its checked done_criteria and its orphan value. Do not change anything.`,
     ``,
     `Tasks to read back: ${taskIds.join(', ')}`,
     ``,
-    `For every task call handoff_get_task (or the CLI \`handoff-mcp task get --task-id <id> --project-dir .\`) and return, per task: task_id, status, and checked_indices (the 0-based indices of the done_criteria whose "checked" is true). If a task cannot be read, return it with status "", checked_indices [] and an error message.`,
+    `For every task call handoff_get_task(task_id, include_orphan: true) (or the CLI \`handoff-mcp task get --task-id <id> --include-orphan true --project-dir .\`) and return, per task: task_id, status, checked_indices (the 0-based indices of the done_criteria whose "checked" is true), and orphan (the response's "orphan" field, true or false, verbatim; leave it out when the response has none). A task in review with orphan true is an expected state (the closer leaves a task with no requirement link in review): report it as it is. If a task cannot be read, return it with status "", checked_indices [] and an error message.`,
     `Return only the structured result; error text may be in any language.`,
   ].join('\n');
 }
@@ -2349,21 +2411,35 @@ function buildCloserPrompt() {
     `1. For every \`met: true\` line under \`### done_criteria progress\` in the task's developer`,
     `   report, call \`handoff_check_criterion(task_id, criterion_index, checked=true)\`.`,
     `   Use the index printed in the report; it matches the done_criteria order above.`,
-    `2. Set status: \`done\` only if the integration verdict is PASS or PASS_WITH_NITS, the review`,
+    `2. Read the report's \`### Requirements addressed\` section. A line starting with \`- None\` says`,
+    `   that no requirement applies and names no stable_id: extract nothing from it. From every other`,
+    `   line extract the stable_id and call \`handoff_trace_update(task_id, ops: [{op: 'link', item:`,
+    `   <stable_id>, role: 'implements'}, {op: 'set', item: <stable_id>, dev_stage: 'implemented'}])\`.`,
+    `3. Link the same stable_ids (plus any pre-linked above) with`,
+    `   \`handoff_update_task(task={id, requirement_ids: [...]})\`.`,
+    `4. Set status. First, after steps 2 and 3, read the task with`,
+    `   \`handoff_get_task(task_id, include_orphan: true)\` and take its \`orphan\` field as it is`,
+    `   (never decide it yourself from task_links or labels):`,
+    `   - \`orphan: true\` (no requirement link): set status to \`review\`, never \`done\`, and in the same`,
+    `     \`handoff_update_task\` call pass \`notes_append\` with exactly this text:`,
+    `     "${REQUIREMENT_LINK_MISSING_NOTE}"`,
+    `     Report \`requirement_link_missing: true\` for the task and add a line to \`warnings\`. This is a`,
+    `     finished close-out, not a failure. If the call is rejected with \`orphan_guard: ...\` (the project`,
+    `     blocks orphans), do not pass force: leave the status, append the note with a notes_append-only`,
+    `     call, and report \`status_set: unchanged\` with the rejected call in \`ops_failed\`.`,
+    `   - \`orphan: false\` (a linked task, a \`no-trace\` task, any task of a project with no layer`,
+    `     document), or no \`orphan\` key at all (an older server): go on as below.`,
+    `   - the read fails: set status to \`review\` and add {op: 'orphan_check', error} to \`ops_failed\`.`,
+    `   Otherwise \`done\` only if the integration verdict is PASS or PASS_WITH_NITS, the review`,
     `   verdict (when shown) is APPROVE, no pending follow-up names this task, and every`,
     `   done_criteria index is checked. Otherwise set status to \`review\` — a task that is not`,
     `   fully verified must not be marked done. Use \`handoff_update_task(task={id, status})\`.`,
-    `2b. Read the \`### Actual time\` line of the developer report and call`,
+    `4b. Read the \`### Actual time\` line of the developer report and call`,
     `   \`handoff_log_time(task_id, hours)\` with exactly that number of hours (never round up or`,
     `   estimate); report it as \`hours_logged\`. If the report has no time, log nothing, omit`,
     `   \`hours_logged\` and say so in notes (not a failure). When one report covers several tasks,`,
     `   log its total against the first task only. A failed call goes in \`ops_failed\` as`,
     `   {op: 'log_time', error}.`,
-    `3. If the developer report has a \`### Requirements addressed\` section, extract each`,
-    `   stable_id and call \`handoff_trace_update(task_id, ops: [{op: 'link', item: <stable_id>,`,
-    `   role: 'implements'}, {op: 'set', item: <stable_id>, dev_stage: 'implemented'}])\`.`,
-    `4. Link the same stable_ids (plus any pre-linked above) with`,
-    `   \`handoff_update_task(task={id, requirement_ids: [...]})\`.`,
     `5. If a call fails for one task, record it in that task's \`ops_failed\` ({op, error}) and`,
     `   continue with the remaining tasks. Never abort the whole close-out for one task's error.`,
     `   A call you could not attempt (no handoff tool and no working CLI) goes in that task's`,
@@ -4389,8 +4465,10 @@ const closerWarnings = [...specPrepWarnings, ...eliteWarnings, ...reconcileWarni
 // Tasks whose close-out the closer reported as failed or incomplete
 // (ops_failed / unexecuted_ops), tasks missing from its tasks_processed, or
 // every task when the closer itself failed (`error`). Empty when the closer
-// did not run. Also holds tasks whose claimed status/criteria did not match
-// what the closer-verifier read back from disk.
+// did not run. Also holds tasks whose claimed status/criteria/requirement-link
+// state did not match what the closer-verifier read back from disk. A task
+// left in `review` for a missing requirement link that the disk confirms is
+// NOT in here: it is reported under `warnings` (requirement_link_missing).
 const closerFailedTasks = [];
 if (sessionPassed && HAS_TEST_STAGE) {
   phase('Close');
@@ -4506,6 +4584,20 @@ if (sessionPassed && HAS_TEST_STAGE) {
       );
     }
   }
+  // A task the closer left in `review` because it has no requirement link is a
+  // finished close-out, not a failure: it stays out of closer_failed_tasks and
+  // is named here so the manager can see why it is not `done`. A task whose
+  // close-out failed for any reason (including a missing-link claim the disk
+  // does not bear out) already has its closer_failed warning instead.
+  // Only session tasks: those are the ones the verifier read back.
+  for (const p of closerResult.tasks_processed) {
+    if (p.requirement_link_missing !== true || !TASK_IDS.includes(p.task_id)) continue;
+    if (closerFailedTasks.includes(p.task_id)) continue;
+    closerWarnings.push(
+      `requirement_link_missing: task ${p.task_id} has no requirement link, so the closer left it in review instead of done `
+        + `(not a closer failure). Link it with requirement_ids, or label it no-trace, then mark it done.`,
+    );
+  }
   if (Array.isArray(closerResult.warnings)) {
     closerWarnings.push(...closerResult.warnings);
   }
@@ -4551,9 +4643,11 @@ return {
   // it skipped, per-task errors it reported).
   closer_report: closerResult,
   // Task ids the closer reported as failed/incomplete (ops_failed or
-  // unexecuted_ops non-empty), whose claimed status/criteria did not match the
-  // disk (or could not be read back), or every task when the closer failed
-  // (`closer_report.error`); the manager closes these by hand.
+  // unexecuted_ops non-empty), whose claimed status/criteria/requirement-link
+  // state did not match the disk (or could not be read back), or every task
+  // when the closer failed (`closer_report.error`); the manager closes these by
+  // hand. A task deliberately left in `review` because it has no requirement
+  // link is not listed here; it has a `requirement_link_missing:` warning.
   closer_failed_tasks: closerFailedTasks,
   warnings: closerWarnings,
   // Findings still unresolved when the last main-loop round ran out, one entry

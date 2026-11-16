@@ -89,6 +89,7 @@ Swap `report_type` / `period` for the other rows of the table.
 | `include_charts` | `true` (default) | burndown / velocity charts; they are Mermaid blocks, harmless in Markdown |
 | `data.ai_summary`, `data.ai_analysis`, `data.ai_risks`, `data.ai_recommendations` | let the agent write them | rendered as AI sections right after the header; omit a key to hide its section |
 | `sections` | only to trim or reorder | omit for the template's full report |
+| `data.orphan_tasks` | leave it out | these report types end with an `Orphan Tasks` section (count and ID / Title / Status of the tasks with no requirement link) whenever the project has such tasks; pass `null` only to hide it |
 | `report_template` | a custom `.handoff/templates/<name>.md.hbs` for a house style | check names with `action: "templates"` |
 | `format` | `"markdown"` in the cloud | PDF needs Typst (built into release binaries) and `mmdc`, usually missing there |
 | follow-up action | `submit` only | keeps the approve / publish decision with a human |

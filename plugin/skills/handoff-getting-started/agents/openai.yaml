@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Getting Started"
+  short_description: "Walk from an empty directory to one finished task in seven steps"
+  default_prompt: "Use $handoff-getting-started to take this project from an empty directory to its first finished task"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

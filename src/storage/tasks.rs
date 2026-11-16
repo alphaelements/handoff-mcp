@@ -229,6 +229,11 @@ pub struct TaskIndex {
     /// `list_tasks` / `load_context` JSON payloads byte-identical.
     #[serde(skip)]
     pub task_links: Vec<TaskLink>,
+    /// Mirrored from `TaskData.labels` for the orphan-task check
+    /// (`crate::trace::orphan`, the `no-trace` label). `serde(skip)` keeps
+    /// the `list_tasks` / `load_context` JSON payloads byte-identical.
+    #[serde(skip)]
+    pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -565,6 +570,8 @@ struct TaskIndexFields {
     lock: Option<TaskLock>,
     #[serde(default)]
     task_links: Vec<TaskLink>,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 // -- t370.13 process-wide `TaskIndexFields` read cache (wiki/240-
@@ -1323,58 +1330,125 @@ pub fn change_status(task_dir: &Path, new_status: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn next_child_id(parent_dir: &Path, parent_id: &str) -> Result<String> {
-    let mut max_n: u32 = 0;
-
-    if parent_dir.exists() {
-        for entry in std::fs::read_dir(parent_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(n) = extract_child_number(&name, parent_id) {
-                max_n = max_n.max(n);
-            }
-        }
-    }
-
-    Ok(format!("{parent_id}.{}", max_n + 1))
+/// The id of the next child of `parent_id`: `{parent_id}.{n}`, with `n` one
+/// above the highest child number in use anywhere under `tasks_dir`.
+///
+/// "Anywhere" matters: a child moved to another parent by `move_to` keeps
+/// its id, and a project written by an older build can hold a `{parent_id}.{n}`
+/// task outside its parent. Counting only the parent's own directory would
+/// hand such an id out a second time. See [`max_used_number`] for what counts
+/// as in use.
+pub fn next_child_id(tasks_dir: &Path, parent_id: &str) -> Result<String> {
+    let max_n = max_used_number(tasks_dir, &|name| extract_child_number(name, parent_id))?;
+    Ok(format!("{parent_id}.{}", next_number(max_n)?))
 }
 
+/// The id of the next top-level task: `t{n}`, with `n` one above the highest
+/// `t{n}` in use anywhere under `tasks_dir` (a top-level task moved under a
+/// parent by `move_to` keeps its id). See [`max_used_number`].
 pub fn next_top_level_id(tasks_dir: &Path) -> Result<String> {
-    let mut max_n: u32 = 0;
+    let max_n = max_used_number(tasks_dir, &extract_top_level_number)?;
+    Ok(format!("t{}", next_number(max_n)?))
+}
 
-    if tasks_dir.exists() {
-        for entry in std::fs::read_dir(tasks_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(n) = extract_top_level_number(&name) {
-                max_n = max_n.max(n);
-            }
+fn next_number(max_n: u32) -> Result<u32> {
+    max_n.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!("Task numbers are exhausted (the highest in use is {max_n})")
+    })
+}
+
+/// The highest number `number_of` extracts from an id in use in the whole
+/// tree under `tasks_dir`, or 0 when it matches none.
+///
+/// An id is in use when a task file stores it, at any depth and in any
+/// status, and also when a directory is named for it (`{id}-{slug}`): task
+/// lookup goes through the directory name, and a directory left without a
+/// task file still occupies the name the next task with that id would get.
+///
+/// An id in use also uses the number of every ancestor its dots name
+/// (`t7.1` uses the `7` of `t7`, whether or not a `t7` exists), so an
+/// allocated id never has descendants already: callers that create a task
+/// and number its children from 1 (`handoff_import_context`) rely on that.
+fn max_used_number(tasks_dir: &Path, number_of: &dyn Fn(&str) -> Option<u32>) -> Result<u32> {
+    let mut max_n = 0;
+    visit_used_ids(sorted_dir_entries(tasks_dir)?, &mut |used| {
+        if let Some(n) = number_of(used) {
+            max_n = max_n.max(n);
         }
-    }
-
-    Ok(format!("t{}", max_n + 1))
+    })?;
+    Ok(max_n)
 }
 
-fn extract_child_number(dir_name: &str, parent_id: &str) -> Option<u32> {
-    let prefix = format!("{parent_id}.");
-    let rest = dir_name.strip_prefix(&prefix)?;
-    let num_part = rest.split('-').next()?;
-    num_part.parse().ok()
+/// Calls `visit` with the directory name and, when the directory holds a
+/// task file, the stored id of every directory in `entries` and below.
+fn visit_used_ids(entries: Vec<std::fs::DirEntry>, visit: &mut dyn FnMut(&str)) -> Result<()> {
+    for entry in entries {
+        visit(&entry.file_name().to_string_lossy());
+        let task_dir = entry.path();
+        let child_entries = match read_task_index_fields_with_children(&task_dir) {
+            Ok(Some((fields, _status, child_entries))) => {
+                visit(&fields.id);
+                child_entries
+            }
+            // No task file, or one that cannot be parsed: the stored id is
+            // unknown, so only the directory name (visited above) reserves a
+            // number here. An unreadable task must not block every creation
+            // in the project, and its directory name is what a lookup of its
+            // id resolves through anyway.
+            Ok(None) | Err(_) => sorted_dir_entries(&task_dir)?,
+        };
+        visit_used_ids(child_entries, visit)?;
+    }
+    Ok(())
 }
 
-fn extract_top_level_number(dir_name: &str) -> Option<u32> {
-    let rest = dir_name.strip_prefix('t')?;
-    let num_part = rest.split('-').next()?;
-    if num_part.contains('.') {
-        return None;
+/// The child number `n` that `name` uses under `parent_id`: `name` is
+/// `{parent_id}.{n}`, a descendant id of it (`{parent_id}.{n}.{m}`), or the
+/// directory name of either (`{parent_id}.{n}-{slug}`).
+fn extract_child_number(name: &str, parent_id: &str) -> Option<u32> {
+    leading_number(name.strip_prefix(parent_id)?.strip_prefix('.')?)
+}
+
+/// The top-level number `n` that `name` uses: `name` is `t{n}`, a descendant
+/// id of it (`t{n}.{m}`), or the directory name of either (`t{n}-{slug}`).
+fn extract_top_level_number(name: &str) -> Option<u32> {
+    leading_number(name.strip_prefix('t')?)
+}
+
+/// The number `rest` starts with, when it ends there or goes on with the
+/// `.` of a descendant id or the `-` of a directory name's slug.
+fn leading_number(rest: &str) -> Option<u32> {
+    rest.split(['.', '-']).next()?.parse().ok()
+}
+
+/// The id of the task a dotted id names as its parent: `t-book` for
+/// `t-book.16`, `t1.2` for `t1.2.3`. `None` for an id without a dot, which
+/// names no parent.
+pub fn implied_parent_id(task_id: &str) -> Option<&str> {
+    task_id.rsplit_once('.').map(|(parent, _)| parent)
+}
+
+/// Rejects an id that cannot name a new task.
+///
+/// The id becomes part of the task's directory name (`{id}-{slug}`), so a
+/// path separator in it would put the task in a directory no lookup by id
+/// reaches, or outside the project. The id, and every dot-separated part of
+/// it, must also be non-empty: `t1.`, `.1` and `t1..2` would each name a
+/// parent or a child with no id.
+pub fn validate_new_task_id(task_id: &str) -> Result<()> {
+    if task_id.contains(['/', '\\']) {
+        anyhow::bail!(
+            "Invalid task id '{task_id}': a task id must not contain a path separator \
+             ('/' or '\\')."
+        );
     }
-    num_part.parse().ok()
+    if task_id.split('.').any(str::is_empty) {
+        anyhow::bail!(
+            "Invalid task id '{task_id}': the id and each dot-separated part of it must not be \
+             empty."
+        );
+    }
+    Ok(())
 }
 
 /// Process-wide cache of `(tasks_dir, task_id) -> resolved task directory`,
@@ -1705,6 +1779,39 @@ pub fn build_task_index(
     Ok((tree, summary))
 }
 
+/// The read-only index of the tasks nested under the task in `task_dir`
+/// (its children and their descendants), never truncated. Empty for a leaf
+/// task and for a directory that holds no task. Same read-only contract as
+/// [`build_task_index`]: no lease reclaim, no write.
+pub fn build_task_children_index(task_dir: &Path) -> Result<Vec<TaskIndex>> {
+    let child_entries = sorted_dir_entries(task_dir)?;
+    let mut children = Vec::new();
+    let mut summary = TaskSummary {
+        total: 0,
+        by_status: std::collections::BTreeMap::new(),
+        total_estimate_hours: None,
+        total_actual_hours: None,
+        completion_rate: None,
+        overdue_count: 0,
+    };
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    build_index_recursive(
+        child_entries,
+        task_dir,
+        &mut children,
+        &mut summary,
+        &mut 0,
+        u32::MAX,
+        &mut 0.0,
+        &mut 0.0,
+        &mut false,
+        &mut Vec::new(),
+        &today,
+        false,
+    )?;
+    Ok(children)
+}
+
 fn build_task_index_impl(
     tasks_dir: &Path,
     done_task_limit: u32,
@@ -1922,6 +2029,7 @@ fn build_index_recursive(
             priority: data.priority,
             lock,
             task_links: data.task_links,
+            labels: data.labels,
             children,
         });
     }

@@ -31,6 +31,12 @@ pub fn run(args: &[String]) -> i32 {
     // invent an agent for it (`handoff_load_context` would otherwise register
     // a new one per call).
     crate::mcp::router::mark_cli_process();
+    // `release-check <milestone>` takes a positional argument and has its own
+    // exit-code contract (and, with `--run`, executes the project's commands),
+    // so it does not go through the generic flag-to-tool mapping.
+    if args.first().map(String::as_str) == Some(RELEASE_CHECK_COMMAND) {
+        return crate::release::cli::run(&args[1..]);
+    }
     let is_trace = args.first().map(String::as_str) == Some("trace");
     let action = args.get(1).map(String::as_str);
     let is_trace_lint = is_trace && action == Some("lint");
@@ -65,6 +71,9 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 }
+
+/// The `release-check` command (see [`crate::release::cli`]).
+const RELEASE_CHECK_COMMAND: &str = "release-check";
 
 /// Whether a `trace update` response carries a `failed` op. The handler
 /// answers `Ok` with `{"applied": [...], "failed": {...}}` for both a
@@ -210,11 +219,7 @@ fn build_handler_context(
 ) -> anyhow::Result<handlers::HandlerContext> {
     let project_dir = handlers::resolve_project_dir(arguments)?;
 
-    let handoff_dir = if matches!(tool_name, "handoff_init" | "handoff_load_context") {
-        crate::storage::handoff_dir(&project_dir)
-    } else {
-        crate::storage::ensure_handoff_exists(&project_dir)?
-    };
+    let handoff_dir = handlers::handoff_dir_for_tool(tool_name, &project_dir)?;
 
     Ok(handlers::HandlerContext {
         agent_id: None,
@@ -327,6 +332,9 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
 
         // dashboard
         ("dashboard", "") => "handoff_dashboard",
+
+        // next step
+        ("next-step", "") => "handoff_next_step",
 
         // timer
         ("timer", "start") => "handoff_timer_start",
@@ -660,6 +668,7 @@ const STRING_FIELDS: &[&str] = &[
     "priority",
     "project_dir",
     "project_name",
+    "preset",
     "description",
     "notes",
     "title",
@@ -882,6 +891,13 @@ pub const GROUPS: &[(&str, &str)] = &[
     ),
     ("assignee", "Team members (list, add, update, remove)"),
     ("milestone", "Milestones (list, add, update, remove)"),
+    (
+        RELEASE_CHECK_COMMAND,
+        // No trailing parenthesized list: this command takes a milestone, not
+        // one of several actions, and `--help` readers (and the help tests)
+        // take such a list for the group's actions.
+        "Pre-release check of a milestone: <milestone> [--run] [--confirm <ids>]",
+    ),
     ("calendar", "Calendar settings (update)"),
     ("labels", "Project labels (update)"),
     ("project", "Project lifecycle (start)"),
@@ -889,6 +905,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("capacity", "Work capacity"),
     ("schedule", "Auto-scheduler"),
     ("dashboard", "Cross-project dashboard"),
+    ("next-step", "Recommended next step for the project"),
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "doc",
@@ -933,8 +950,15 @@ EXAMPLES:
 }
 
 pub fn print_group_help(group: &str) {
+    if group == RELEASE_CHECK_COMMAND {
+        println!("{}", crate::release::cli::USAGE);
+        return;
+    }
     let actions: &[(&str, &str)] = match group {
-        "init" => &[("", "Initialize handoff tracking (--project-name <name>)")],
+        "init" => &[(
+            "",
+            "Initialize handoff tracking (--project-name <name> [--preset beginner])",
+        )],
         "task" => &[
             ("list", "List tasks (--status-filter, --assignee-filter, --milestone-filter, --priority-filter, --label-filter)"),
             ("get", "Get task detail (--task-id <id>)"),
@@ -953,7 +977,10 @@ pub fn print_group_help(group: &str) {
         ],
         "config" => &[
             ("get", "Read project config"),
-            ("update", "Update config (--updates '{...}')"),
+            (
+                "update",
+                "Update config (--updates '{...}' | --preset beginner [--confirm])",
+            ),
         ],
         "memory" => &[
             ("save", "Save a memory (--text, --kind, --tags, --scope-paths, --force)"),
@@ -977,7 +1004,7 @@ pub fn print_group_help(group: &str) {
         "milestone" => &[
             ("list", "List milestones"),
             ("add", "Add milestone (--name, --date, --description)"),
-            ("update", "Update milestone (--name, --date, --description)"),
+            ("update", "Update milestone (--name, --date, --description, --status, --force; a move to `released` consults the release check when [onboarding] release_guard is warn or block)"),
             ("remove", "Remove milestone (--name)"),
         ],
         "calendar" => &[
@@ -1003,6 +1030,10 @@ pub fn print_group_help(group: &str) {
         "dashboard" => &[
             ("", "Show cross-project dashboard (--scan-dirs, --include-completed)"),
         ],
+        "next-step" => &[(
+            "",
+            "Print the project's state and the one operation to do next, as JSON {state, action, facts}",
+        )],
         "timer" => &[
             ("start", "Start timer for task (--task-id)"),
             ("stop", "Stop timer for task (--task-id)"),
@@ -1092,6 +1123,26 @@ pub fn is_cli_command(first_arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--preset` names a preset; a value that looks like a literal must reach
+    /// the tool as text so the error can name it.
+    #[test]
+    fn preset_flag_stays_a_string_and_confirm_is_a_boolean() {
+        let args: Vec<String> = ["--preset", "true", "--confirm"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let parsed = parse_flags(&args, "handoff_update_config").unwrap();
+        assert_eq!(parsed, json!({ "preset": "true", "confirm": true }));
+        let args: Vec<String> = ["--project-name", "demo", "--preset", "beginner"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(
+            parse_flags(&args, "handoff_init").unwrap(),
+            json!({ "project_name": "demo", "preset": "beginner" })
+        );
+    }
 
     #[test]
     fn condition_values_stay_strings() {

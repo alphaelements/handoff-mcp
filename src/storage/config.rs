@@ -127,6 +127,354 @@ pub struct Config {
     /// before this section existed parsing and re-serializing unchanged.
     #[serde(default, skip_serializing_if = "SessionLoopConfig::is_empty")]
     pub session_loop: SessionLoopConfig,
+    /// Project commands: `[commands]` (SPEC-ONB-001), the source of truth for
+    /// the install / build / test / check commands. `serde(default)` +
+    /// `skip_serializing_if` keep every config.toml written before this
+    /// section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "CommandsConfig::is_empty")]
+    pub commands: CommandsConfig,
+    /// Guidance and checks for first-time users: `[onboarding]`
+    /// (SPEC-ONB-091), all off by default. `serde(default)` +
+    /// `skip_serializing_if` keep every config.toml written before this
+    /// section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "OnboardingConfig::is_empty")]
+    pub onboarding: OnboardingConfig,
+    /// Pre-release checks: `[release]` (SPEC-ONB-040). `serde(default)` +
+    /// `skip_serializing_if` keep every config.toml written before this
+    /// section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "ReleaseConfig::is_empty")]
+    pub release: ReleaseConfig,
+}
+
+/// Keys of the `[commands]` section, in the order they are listed to users.
+pub const COMMAND_KEYS: &[&str] = &[
+    "install",
+    "build",
+    "test",
+    "lint",
+    "format",
+    "typecheck",
+    "smoke",
+    "audit",
+];
+
+/// `[commands]` section (SPEC-ONB-001): the project's install, build, test and
+/// check commands, each a free-form shell command line.
+///
+/// This section is the source of truth for those commands. `handoff-mcp setup`
+/// fills it from the project's manifests and copies the values into the
+/// `Build & Test` section of `CLAUDE.md`; the readiness and release checks
+/// read it. handoff-mcp's MCP server never runs these commands: it hands them
+/// to the agent, and only the `setup --check --run` CLI executes them.
+///
+/// Any string is accepted, so a project whose layout the inference does not
+/// know works once the user writes the commands by hand (SPEC-ONB-093).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CommandsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typecheck: Option<String>,
+    /// One command that shows the application still starts and works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke: Option<String>,
+    /// Dependency audit command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<String>,
+    /// Keys this version does not know. They are kept so that rewriting
+    /// config.toml never drops a command the project (or a newer handoff-mcp)
+    /// defined; nothing here reads them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl CommandsConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// The command for one of [`COMMAND_KEYS`], or `None` when it is not
+    /// defined. A blank value counts as not defined: that is what clearing a
+    /// key through `handoff_update_config` leaves behind.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        let value = match key {
+            "install" => &self.install,
+            "build" => &self.build,
+            "test" => &self.test,
+            "lint" => &self.lint,
+            "format" => &self.format,
+            "typecheck" => &self.typecheck,
+            "smoke" => &self.smoke,
+            "audit" => &self.audit,
+            _ => return None,
+        };
+        value
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+    }
+}
+
+/// Presets `handoff_init` / `handoff_update_config` accept (SPEC-ONB-010).
+pub const ONBOARDING_PRESETS: &[&str] = &["beginner"];
+
+/// Values `[onboarding] preflight` accepts.
+pub const PREFLIGHT_MODES: &[&str] = &["off", "check", "run"];
+
+/// Values `[onboarding] release_guard` accepts.
+pub const RELEASE_GUARD_MODES: &[&str] = &["off", "warn", "block"];
+
+/// Seconds a `[commands]` command may run in a readiness check before it is
+/// stopped, unless `[onboarding] command_timeout_sec` says otherwise.
+pub const DEFAULT_COMMAND_TIMEOUT_SEC: u64 = 600;
+
+/// The value every `[onboarding]` mode key reads as when it is unset.
+const ONBOARDING_MODE_OFF: &str = "off";
+
+/// File names that usually hold secrets (SPEC-ONB-050), matched against the
+/// files Git tracks unless `[onboarding] secret_file_patterns` replaces the
+/// list. `*` stands for any run of characters and `?` for one.
+pub const DEFAULT_SECRET_FILE_PATTERNS: &[&str] = &[
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json",
+    "secrets.*",
+];
+
+/// File names that match a secrets pattern but are templates meant to be
+/// committed. They are never reported, whatever the patterns are.
+pub const SECRET_FILE_EXCLUSIONS: &[&str] = &[".env.example", ".env.sample", ".env.template"];
+
+/// `[onboarding]` section (SPEC-ONB-010, SPEC-ONB-091): switches for the
+/// guidance and checks aimed at first-time users.
+///
+/// Every key is off unless the project sets it, so a config.toml written
+/// before this section existed behaves exactly as it did; the `beginner`
+/// preset turns them on together. handoff-mcp only stores and validates these
+/// values here: the session-loop and requirement-loop skills read them
+/// through `handoff_get_config`.
+///
+/// Fields are `Option`s so that a value written explicitly, even one equal to
+/// the default, survives a rewrite as written. Mode strings are lenient on
+/// parse (a hand-edited bad value must not make the whole `config.toml`
+/// unreadable; the accessor reads it as off) and strict in
+/// [`Self::validate`], which the config write path calls.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OnboardingConfig {
+    /// Name of the preset last applied (see [`ONBOARDING_PRESETS`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Readiness check before a session is planned (see [`PREFLIGHT_MODES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<String>,
+    /// Add the recommended next step to `handoff_load_context`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<bool>,
+    /// Run `[commands] smoke` before implementation starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke_check: Option<bool>,
+    /// Pre-release check when a milestone is released (see
+    /// [`RELEASE_GUARD_MODES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_guard: Option<String>,
+    /// Require a decision on the minimum security requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_min_nfr: Option<bool>,
+    /// Seconds a `[commands]` command may run in a readiness check
+    /// (default [`DEFAULT_COMMAND_TIMEOUT_SEC`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_timeout_sec: Option<u64>,
+    /// Seconds `[commands] smoke` may run in the smoke check of the session
+    /// loop before it is stopped (SPEC-ONB-030). handoff-mcp never runs the
+    /// smoke check: the session-loop command reads this key through
+    /// `handoff_get_config` and applies its default of 120 seconds when the
+    /// key is unset. It is typed here so that a value that is not a positive
+    /// number of seconds is rejected when it is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke_timeout_sec: Option<u64>,
+    /// File-name patterns of secrets files, replacing
+    /// [`DEFAULT_SECRET_FILE_PATTERNS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_file_patterns: Option<Vec<String>>,
+    /// Keys this version does not know. They are kept so that rewriting
+    /// config.toml never drops a setting a newer handoff-mcp wrote; nothing
+    /// here reads them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl OnboardingConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// The applied preset, if it is one this version knows.
+    pub fn preset(&self) -> Option<&str> {
+        self.preset
+            .as_deref()
+            .filter(|preset| ONBOARDING_PRESETS.contains(preset))
+    }
+
+    /// `"off"` (default) | `"check"` | `"run"`.
+    pub fn preflight(&self) -> &str {
+        known_mode(self.preflight.as_deref(), PREFLIGHT_MODES)
+    }
+
+    pub fn next_step(&self) -> bool {
+        self.next_step.unwrap_or(false)
+    }
+
+    pub fn smoke_check(&self) -> bool {
+        self.smoke_check.unwrap_or(false)
+    }
+
+    /// `"off"` (default) | `"warn"` | `"block"`.
+    pub fn release_guard(&self) -> &str {
+        known_mode(self.release_guard.as_deref(), RELEASE_GUARD_MODES)
+    }
+
+    pub fn security_min_nfr(&self) -> bool {
+        self.security_min_nfr.unwrap_or(false)
+    }
+
+    /// Seconds a `[commands]` command may run in a readiness check. Zero
+    /// would fail every command at once, so it reads as the default.
+    pub fn command_timeout_sec(&self) -> u64 {
+        self.command_timeout_sec
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SEC)
+    }
+
+    /// The file-name patterns the secrets check matches: the configured
+    /// list, or [`DEFAULT_SECRET_FILE_PATTERNS`] when none is configured. A
+    /// blank entry matches nothing and is left out. An explicitly empty list
+    /// stays empty: the project asked for no patterns.
+    pub fn secret_file_patterns(&self) -> Vec<&str> {
+        match &self.secret_file_patterns {
+            Some(patterns) => patterns
+                .iter()
+                .map(|pattern| pattern.trim())
+                .filter(|pattern| !pattern.is_empty())
+                .collect(),
+            None => DEFAULT_SECRET_FILE_PATTERNS.to_vec(),
+        }
+    }
+
+    /// Rejects a value the readers would not honor. An empty string is what a
+    /// `null` update writes and means "unset", so it passes.
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, value, accepted) in [
+            ("preset", &self.preset, ONBOARDING_PRESETS),
+            ("preflight", &self.preflight, PREFLIGHT_MODES),
+            ("release_guard", &self.release_guard, RELEASE_GUARD_MODES),
+        ] {
+            match value.as_deref() {
+                None | Some("") => {}
+                Some(value) if accepted.contains(&value) => {}
+                Some(value) => {
+                    return Err(format!(
+                        "invalid onboarding.{key} '{value}': expected one of {}",
+                        accepted.join("/")
+                    ))
+                }
+            }
+        }
+        for (key, seconds) in [
+            ("command_timeout_sec", self.command_timeout_sec),
+            ("smoke_timeout_sec", self.smoke_timeout_sec),
+        ] {
+            if seconds == Some(0) {
+                return Err(format!(
+                    "invalid onboarding.{key} 0: expected a number of seconds >= 1"
+                ));
+            }
+        }
+        if self
+            .secret_file_patterns
+            .iter()
+            .flatten()
+            .any(|pattern| pattern.trim().is_empty())
+        {
+            return Err(
+                "invalid onboarding.secret_file_patterns: a pattern is blank. Give file-name \
+                 patterns such as \".env\" or \"*.pem\", or an empty list for none"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[release]` section (SPEC-ONB-040): what the pre-release check of a
+/// milestone asks for beyond what it can judge from the project's data.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseConfig {
+    /// Names of the items a person confirms before a release
+    /// (`docs_updated`, ...). Each becomes the check `manual:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_checks: Option<Vec<String>>,
+    /// Keys this version does not know. They are kept so that rewriting
+    /// config.toml never drops a setting a newer handoff-mcp wrote; nothing
+    /// here reads them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl ReleaseConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// The manual check names in the order they are configured, each once. A
+    /// blank entry names nothing and is left out.
+    pub fn manual_checks(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for name in self.manual_checks.iter().flatten().map(|name| name.trim()) {
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Rejects a list the readers would silently reduce.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for name in self.manual_checks.iter().flatten().map(|name| name.trim()) {
+            if name.is_empty() {
+                return Err(
+                    "invalid release.manual_checks: a name is blank. Give names such as \
+                     \"docs_updated\""
+                        .to_string(),
+                );
+            }
+            if seen.contains(&name) {
+                return Err(format!(
+                    "invalid release.manual_checks: '{name}' is listed more than once"
+                ));
+            }
+            seen.push(name);
+        }
+        Ok(())
+    }
+}
+
+/// `value` when it is one of `accepted`, otherwise off.
+fn known_mode<'a>(value: Option<&'a str>, accepted: &[&str]) -> &'a str {
+    value
+        .filter(|mode| accepted.contains(mode))
+        .unwrap_or(ONBOARDING_MODE_OFF)
 }
 
 /// Pipeline profiles `[session_loop] profile` accepts, cheapest first. This
@@ -471,6 +819,10 @@ pub const MILESTONE_DEFAULT_STATUS: &str = "planning";
 /// Status that gates new task assignment with a warning.
 pub const MILESTONE_FROZEN_STATUS: &str = "frozen";
 
+/// Status of a milestone that shipped. Moving a milestone to it is what the
+/// release guard (`[onboarding] release_guard`) checks.
+pub const MILESTONE_RELEASED_STATUS: &str = "released";
+
 impl MilestoneConfig {
     /// The effective lifecycle status (`planning` when unset).
     pub fn effective_status(&self) -> &str {
@@ -656,6 +1008,14 @@ pub struct TraceConfig {
     /// that also carries the `check_*` switches. See [`DoneGuardConfig`].
     #[serde(default, skip_serializing_if = "DoneGuardConfig::is_default")]
     pub done_guard: DoneGuardConfig,
+    /// `[trace] orphan_guard` (REQ-TRC-002): what a `review`/`done`
+    /// transition of an orphan task (no requirement link, see
+    /// `crate::trace::orphan`) does. One of [`ORPHAN_GUARD_MODES`]; unset
+    /// means [`DEFAULT_ORPHAN_GUARD_MODE`]. Stored as written — read it
+    /// through [`TraceConfig::orphan_guard_mode`]. Independent of
+    /// `done_guard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_guard: Option<String>,
     /// `[trace.profiles.<name>]` project-defined profiles (wiki/260 §2.1).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub profiles: HashMap<String, TraceProfileConfig>,
@@ -763,6 +1123,12 @@ pub const DEFAULT_PLAN_LAYER: &str = "detailed_spec";
 
 /// Accepted `[trace] done_guard` values.
 pub const DONE_GUARD_MODES: &[&str] = &["off", "warn", "block"];
+
+/// Accepted `[trace] orphan_guard` values.
+pub const ORPHAN_GUARD_MODES: &[&str] = &["off", "warn", "block"];
+
+/// `[trace] orphan_guard` when the key is not set.
+pub const DEFAULT_ORPHAN_GUARD_MODE: &str = "warn";
 
 /// `[trace] done_guard` (wiki/260 §3.4, wiki/430 §3.6).
 ///
@@ -1015,12 +1381,24 @@ where
 }
 
 impl TraceConfig {
+    /// The effective `[trace] orphan_guard` mode. Any value other than one
+    /// of [`ORPHAN_GUARD_MODES`] (a typo in a hand-edited file, a future
+    /// mode) reads as the default — never silently stricter, never silently
+    /// disabled, the same fail-safe as `done_guard`.
+    pub fn orphan_guard_mode(&self) -> &str {
+        match self.orphan_guard.as_deref() {
+            Some(mode) if ORPHAN_GUARD_MODES.contains(&mode) => mode,
+            _ => DEFAULT_ORPHAN_GUARD_MODE,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
             && self.id_prefixes.is_empty()
             && self.layer.is_empty()
             && self.profile.is_none()
             && self.done_guard.is_default()
+            && self.orphan_guard.is_none()
             && self.profiles.is_empty()
             && self.lint.is_empty()
             && !self.auto_layer
@@ -1197,6 +1575,9 @@ impl Config {
             gui: GuiConfig::default(),
             test: TestConfig::default(),
             session_loop: SessionLoopConfig::default(),
+            commands: CommandsConfig::default(),
+            onboarding: OnboardingConfig::default(),
+            release: ReleaseConfig::default(),
         }
     }
 }
@@ -1287,6 +1668,26 @@ pub fn write_config(path: &Path, config: &Config) -> Result<()> {
     crate::storage::atomic_write(path, content.as_bytes())
         .with_context(|| format!("Failed to write config: {}", path.display()))?;
     Ok(())
+}
+
+/// For code that edits `config.toml` in place (keeping its comments and
+/// layout) instead of re-serializing [`Config`]: the table stored at `key` of
+/// `parent`, created when there is none (or when
+/// `key` holds a plain value, which the dotted key being written replaces).
+/// A section written inline (`key = { ... }`, which is how a whole-object
+/// update is stored) is kept and extended: replacing it with a fresh table
+/// would drop every key it already holds.
+pub(crate) fn ensure_table_like<'a>(
+    parent: &'a mut dyn toml_edit::TableLike,
+    key: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike> {
+    if !parent.get(key).is_some_and(toml_edit::Item::is_table_like) {
+        parent.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| anyhow::anyhow!("{key} is not a table"))
 }
 
 #[cfg(test)]
@@ -1980,6 +2381,62 @@ done_guard = "error"
         assert!(!render_config(&cfg).unwrap().contains("done_guard"));
     }
 
+    // -- [trace] orphan_guard (REQ-TRC-002, SPEC-TRC-003) --
+
+    fn trace_of(toml_str: &str) -> TraceConfig {
+        parse_config(&format!("[project]\nname = \"t\"\n{toml_str}")).trace
+    }
+
+    #[test]
+    fn orphan_guard_defaults_to_warn_and_keeps_an_empty_trace_empty() {
+        let trace = trace_of("");
+        assert_eq!(trace.orphan_guard, None);
+        assert_eq!(trace.orphan_guard_mode(), "warn");
+        assert!(trace.is_empty());
+        // A config without the key is rendered without it.
+        let cfg = parse_config("[project]\nname = \"t\"\n[trace]\nprofile = \"standard\"\n");
+        assert!(!render_config(&cfg).unwrap().contains("orphan_guard"));
+    }
+
+    #[test]
+    fn orphan_guard_reads_each_mode_and_round_trips() {
+        for mode in ORPHAN_GUARD_MODES {
+            let src = format!("[trace]\norphan_guard = \"{mode}\"\n");
+            let trace = trace_of(&src);
+            assert_eq!(trace.orphan_guard_mode(), *mode);
+            assert!(!trace.is_empty(), "{mode}: an explicit value is a setting");
+            let cfg = parse_config(&format!("[project]\nname = \"t\"\n{src}"));
+            let rendered = render_config(&cfg).unwrap();
+            assert!(
+                rendered.contains(&format!("orphan_guard = \"{mode}\"")),
+                "{rendered}"
+            );
+            assert_eq!(parse_config(&rendered).trace.orphan_guard_mode(), *mode);
+        }
+        assert_eq!(ORPHAN_GUARD_MODES, &["off", "warn", "block"]);
+    }
+
+    /// A hand-edited value the guard does not know reads as `warn`: never
+    /// silently stricter, never silently disabled. It is kept as written.
+    #[test]
+    fn orphan_guard_unknown_value_falls_back_to_warn() {
+        let trace = trace_of("[trace]\norphan_guard = \"strict\"\n");
+        assert_eq!(trace.orphan_guard.as_deref(), Some("strict"));
+        assert_eq!(trace.orphan_guard_mode(), "warn");
+    }
+
+    #[test]
+    fn orphan_guard_and_done_guard_are_independent() {
+        let trace = trace_of("[trace]\ndone_guard = \"block\"\norphan_guard = \"off\"\n");
+        assert_eq!(trace.done_guard.mode, "block");
+        assert_eq!(trace.orphan_guard_mode(), "off");
+
+        let trace = trace_of("[trace]\ndone_guard = \"off\"\n");
+        assert_eq!(trace.orphan_guard_mode(), "warn");
+        let trace = trace_of("[trace]\norphan_guard = \"block\"\n");
+        assert_eq!(trace.done_guard.mode, "warn");
+    }
+
     #[test]
     fn trace_config_parses_profile_and_profiles() {
         let cfg = parse_config(
@@ -2425,5 +2882,418 @@ pair = "usability_test"
         let rendered = render_config(&cfg).unwrap();
         assert!(!rendered.contains("[test"), "{rendered}");
         assert_eq!(parse_config(&rendered).test, cfg.test);
+    }
+
+    // --- [commands] (SPEC-ONB-001, SPEC-ONB-093) ---
+
+    #[test]
+    fn commands_section_is_optional_and_absent_from_serialized_config_when_empty() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert!(cfg.commands.is_empty());
+        assert_eq!(cfg.commands, CommandsConfig::default());
+        for key in COMMAND_KEYS {
+            assert_eq!(cfg.commands.get(key), None, "{key}");
+        }
+        let rendered = render_config(&cfg).unwrap();
+        assert!(!rendered.contains("commands"), "{rendered}");
+        assert!(
+            !render_config(&Config::new("x", ""))
+                .unwrap()
+                .contains("commands"),
+            "a freshly initialized config has no [commands]"
+        );
+    }
+
+    #[test]
+    fn commands_section_reads_every_known_key() {
+        let body: String = COMMAND_KEYS
+            .iter()
+            .map(|key| format!("{key} = \"run {key}\"\n"))
+            .collect();
+        let cfg = parse_config(&format!("[project]\nname = \"x\"\n\n[commands]\n{body}"));
+        assert!(!cfg.commands.is_empty());
+        for key in COMMAND_KEYS {
+            assert_eq!(
+                cfg.commands.get(key),
+                Some(format!("run {key}").as_str()),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            COMMAND_KEYS,
+            &[
+                "install",
+                "build",
+                "test",
+                "lint",
+                "format",
+                "typecheck",
+                "smoke",
+                "audit"
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_accept_any_string_and_treat_blank_as_undefined() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[commands]\n\
+             test = \"make -C sub test | tee log && echo 'done' # 日本語\"\n\
+             build = \"\"\nlint = \"   \"\n",
+        );
+        assert_eq!(
+            cfg.commands.get("test"),
+            Some("make -C sub test | tee log && echo 'done' # 日本語")
+        );
+        assert_eq!(cfg.commands.get("build"), None);
+        assert_eq!(cfg.commands.get("lint"), None);
+        assert_eq!(cfg.commands.get("no_such_key"), None);
+    }
+
+    /// A rewrite of config.toml (any tool that re-serializes `Config`) must not
+    /// drop `[commands]`: it is the source of truth for the project's commands.
+    #[test]
+    fn commands_section_round_trips_including_keys_this_version_does_not_know() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[commands]\ntest = \"cargo test\"\n\
+             smoke = \"./smoke.sh\"\ne2e = \"npm run e2e\"\nretries = 3\n",
+        );
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("[commands]"), "{rendered}");
+        let reparsed = parse_config(&rendered);
+        assert_eq!(reparsed.commands, cfg.commands);
+        assert_eq!(reparsed.commands.get("test"), Some("cargo test"));
+        assert_eq!(reparsed.commands.get("smoke"), Some("./smoke.sh"));
+        assert!(rendered.contains("e2e = \"npm run e2e\""), "{rendered}");
+        assert!(rendered.contains("retries = 3"), "{rendered}");
+        assert_eq!(
+            reparsed.commands.get("e2e"),
+            None,
+            "an unknown key is preserved, not treated as a command"
+        );
+    }
+
+    #[test]
+    fn commands_known_key_must_be_a_string() {
+        let err = toml::from_str::<Config>("[project]\nname = \"x\"\n\n[commands]\ntest = 1\n");
+        assert!(err.is_err());
+    }
+
+    // --- [onboarding] (SPEC-ONB-010, SPEC-ONB-091) ---
+
+    #[test]
+    fn onboarding_section_absent_means_everything_is_off() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        let onboarding = &cfg.onboarding;
+        assert!(onboarding.is_empty());
+        assert_eq!(onboarding, &OnboardingConfig::default());
+        assert_eq!(onboarding.preset(), None);
+        assert_eq!(onboarding.preflight(), "off");
+        assert!(!onboarding.next_step());
+        assert!(!onboarding.smoke_check());
+        assert_eq!(onboarding.release_guard(), "off");
+        assert!(!onboarding.security_min_nfr());
+
+        let rendered = render_config(&cfg).unwrap();
+        assert!(!rendered.contains("onboarding"), "{rendered}");
+        assert!(
+            !render_config(&Config::new("x", ""))
+                .unwrap()
+                .contains("onboarding"),
+            "a freshly initialized config has no [onboarding]"
+        );
+    }
+
+    #[test]
+    fn onboarding_section_reads_every_key() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\npreset = \"beginner\"\n\
+             preflight = \"run\"\nnext_step = true\nsmoke_check = true\n\
+             release_guard = \"block\"\nsecurity_min_nfr = true\n",
+        );
+        let onboarding = &cfg.onboarding;
+        assert!(!onboarding.is_empty());
+        assert_eq!(onboarding.preset(), Some("beginner"));
+        assert_eq!(onboarding.preflight(), "run");
+        assert!(onboarding.next_step());
+        assert!(onboarding.smoke_check());
+        assert_eq!(onboarding.release_guard(), "block");
+        assert!(onboarding.security_min_nfr());
+        assert!(onboarding.validate().is_ok());
+    }
+
+    /// A value written explicitly, even one equal to the default, is kept as
+    /// written, and keys this version does not know survive a rewrite.
+    #[test]
+    fn onboarding_section_round_trips_as_written() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\npreflight = \"off\"\n\
+             next_step = false\nsmoke_timeout_sec = 90\n\
+             secret_file_patterns = [\".env\", \"*.pem\"]\n",
+        );
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("[onboarding]"), "{rendered}");
+        assert!(rendered.contains("preflight = \"off\""), "{rendered}");
+        assert!(rendered.contains("next_step = false"), "{rendered}");
+        assert!(rendered.contains("smoke_timeout_sec = 90"), "{rendered}");
+        assert!(rendered.contains("secret_file_patterns"), "{rendered}");
+        assert!(!rendered.contains("smoke_check"), "{rendered}");
+        assert_eq!(parse_config(&rendered).onboarding, cfg.onboarding);
+    }
+
+    #[test]
+    fn onboarding_validate_names_the_accepted_values() {
+        for (toml_line, key, accepted) in [
+            (
+                "preflight = \"sometimes\"",
+                "onboarding.preflight",
+                "off/check/run",
+            ),
+            (
+                "release_guard = \"strict\"",
+                "onboarding.release_guard",
+                "off/warn/block",
+            ),
+            ("preset = \"expert\"", "onboarding.preset", "beginner"),
+        ] {
+            let cfg = parse_config(&format!(
+                "[project]\nname = \"x\"\n\n[onboarding]\n{toml_line}\n"
+            ));
+            let err = cfg.onboarding.validate().unwrap_err();
+            assert!(err.contains(key), "{toml_line}: {err}");
+            assert!(err.contains(accepted), "{toml_line}: {err}");
+        }
+        for ok in [
+            "preflight = \"check\"",
+            "release_guard = \"warn\"",
+            "preset = \"beginner\"",
+            "preset = \"\"",
+            "preflight = \"\"",
+            "release_guard = \"\"",
+        ] {
+            let cfg = parse_config(&format!("[project]\nname = \"x\"\n\n[onboarding]\n{ok}\n"));
+            assert!(cfg.onboarding.validate().is_ok(), "{ok}");
+        }
+    }
+
+    /// A hand-edited bad mode must not make config.toml unreadable; the
+    /// feature it names simply stays off.
+    #[test]
+    fn onboarding_unknown_modes_parse_and_read_as_off() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\npreflight = \"sometimes\"\n\
+             release_guard = \"\"\npreset = \"\"\n",
+        );
+        assert_eq!(cfg.onboarding.preflight(), "off");
+        assert_eq!(cfg.onboarding.release_guard(), "off");
+        assert_eq!(cfg.onboarding.preset(), None);
+    }
+
+    #[test]
+    fn onboarding_switches_must_be_booleans() {
+        for line in ["next_step = \"yes\"", "smoke_check = 1", "preflight = true"] {
+            let parsed = toml::from_str::<Config>(&format!(
+                "[project]\nname = \"x\"\n\n[onboarding]\n{line}\n"
+            ));
+            assert!(parsed.is_err(), "{line}");
+        }
+    }
+
+    // --- [onboarding] command_timeout_sec (SPEC-ONB-002) ---
+
+    #[test]
+    fn command_timeout_defaults_to_ten_minutes() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert_eq!(cfg.onboarding.command_timeout_sec(), 600);
+        assert_eq!(DEFAULT_COMMAND_TIMEOUT_SEC, 600);
+        assert!(cfg.onboarding.is_empty());
+    }
+
+    #[test]
+    fn command_timeout_is_read_and_round_trips() {
+        let cfg =
+            parse_config("[project]\nname = \"x\"\n\n[onboarding]\ncommand_timeout_sec = 45\n");
+        assert_eq!(cfg.onboarding.command_timeout_sec(), 45);
+        assert!(cfg.onboarding.validate().is_ok());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("command_timeout_sec = 45"), "{rendered}");
+        assert_eq!(parse_config(&rendered).onboarding, cfg.onboarding);
+    }
+
+    /// A timeout of zero would fail every command at once; it is rejected on
+    /// write and read as the default when hand-edited.
+    #[test]
+    fn command_timeout_of_zero_is_invalid_and_reads_as_the_default() {
+        let cfg =
+            parse_config("[project]\nname = \"x\"\n\n[onboarding]\ncommand_timeout_sec = 0\n");
+        assert_eq!(cfg.onboarding.command_timeout_sec(), 600);
+        let err = cfg.onboarding.validate().unwrap_err();
+        assert!(err.contains("onboarding.command_timeout_sec"), "{err}");
+
+        for bad in ["command_timeout_sec = -5", "command_timeout_sec = \"60\""] {
+            let parsed = toml::from_str::<Config>(&format!(
+                "[project]\nname = \"x\"\n\n[onboarding]\n{bad}\n"
+            ));
+            assert!(parsed.is_err(), "{bad}");
+        }
+    }
+
+    // --- [onboarding] smoke_timeout_sec (SPEC-ONB-030) ---
+
+    /// The key is typed, not one of the unknown keys that are only carried
+    /// along, and an unset key leaves the section empty: the default (120
+    /// seconds) is applied by its reader, session-loop Step 0c.
+    #[test]
+    fn smoke_timeout_is_read_and_round_trips() {
+        let unset = parse_config("[project]\nname = \"x\"\n");
+        assert_eq!(unset.onboarding.smoke_timeout_sec, None);
+        assert!(unset.onboarding.is_empty());
+
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 45\n");
+        assert_eq!(cfg.onboarding.smoke_timeout_sec, Some(45));
+        assert!(
+            cfg.onboarding.extra.is_empty(),
+            "{:?}",
+            cfg.onboarding.extra
+        );
+        assert!(cfg.onboarding.validate().is_ok());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("smoke_timeout_sec = 45"), "{rendered}");
+        assert_eq!(parse_config(&rendered).onboarding, cfg.onboarding);
+    }
+
+    /// The smoke timeout and `command_timeout_sec` are independent keys.
+    #[test]
+    fn smoke_timeout_is_independent_of_the_command_timeout() {
+        let cfg =
+            parse_config("[project]\nname = \"x\"\n\n[onboarding]\ncommand_timeout_sec = 45\n");
+        assert_eq!(cfg.onboarding.smoke_timeout_sec, None);
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 7\n");
+        assert_eq!(cfg.onboarding.command_timeout_sec(), 600);
+    }
+
+    /// A timeout of zero would fail the smoke check at once; it is rejected
+    /// on write. A value that is not a whole number of seconds does not parse.
+    #[test]
+    fn smoke_timeout_must_be_a_positive_number_of_seconds() {
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 0\n");
+        let err = cfg.onboarding.validate().unwrap_err();
+        assert!(err.contains("onboarding.smoke_timeout_sec"), "{err}");
+        assert!(err.contains(">= 1"), "{err}");
+
+        let one = parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsmoke_timeout_sec = 1\n");
+        assert!(one.onboarding.validate().is_ok());
+
+        for bad in ["smoke_timeout_sec = -5", "smoke_timeout_sec = \"60\""] {
+            let parsed = toml::from_str::<Config>(&format!(
+                "[project]\nname = \"x\"\n\n[onboarding]\n{bad}\n"
+            ));
+            assert!(parsed.is_err(), "{bad}");
+        }
+    }
+
+    // --- [onboarding] secret_file_patterns (SPEC-ONB-050) ---
+
+    #[test]
+    fn secret_file_patterns_default_to_the_documented_list() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert_eq!(
+            cfg.onboarding.secret_file_patterns(),
+            [
+                ".env",
+                ".env.*",
+                "*.pem",
+                "*.key",
+                "id_rsa",
+                "id_ed25519",
+                "credentials.json",
+                "secrets.*"
+            ]
+        );
+        assert_eq!(
+            SECRET_FILE_EXCLUSIONS,
+            [".env.example", ".env.sample", ".env.template"]
+        );
+        assert!(cfg.onboarding.is_empty());
+    }
+
+    #[test]
+    fn secret_file_patterns_are_read_and_round_trip() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = [\"*.tfstate\", \" token.txt \"]\n",
+        );
+        assert_eq!(
+            cfg.onboarding.secret_file_patterns(),
+            ["*.tfstate", "token.txt"]
+        );
+        assert!(cfg.onboarding.validate().is_ok());
+        let rendered = render_config(&cfg).unwrap();
+        assert_eq!(parse_config(&rendered).onboarding, cfg.onboarding);
+
+        // An explicit empty list is kept as written: it means "no patterns".
+        let none =
+            parse_config("[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = []\n");
+        assert!(none.onboarding.secret_file_patterns().is_empty());
+        assert!(render_config(&none)
+            .unwrap()
+            .contains("secret_file_patterns = []"));
+    }
+
+    #[test]
+    fn a_blank_secret_file_pattern_is_invalid() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = [\".env\", \"  \"]\n",
+        );
+        let err = cfg.onboarding.validate().unwrap_err();
+        assert!(err.contains("onboarding.secret_file_patterns"), "{err}");
+        // Read leniently: the blank entry matches nothing and is dropped.
+        assert_eq!(cfg.onboarding.secret_file_patterns(), [".env"]);
+
+        let parsed = toml::from_str::<Config>(
+            "[project]\nname = \"x\"\n\n[onboarding]\nsecret_file_patterns = \".env\"\n",
+        );
+        assert!(parsed.is_err(), "a string is not a list of patterns");
+    }
+
+    // --- [release] manual_checks (SPEC-ONB-040) ---
+
+    #[test]
+    fn release_section_absent_means_no_manual_checks() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert!(cfg.release.is_empty());
+        assert!(cfg.release.manual_checks().is_empty());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(!rendered.contains("release"), "{rendered}");
+    }
+
+    #[test]
+    fn release_manual_checks_are_read_in_order_and_round_trip() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[release]\nmanual_checks = [\"docs_updated\", \" changelog \", \"docs_updated\", \"\"]\nfuture_key = 1\n",
+        );
+        assert_eq!(cfg.release.manual_checks(), ["docs_updated", "changelog"]);
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("[release]"), "{rendered}");
+        assert!(
+            rendered.contains("future_key = 1"),
+            "a key this version does not know survives a rewrite: {rendered}"
+        );
+        assert_eq!(parse_config(&rendered).release, cfg.release);
+    }
+
+    #[test]
+    fn release_validate_rejects_blank_and_duplicate_names() {
+        for (body, expected) in [
+            ("manual_checks = [\"a\", \" \"]", "blank"),
+            ("manual_checks = [\"a\", \"a\"]", "more than once"),
+        ] {
+            let cfg = parse_config(&format!("[project]\nname = \"x\"\n\n[release]\n{body}\n"));
+            let err = cfg.release.validate().unwrap_err();
+            assert!(err.contains("release.manual_checks"), "{err}");
+            assert!(err.contains(expected), "{err}");
+        }
+        let ok =
+            parse_config("[project]\nname = \"x\"\n\n[release]\nmanual_checks = [\"a\", \"b\"]\n");
+        assert!(ok.release.validate().is_ok());
     }
 }

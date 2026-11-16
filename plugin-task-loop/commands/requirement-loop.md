@@ -434,6 +434,65 @@ Save `reqflow_state` (`scopes` with `status: "defined"`, `completed_phases: [0,1
    its id. Then `handoff_trace_lint(rules=["missing_acceptance","ambiguous_word"])` must be quiet
    for the NFR items.
 
+#### Security minimum (only when `[onboarding] security_min_nfr = true`)
+
+`handoff_get_config` -> `onboarding.security_min_nfr`. When it is absent or `false`: skip this
+block. Ask nothing, record nothing, and go straight to Gate #2. Phase 2 is then exactly
+steps 1-4 above.
+
+When it is `true`, three security items each need an explicit decision before Gate #2,
+whatever step 2 decided for the security characteristic as a whole:
+
+| Item | What the decision is about |
+|---|---|
+| Handling of secrets | Where passwords, API keys and tokens are kept, and how they stay out of the repository, the logs and error messages |
+| Validation of external input | Which input crosses a trust boundary (users, files, the network, other systems) and how it is checked before it is used |
+| Dependency updates | How vulnerable third-party dependencies are found, and how soon they are updated |
+
+The questions to put to the user for each item are in the NFR checklist, section
+"Security minimum: three decisions".
+
+1. Ask the three decisions in one `AskUserQuestion` call, one question per item, each with
+   the options "File as a requirement / Out of scope". Do not decide for the user, and do
+   not read an answer out of the brainstorm report or out of step 2: no answer is not a
+   decision.
+2. Act on each answer:
+   - **File as a requirement** — write an `NFR-SEC-nnn` item into the NFR document
+     (`nfr_doc_id`) under the rules of Phase 2 step 3: a numeric criterion, a `method`
+     and an acceptance criterion.
+   - **Out of scope** — ask the user for the reason and keep it in the table of the next
+     step. An item without a reason is still undecided.
+3. Keep the three decisions in the NFR document, in a `## Security minimum` section. The
+   heading carries no item id, so the section adds no requirement:
+
+   ```markdown
+   ## Security minimum
+
+   | Item | Decision | Requirement or reason |
+   |---|---|---|
+   | Handling of secrets | requirement | NFR-SEC-001 |
+   | Validation of external input | requirement | NFR-SEC-002 |
+   | Dependency updates | out of scope | <the reason the user gave> |
+   ```
+
+   `Decision` is `requirement` (with the id of the `NFR-` item), `out of scope` (with the
+   reason) or `undecided`. Write the section as soon as the first answer is in, with
+   `undecided` for what is still open, so a suspended flow shows where it stopped.
+4. Record the outcome for the security characteristic. `nfr_check` records the status
+   only, which is why the reasons live in the document:
+   - the NFR document has at least one security item:
+     `handoff_trace_lint(action="nfr_check", review={"security": "applicable"})`;
+   - all three are out of scope and there is no other security item:
+     `handoff_trace_lint(action="nfr_check", review={"security": "not_applicable"})`.
+
+   When items were added, run the two `handoff_trace_lint` calls of Phase 2 step 4 again.
+
+**Do not ask Gate #2 while any of the three is `undecided`.** Until every item is a
+requirement or out of scope with a reason, the "Gate 2 to 3" checklist is not met. When
+the user cannot decide now, Suspend the flow (it resumes in Phase 2) instead of passing the
+gate with an open item. At Gate #2, show the `## Security minimum` table together with the
+eight-category table.
+
 **Gate #2 — preflight "Gate 2 to 3"** (shared contracts complete).
 
 `AskUserQuestion`: show the eight-category table (status, item ids, reasons for N/A) and

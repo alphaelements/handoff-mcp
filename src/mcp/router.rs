@@ -2,7 +2,9 @@ use std::sync::{LazyLock, Mutex};
 
 use serde_json::{json, Value};
 
-use super::handlers::{handle_tool_call, resolve_project_dir, HandlerContext};
+use super::handlers::{
+    handle_tool_call, handoff_dir_for_tool, resolve_project_dir, HandlerContext,
+};
 use super::tools::{all_resource_definitions, all_tool_definitions};
 use super::types::{
     InitializeResult, JsonRpcResponse, ResourcesCapability, ServerCapabilities, ServerInfo,
@@ -180,6 +182,11 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_get_task",
     "handoff_list_tasks",
     "handoff_get_config",
+    // Reads files and judges the results it is given; writes nothing.
+    "handoff_doctor",
+    // SPEC-ONB-011: reads the project's state and recommends one operation;
+    // writes nothing.
+    "handoff_next_step",
     "handoff_get_metrics",
     // REQ-RPT-004: pure read over `.handoff/metrics_snapshots/`, `events.jsonl`
     // and the task tree; writes nothing.
@@ -447,11 +454,7 @@ fn handle_tools_call(params: Option<&Value>) -> JsonRpcResponse {
 fn build_handler_context(name: &str, arguments: &Value) -> anyhow::Result<HandlerContext> {
     let project_dir = resolve_project_dir(arguments)?;
 
-    let handoff_dir = if matches!(name, "handoff_init" | "handoff_load_context") {
-        crate::storage::handoff_dir(&project_dir)
-    } else {
-        crate::storage::ensure_handoff_exists(&project_dir)?
-    };
+    let handoff_dir = handoff_dir_for_tool(name, &project_dir)?;
 
     Ok(HandlerContext {
         agent_id: get_agent_id(),
