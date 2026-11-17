@@ -735,6 +735,10 @@ A plain Markdown file, `.handoff/review_board.md`, where the AI puts questions f
 |------|---------|
 | `handoff_review_init` | Create the board with the default categories (an existing board is left untouched) |
 | `handoff_review_add` | Append an item (`### title <!-- rb-id: R-NNN -->`, attribute lines, body, checkbox, memo line) to a category |
+| `handoff_review_list` | List all boards with pending/confirmed/total counts |
+| `handoff_review_read` | Read a board's items with status, memos, and image paths |
+| `handoff_review_update` | Check/uncheck items and record memos; validates assignee |
+| `handoff_review_resolve` | Mark a board as resolved; locks it against further changes |
 
 ### Document Management
 
