@@ -36,6 +36,18 @@ fn string_array<'a>(arguments: &'a Value, key: &str) -> Result<Vec<&'a str>> {
     }
 }
 
+/// Reads an optional JSON number; present-but-not-a-number is an error.
+fn optional_number(arguments: &Value, key: &str) -> Result<Option<f64>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("'{key}' must be a finite number")),
+        Some(_) => bail!("'{key}' must be a number"),
+    }
+}
+
 /// `handoff_review_init`: creates the board with the default categories when
 /// it does not exist; an existing board is left untouched.
 pub fn handle_init(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
@@ -67,6 +79,11 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         assignee: optional_str(arguments, "assignee")?,
         task_id: optional_str(arguments, "task_id")?,
         doc_id: optional_str(arguments, "doc_id")?,
+        expected_image: optional_str(arguments, "expected_image")?,
+        actual_image: optional_str(arguments, "actual_image")?,
+        diff_image: optional_str(arguments, "diff_image")?,
+        similarity_pct: optional_number(arguments, "similarity_pct")?,
+        threshold: optional_number(arguments, "threshold")?,
         image_paths: &image_paths,
     };
     let added = add_item(&ctx.handoff_dir, &item, chrono::Utc::now().date_naive())?;

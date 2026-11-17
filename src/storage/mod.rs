@@ -19,6 +19,7 @@ pub mod referrals;
 pub mod review_assets;
 pub mod review_board;
 pub mod review_board_items;
+pub mod review_decisions;
 pub mod review_lock;
 pub mod review_scan;
 pub mod review_section;

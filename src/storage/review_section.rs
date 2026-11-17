@@ -26,21 +26,32 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map, Number, Value};
 
 use super::review_assets::{ensure_assets_ignored, normalize_image_path};
-use super::review_board::{board_path, CHECKBOX_LINE, MEMO_LINE};
+use super::review_board::{assignee_warnings, board_path, CHECKBOX_LINE, MEMO_LINE};
 use super::review_board_items::{detect_status, ReviewStatus};
 use super::review_lock::BoardLock;
 use super::review_scan::{
     attr_block_end, board_warnings, checkbox_state, fenced_flags, find_footer, heading, memo_rest,
-    normalize_mixed_line_endings, parse_attr, parse_item_heading, split_eol, Fence,
+    normalize_mixed_line_endings, parse_attr, parse_item_heading, parse_number, split_eol, Fence,
 };
 
 /// Attribute keys in the order the tool writes them. A key the tool adds to
 /// an existing section is inserted at its place in this order; keys it does
 /// not know keep their position and sort after these.
-const ATTR_ORDER: [&str; 5] = ["priority", "assignee", "task_id", "doc_id", "date"];
+const ATTR_ORDER: [&str; 10] = [
+    "priority",
+    "assignee",
+    "task_id",
+    "doc_id",
+    "expected_image",
+    "actual_image",
+    "diff_image",
+    "similarity_pct",
+    "threshold",
+    "date",
+];
 
 /// Alt text used for an embedded image whose path has no usable file stem.
 const FALLBACK_IMAGE_ALT: &str = "image";
@@ -78,10 +89,20 @@ pub struct ReviewSection {
     pub date: Option<String>,
     pub task_id: Option<String>,
     pub doc_id: Option<String>,
+    /// Expected / golden image path (RB-011), as written.
+    pub expected_image: Option<String>,
+    pub actual_image: Option<String>,
+    pub diff_image: Option<String>,
+    /// `None` when the line is absent, empty or not a number.
+    pub similarity_pct: Option<Number>,
+    pub threshold: Option<Number>,
     pub images: Vec<String>,
     pub checkbox_checked: bool,
     pub memo: String,
     pub content_hash: String,
+    /// Findings about this item alone (a non-numeric `similarity_pct` or
+    /// `threshold`); surfaced by [`read_item_with_warnings`].
+    pub warnings: Vec<String>,
 }
 
 impl ReviewSection {
@@ -101,6 +122,11 @@ impl ReviewSection {
         m.insert("date".into(), json!(self.date));
         m.insert("task_id".into(), json!(self.task_id));
         m.insert("doc_id".into(), json!(self.doc_id));
+        m.insert("expected_image".into(), json!(self.expected_image));
+        m.insert("actual_image".into(), json!(self.actual_image));
+        m.insert("diff_image".into(), json!(self.diff_image));
+        m.insert("similarity_pct".into(), json!(self.similarity_pct));
+        m.insert("threshold".into(), json!(self.threshold));
         m.insert("images".into(), json!(self.images));
         m.insert("checkbox_checked".into(), json!(self.checkbox_checked));
         if !meta {
@@ -341,7 +367,9 @@ pub fn read_item_with_warnings(
     let spans = index_sections(&board.text);
     let span = locate(&spans, which)?;
     let item = parse_item(&board.text[span.start..span.end], span);
-    Ok((item, board.warnings))
+    let mut warnings = board.warnings;
+    warnings.extend(item.warnings.iter().cloned());
+    Ok((item, warnings))
 }
 
 /// Result of a successful [`update_item`].
@@ -411,6 +439,8 @@ pub fn update_item(
 
     let new_span = &new_spans[span.seq];
     let item = parse_item(&new_text[new_span.start..new_span.end], new_span);
+    let mut warnings = warnings;
+    warnings.extend(assignee_warnings(handoff_dir, updates.assignee.as_deref()));
     Ok(UpdatedItem {
         item,
         fields: updates.field_names(),
@@ -428,13 +458,13 @@ pub fn section_hash(section: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The board text as readers and writers see it, with its warnings.
-struct Board {
+pub(super) struct Board {
     /// Mixed LF/CRLF turned into LF; a uniform board is as on disk.
-    text: String,
-    warnings: Vec<String>,
+    pub(super) text: String,
+    pub(super) warnings: Vec<String>,
 }
 
-fn read_board(handoff_dir: &Path) -> Result<Board> {
+pub(super) fn read_board(handoff_dir: &Path) -> Result<Board> {
     let path = board_path(handoff_dir);
     match std::fs::read_to_string(&path) {
         Ok(raw) => Ok(Board {
@@ -451,7 +481,10 @@ fn read_board(handoff_dir: &Path) -> Result<Board> {
     }
 }
 
-fn locate<'a>(spans: &'a [SectionSpan], which: SectionRef<'_>) -> Result<&'a SectionSpan> {
+pub(super) fn locate<'a>(
+    spans: &'a [SectionSpan],
+    which: SectionRef<'_>,
+) -> Result<&'a SectionSpan> {
     match which {
         SectionRef::Id(id) => {
             let mut matches = spans.iter().filter(|s| s.id.as_deref() == Some(id));
@@ -554,6 +587,20 @@ pub(super) fn parse_item(section: &str, span: &SectionSpan) -> ReviewSection {
             .map(|(_, v)| v.to_string())
             .filter(|v| !v.is_empty())
     };
+    let mut warnings = Vec::new();
+    let mut number = |key: &'static str| {
+        let raw = attr(key)?;
+        let parsed = parse_number(&raw);
+        if parsed.is_none() {
+            warnings.push(format!(
+                "item {} has a non-numeric {key} ({raw:?}); it is read as null",
+                span.id.as_deref().unwrap_or(&span.title)
+            ));
+        }
+        parsed
+    };
+    let similarity_pct = number("similarity_pct");
+    let threshold = number("threshold");
     let body = trimmed_blank_lines(&lines[lay.attr_end..lay.footer_start]);
     let checkbox_checked = lay
         .checkbox
@@ -592,10 +639,16 @@ pub(super) fn parse_item(section: &str, span: &SectionSpan) -> ReviewSection {
         date: attr("date"),
         task_id: attr("task_id"),
         doc_id: attr("doc_id"),
+        expected_image: attr("expected_image"),
+        actual_image: attr("actual_image"),
+        diff_image: attr("diff_image"),
+        similarity_pct,
+        threshold,
         images,
         checkbox_checked,
         memo,
         content_hash: section_hash(section),
+        warnings,
     }
 }
 

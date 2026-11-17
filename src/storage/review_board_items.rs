@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Result};
 use serde::Serialize;
+use serde_json::Number;
 
 use super::review_section::{index_sections, parse_item, ReviewSection};
 
@@ -66,6 +67,12 @@ pub struct ReviewItem {
     pub date: Option<String>,
     pub task_id: Option<String>,
     pub doc_id: Option<String>,
+    /// Image comparison attributes (RB-011), as [`ReviewSection`] reads them.
+    pub expected_image: Option<String>,
+    pub actual_image: Option<String>,
+    pub diff_image: Option<String>,
+    pub similarity_pct: Option<Number>,
+    pub threshold: Option<Number>,
     /// Text of the enclosing `##` heading; `None` before the first one.
     pub category: Option<String>,
     /// The item contains a Markdown image link outside code fences.
@@ -74,6 +81,15 @@ pub struct ReviewItem {
     pub checkbox_checked: bool,
     /// Text the user wrote after `メモ:` (trimmed; empty when none).
     pub memo: String,
+}
+
+impl ReviewItem {
+    /// The item carries both the expected and the actual image, the pair the
+    /// compare view needs. The other comparison attributes alone do not
+    /// count, and the Markdown image links of `has_images` are unrelated.
+    pub fn has_comparison(&self) -> bool {
+        self.expected_image.is_some() && self.actual_image.is_some()
+    }
 }
 
 /// The status rule shared by every reader: an item is `Answered` when its
@@ -165,6 +181,11 @@ impl From<ReviewSection> for ReviewItem {
             date: section.date,
             task_id: section.task_id,
             doc_id: section.doc_id,
+            expected_image: section.expected_image,
+            actual_image: section.actual_image,
+            diff_image: section.diff_image,
+            similarity_pct: section.similarity_pct,
+            threshold: section.threshold,
             category: Some(section.category).filter(|c| !c.is_empty()),
             has_images: !section.images.is_empty(),
             checkbox_checked: section.checkbox_checked,

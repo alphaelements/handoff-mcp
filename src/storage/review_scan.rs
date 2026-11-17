@@ -259,6 +259,29 @@ pub fn parse_attr(line: &str) -> Option<(&str, &str)> {
     is_key.then(|| (key, value.trim()))
 }
 
+/// Image comparison attributes (RB-011) in the order the tool writes them.
+/// The first three hold paths, the last two numbers.
+pub const COMPARISON_KEYS: [&str; 5] = [
+    "expected_image",
+    "actual_image",
+    "diff_image",
+    "similarity_pct",
+    "threshold",
+];
+
+/// The value of a numeric attribute (`similarity_pct`, `threshold`). An
+/// integer stays an integer (`99`, not `99.0`). `None` for anything that is
+/// not a finite number, so a hand-edited `high` or `NaN` never reaches JSON.
+pub fn parse_number(raw: &str) -> Option<serde_json::Number> {
+    let raw = raw.trim();
+    if let Ok(n) = raw.parse::<i64>() {
+        return Some(n.into());
+    }
+    raw.parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+}
+
 /// `Some(checked)` for a task-list line (`- [ ] ...` / `- [x] ...`).
 pub fn checkbox_state(line: &str) -> Option<bool> {
     let rest = line.strip_prefix("- [")?;
@@ -373,6 +396,16 @@ body quoting rb-id: R-9999
 ### Hand typed
 ";
         assert_eq!(heading_id_numbers(text), vec![7, 12]);
+    }
+
+    #[test]
+    fn parse_number_keeps_integers_and_rejects_non_finite_text() {
+        assert_eq!(parse_number("99"), Some(99.into()));
+        assert_eq!(parse_number(" 98.5 "), serde_json::Number::from_f64(98.5));
+        assert_eq!(parse_number("105"), Some(105.into()));
+        for bad in ["", "high", "NaN", "inf", "-inf", "9x"] {
+            assert_eq!(parse_number(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

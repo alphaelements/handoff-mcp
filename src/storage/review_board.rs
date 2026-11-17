@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 
+use super::config::{push_config_warning, read_config_lenient};
 use super::review_assets::{ensure_assets_ignored, normalize_image_path};
 use super::review_lock::BoardLock;
 use super::review_scan::{
@@ -52,6 +53,15 @@ pub struct NewReviewItem<'a> {
     pub assignee: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub doc_id: Option<&'a str>,
+    /// Expected / golden image path (RB-011); written as an attribute line,
+    /// not copied and not embedded.
+    pub expected_image: Option<&'a str>,
+    pub actual_image: Option<&'a str>,
+    pub diff_image: Option<&'a str>,
+    /// Similarity percentage of the comparison (RB-011).
+    pub similarity_pct: Option<f64>,
+    /// Pass/fail threshold of the comparison (RB-011).
+    pub threshold: Option<f64>,
     pub image_paths: &'a [String],
 }
 
@@ -128,7 +138,8 @@ pub fn add_item(
     let path = board_path(handoff_dir);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let warnings = board_warnings(&raw);
+    let mut warnings = board_warnings(&raw);
+    warnings.extend(assignee_warnings(handoff_dir, item.assignee));
     let text = normalize_mixed_line_endings(&raw);
     let decisions = read_optional(&handoff_dir.join(DECISIONS_FILE))?;
 
@@ -160,7 +171,7 @@ fn default_board() -> String {
     out
 }
 
-fn read_optional(path: &Path) -> Result<String> {
+pub(super) fn read_optional(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -178,7 +189,7 @@ struct ValidItem<'a> {
     title: &'a str,
     category: &'a str,
     body: Option<&'a str>,
-    attributes: Vec<(&'static str, &'a str)>,
+    attributes: Vec<(&'static str, String)>,
     /// Image paths as written in the board (see [`normalize_image_path`]).
     images: Vec<String>,
 }
@@ -199,9 +210,23 @@ impl<'a> ValidItem<'a> {
             ("assignee", item.assignee),
             ("task_id", item.task_id),
             ("doc_id", item.doc_id),
+            ("expected_image", item.expected_image),
+            ("actual_image", item.actual_image),
+            ("diff_image", item.diff_image),
         ] {
             if let Some(v) = value.map(|v| single_line(key, v)).transpose()?.flatten() {
-                attributes.push((key, v));
+                attributes.push((key, v.to_string()));
+            }
+        }
+        for (key, value) in [
+            ("similarity_pct", item.similarity_pct),
+            ("threshold", item.threshold),
+        ] {
+            if let Some(n) = value {
+                if !n.is_finite() {
+                    bail!("'{key}' must be a finite number");
+                }
+                attributes.push((key, n.to_string()));
             }
         }
 
@@ -224,6 +249,29 @@ impl<'a> ValidItem<'a> {
             images,
         })
     }
+}
+
+/// Warnings for an `assignee` key about to be written (RB-012): one when the
+/// key is not a `[assignees.<key>]` table of `config.toml`.
+///
+/// Never an error. An absent or blank key is not validated (a blank value
+/// writes nothing or removes the line). A missing, unreadable or roster-less
+/// config is an empty roster, so every key is unknown, and an unreadable one
+/// adds its own load warning: the write must keep working with a broken
+/// hand-edited config. Keys compare exactly (case-sensitive).
+pub fn assignee_warnings(handoff_dir: &Path, assignee: Option<&str>) -> Vec<String> {
+    let Some(key) = assignee.map(str::trim).filter(|k| !k.is_empty()) else {
+        return Vec::new();
+    };
+    let (config, config_warning) = read_config_lenient(handoff_dir);
+    let mut warnings = Vec::new();
+    push_config_warning(&mut warnings, config_warning);
+    if !config.is_some_and(|c| c.assignees.contains_key(key)) {
+        warnings.push(format!(
+            "assignee '{key}' is not in the [assignees] roster of config.toml; it was written as given"
+        ));
+    }
+    warnings
 }
 
 /// Trims `value`; `None` when nothing is left. A line break would split the
@@ -499,6 +547,7 @@ mod tests {
                 task_id: Some("t-1"),
                 doc_id: Some("doc-1"),
                 image_paths: &paths,
+                ..Default::default()
             },
             date(),
         )

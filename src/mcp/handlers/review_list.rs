@@ -31,6 +31,12 @@ fn item_json(item: &ReviewItem) -> Value {
         "assignee": item.assignee,
         "date": item.date,
         "has_images": item.has_images,
+        "has_comparison": item.has_comparison(),
+        "expected_image": item.expected_image,
+        "actual_image": item.actual_image,
+        "diff_image": item.diff_image,
+        "similarity_pct": item.similarity_pct,
+        "threshold": item.threshold,
         "category": item.category,
     })
 }
