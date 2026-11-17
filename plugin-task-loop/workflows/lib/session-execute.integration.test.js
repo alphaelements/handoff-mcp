@@ -63,6 +63,7 @@ async function runWorkflow(
     testerFindings = [],
     crashDevelopers = false,
     crashTester = false,
+    crashReviewer = false,
     crashDevLabels = [],
     closerResult = DEFAULT_CLOSER_RESULT,
     crashCloser = false,
@@ -113,6 +114,7 @@ async function runWorkflow(
         };
       }
       if (opts.label === 'reviewer') {
+        if (crashReviewer) throw new Error('simulated reviewer crash');
         return { verdict: reviewVerdict, findings: [], report: 'review report' };
       }
       if (opts.label === 'spec-writer') {
@@ -1084,14 +1086,22 @@ test('standard: a failing tester retries up to max_rounds, then files a follow-u
   assert.ok(r.pending_followups.length > 0);
 });
 
-test('standard: a crashed tester on the last round is fail-closed into a follow-up, not a silent pass', async () => {
+test('standard: a crashed tester aborts the loop immediately (fail-closed)', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 1 },
     { crashTester: true },
   );
-  assert.equal(r.passed, true, 'the session still completes rather than escalating');
-  assert.ok(r.pending_followups.length > 0, 'the crash must not be read as "no defect found"');
-  assert.match(r.pending_followups[0].problem, /crashed/);
+  assert.equal(r.passed, false, 'a crashed agent is fail-closed, not a soft follow-up');
+  assert.equal(r.rounds, 1);
+});
+
+test('standard: a crashed tester with rounds remaining does not waste them on empty rework', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard', max_rounds: 3 },
+    { crashTester: true },
+  );
+  assert.equal(r.passed, false, 'crash is fail-closed regardless of remaining rounds');
+  assert.equal(r.rounds, 1, 'must abort on round 1 without consuming rounds 2 and 3');
 });
 
 test('express: max_rounds does not re-run the developer', async () => {
@@ -1450,13 +1460,13 @@ test('standard: PASS_WITH_NITS from the tester still passes', async () => {
   assert.equal(r.passed, true);
 });
 
-test('a crashed tester never silently passes: integration_report is null and a follow-up is filed', async () => {
+test('a crashed tester never silently passes: integration_report is null and session fails', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 1 },
     { crashTester: true },
   );
   assert.equal(r.integration_report, null, 'a dead tester found no bug — that must not read as PASS');
-  assert.ok(r.pending_followups.length > 0);
+  assert.equal(r.passed, false, 'crash is fail-closed, not filed as a follow-up');
 });
 
 test('full: tester FAIL on the last round skips the reviewer and files a follow-up', async () => {
@@ -1472,6 +1482,24 @@ test('full: tester FAIL on the last round skips the reviewer and files a follow-
   // or the manager is told review happened when it did not.
   assert.equal(r.stages_run.review, false, 'stages_run.review must reflect that Stage 3 never ran');
   assert.equal(r.review_report, null);
+});
+
+test('full: a crashed reviewer aborts the loop immediately (fail-closed)', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'full', max_rounds: 1 },
+    { crashReviewer: true },
+  );
+  assert.equal(r.passed, false, 'a crashed reviewer is fail-closed, not a soft follow-up');
+  assert.equal(r.rounds, 1);
+});
+
+test('full: a crashed reviewer with rounds remaining does not waste them on empty rework', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'full', max_rounds: 3 },
+    { crashReviewer: true },
+  );
+  assert.equal(r.passed, false, 'crash is fail-closed regardless of remaining rounds');
+  assert.equal(r.rounds, 1, 'must abort on round 1 without consuming rounds 2 and 3');
 });
 
 test('full: reviewer REQUEST_CHANGES on the last round still passes, with a follow-up filed', async () => {

@@ -28,6 +28,10 @@ ignore = [
     # markdown converter escapes user text. handoff-mcp's own quick-xml is 0.42.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # chrono unmaintained (RUSTSEC-2026-0543). Used directly by handoff-mcp
+    # and transitively by typst-as-lib. Migration to jiff is tracked but not
+    # yet done. No security vulnerability — just unmaintained.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
