@@ -654,6 +654,21 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     result["requirements_health"] = requirements_health;
     result["docs_health"] = docs_health;
 
+    // RB-007: answers the user left on the review board since the last
+    // session. Read-only; `null` when the project has no board.
+    match review_board_summary(handoff) {
+        Ok(summary) => result["review_board"] = summary,
+        // A board that cannot be read must not cost the caller its context:
+        // say so and report no board.
+        Err(e) => {
+            result["review_board"] = Value::Null;
+            push_warning(
+                &mut result,
+                format!("review_board could not be read: {e:#}. Fix the file and call again."),
+            );
+        }
+    }
+
     // SPEC-ONB-011: opt-in, and read last, so that it describes the project
     // as this call leaves it (a session it activated counts) and equals what
     // `handoff_next_step` answers right after. Without the setting nothing
@@ -676,6 +691,23 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// The `review_board` field of the response (RB-007): pending/answered counts
+/// and the answered items of `.handoff/review_board.md`, or `null` when the
+/// project has no board. A missing file is the normal "no board yet" state;
+/// any other read failure is an error for the caller to surface.
+fn review_board_summary(handoff: &Path) -> Result<Value> {
+    let path = crate::storage::review_board::board_path(handoff);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
+        }
+    };
+    serde_json::to_value(crate::storage::review_board_items::summarize_board(&text))
+        .context("serialize review_board")
 }
 
 /// Appends `message` to the `warnings` array of the response, creating the
@@ -1431,5 +1463,94 @@ mod suspect_summary_tests {
         write_report(&handoff, sample_items());
         let some: Value = serde_json::from_str(&handle(&ctx, &json!({})).unwrap()).unwrap();
         assert_eq!(some["suspect_summary"]["total"], 3);
+    }
+
+    fn init_project(tmp: &tempfile::TempDir) -> HandlerContext {
+        let project = tmp.path().to_path_buf();
+        let handoff = project.join(".handoff");
+        let ctx = HandlerContext {
+            agent_id: None,
+            project_dir: project,
+            handoff_dir: handoff,
+        };
+        crate::mcp::handlers::init::handle(&ctx, &json!({ "project_name": "p" })).unwrap();
+        ctx
+    }
+
+    fn load(ctx: &HandlerContext) -> Value {
+        serde_json::from_str(&handle(ctx, &json!({})).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn review_board_is_null_without_a_board_file_and_none_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        let out = load(&ctx);
+        assert!(out.as_object().unwrap().contains_key("review_board"));
+        assert!(out["review_board"].is_null());
+        assert!(!ctx.handoff_dir.join("review_board.md").exists());
+    }
+
+    #[test]
+    fn review_board_reports_counts_and_answered_items_without_modifying_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        let long = "あ".repeat(250);
+        let board = format!(
+            "## C\n\
+### A <!-- rb-id: R-001 -->\n- [ ] 確認済み\nメモ:\n\
+### B <!-- rb-id: R-002 -->\n- [x] 確認済み\nメモ:\n\
+### C <!-- rb-id: R-003 -->\n- [ ] 確認済み\nメモ: この方針で進めてください\n\
+### D <!-- rb-id: R-004 -->\n- [x] 確認済み\nメモ: {long}\n"
+        );
+        let path = ctx.handoff_dir.join("review_board.md");
+        std::fs::write(&path, &board).unwrap();
+        let rb = load(&ctx)["review_board"].clone();
+        assert_eq!(rb["pending_count"], 1);
+        assert_eq!(rb["answered_count"], 3);
+        let items = rb["answered_items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[0],
+            json!({ "id": "R-002", "title": "B", "answer_summary": "checked" })
+        );
+        assert_eq!(items[1]["answer_summary"], "この方針で進めてください");
+        assert_eq!(items[2]["answer_summary"], "あ".repeat(100));
+        assert_eq!(items[2].as_object().unwrap().len(), 3);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), board);
+
+        // A user checking the pending item is picked up by the next call.
+        std::fs::write(
+            &path,
+            board.replace("- [ ] 確認済み\nメモ:\n##", "- [x] 確認済み\nメモ:\n##"),
+        )
+        .unwrap();
+        let rb = load(&ctx)["review_board"].clone();
+        assert_eq!(rb["pending_count"], 0);
+        assert_eq!(rb["answered_count"], 4);
+    }
+
+    #[test]
+    fn review_board_with_no_items_is_an_empty_object_not_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        crate::storage::review_board::init_board(&ctx.handoff_dir).unwrap();
+        let rb = load(&ctx)["review_board"].clone();
+        assert_eq!(
+            rb,
+            json!({ "pending_count": 0, "answered_count": 0, "answered_items": [] })
+        );
+    }
+
+    #[test]
+    fn unreadable_review_board_warns_and_keeps_the_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        // A directory in place of the file makes the read fail with a
+        // non-NotFound error.
+        std::fs::create_dir(ctx.handoff_dir.join("review_board.md")).unwrap();
+        let out = load(&ctx);
+        assert!(out["review_board"].is_null());
+        assert!(out["warnings"].to_string().contains("review_board"));
     }
 }

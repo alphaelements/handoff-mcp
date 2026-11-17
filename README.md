@@ -727,6 +727,15 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_reclaim_task` | Forcibly reclaim another agent's task lock |
 | `handoff_list_agents` | List registered agents and their claimed tasks |
 
+### User Review Board
+
+A plain Markdown file, `.handoff/review_board.md`, where the AI puts questions for the user to answer by ticking a checkbox or writing a memo. Open it in any editor or Markdown preview.
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_review_init` | Create the board with the default categories (an existing board is left untouched) |
+| `handoff_review_add` | Append an item (`### title <!-- rb-id: R-NNN -->`, attribute lines, body, checkbox, memo line) to a category |
+
 ### Document Management
 
 | Tool | Purpose |

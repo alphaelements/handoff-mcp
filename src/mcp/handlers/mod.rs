@@ -44,6 +44,11 @@ pub mod refer;
 pub mod referrals;
 pub mod release_check;
 pub mod report;
+pub mod review_board;
+pub mod review_list;
+pub mod review_resolve;
+pub mod review_section;
+pub mod review_session_decision;
 pub mod save_context;
 pub mod task_checklist;
 pub mod timer;
@@ -258,6 +263,12 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_overview" => overview::handle(ctx, arguments),
         "handoff_events" => events::handle(ctx, arguments),
         "handoff_report" => report::handle_report(ctx, arguments),
+        "handoff_review_init" => review_board::handle_init(ctx, arguments),
+        "handoff_review_add" => review_board::handle_add(ctx, arguments),
+        "handoff_review_list" => review_list::handle(ctx, arguments),
+        "handoff_review_read" => review_section::handle_read(ctx, arguments),
+        "handoff_review_update" => review_section::handle_update(ctx, arguments),
+        "handoff_review_resolve" => review_resolve::handle(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     }
 }
