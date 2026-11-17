@@ -4344,8 +4344,18 @@ while (!SINGLE_AGENT_MODE && mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed)
     });
 
     if (!isIntegrationPassed(integrationResult)) {
+      const testVerdict = normalizeIntegrationVerdict(integrationResult);
+
+      // An ERROR verdict means the agent crashed or returned an empty/unparseable
+      // result. Reworking with no feedback wastes a round — break immediately,
+      // just as we do when a developer crashes (line ~4294).
+      if (testVerdict === 'ERROR') {
+        log(`Test stage returned ERROR (agent crash or empty result) — aborting loop (fail-closed).`);
+        break;
+      }
+
       const isLastRound = mainRound >= EFFECTIVE_MAX_ROUNDS;
-      log(`Test stage FAILED (${normalizeIntegrationVerdict(integrationResult)}). Extracting rework notes...`);
+      log(`Test stage FAILED (${testVerdict}). Extracting rework notes...`);
       applyReworkNotes(tasks, extractIntegrationReworkNotes(integrationResult, TASK_IDS, mainRound));
 
       if (isLastRound) {
@@ -4406,7 +4416,16 @@ while (!SINGLE_AGENT_MODE && mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed)
     });
 
     if (!isReviewApproved(reviewResult)) {
-      log(`Review FAILED (${normalizeReviewVerdict(reviewResult)}). Extracting rework notes...`);
+      const reviewVerdict = normalizeReviewVerdict(reviewResult);
+
+      // Same as the test stage: a crashed/empty reviewer has no feedback to
+      // rework against. Break immediately instead of burning rounds.
+      if (reviewVerdict === 'ERROR') {
+        log(`Reviewer returned ERROR (agent crash or empty result) — aborting loop (fail-closed).`);
+        break;
+      }
+
+      log(`Review FAILED (${reviewVerdict}). Extracting rework notes...`);
       applyReworkNotes(tasks, extractReviewReworkNotes(reviewResult, TASK_IDS, mainRound));
 
       if (isLastRound) {
