@@ -218,6 +218,11 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // two exports of the same slug at once just rewrite the same output.
     "handoff_doc_export",
     "handoff_list_agents",
+    // RB-005: parses `.handoff/review_board.md` and writes nothing.
+    "handoff_review_list",
+    // RB-003: slices one section out of `.handoff/review_board.md`; writes
+    // nothing. (`handoff_review_update` is write-classified by default.)
+    "handoff_review_read",
     "handoff_overview",
     "handoff_events",
     "handoff_list_referrals",

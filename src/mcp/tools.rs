@@ -2526,6 +2526,158 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_review_list".to_string(),
+            description: "List the items on the User Review Board (`.handoff/review_board.md`) with their status, without loading the whole file into context. Returns {items: [{id, title, status, priority, assignee, date, has_images, category}], summary: {total, pending, answered}} in file order. status is `pending` (checkbox `[ ]` and an empty memo line) or `answered` (checkbox `[x]` or a non-empty memo line); `resolved` items have moved to the decisions file and are not listed. Filters combine with AND; a filter that matches nothing returns an empty list. A missing board file returns an empty list and creates nothing. Read-only.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "description": "Only items with this status. `resolved` always yields an empty list (resolved items are no longer on the board).",
+                        "enum": ["pending", "answered", "resolved"]
+                    },
+                    "assignee_filter": {
+                        "type": "string",
+                        "description": "Only items whose `- assignee:` value equals this (exact match)."
+                    },
+                    "category_filter": {
+                        "type": "string",
+                        "description": "Only items inside the `##` category section with this heading text (exact match)."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_review_read".to_string(),
+            description: "Read ONE item section of the User Review Board (`.handoff/review_board.md`) by stable id or 0-based seq, without loading the whole board. Returns {seq, id, title, category, body, status (pending|answered; a resolved item has left the board, so it is never returned), priority, assignee, date, task_id, doc_id, images[] (paths of the Markdown image links in the section), checkbox_checked, memo, content_hash}. status is `answered` when the user ticked the checkbox or wrote a memo, else `pending`. content_hash is the FNV-1a hash of the section's raw bytes: pass it back as expected_hash to handoff_review_update. format=\"meta\" omits body and memo. `seq` counts ### item sections only (not ## categories) in file order. When both id and seq are given, id wins. An unknown id, an out-of-range seq, neither argument, or a missing board is an error. Read-only.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Stable id of the item, e.g. \"R-001\". Takes precedence over seq."
+                    },
+                    "seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "0-based index among the ### item sections in file order."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["full", "meta"],
+                        "description": "\"full\" (default) or \"meta\" (no body, no memo)."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_review_update".to_string(),
+            description: "Update ONE item section of the User Review Board (`.handoff/review_board.md`) under an optimistic lock. Read the section first with handoff_review_read and pass its content_hash as expected_hash. Only the target section's bytes are rewritten; every other byte of the file (including sections the user edited meanwhile) is preserved exactly, and the file is replaced atomically (temp file + rename). If expected_hash is stale the call fails, the file is untouched, and the error reports the section's `current_hash` so you can re-read and retry. updates keys (all optional, at least one required; an unknown key is an error): body (replaces the whole body, image links included), priority / assignee (empty string removes the attribute line), checkbox_checked, memo (replaces the memo text; empty clears it), images (replaces the body's standalone image-link lines with links to these paths; empty array removes them). Text that would restructure the board (a ## or ### heading, an unclosed code fence, a checkbox line inside memo) is rejected. The heading and its rb-id comment never change. Returns {id, updated[], status, checkbox_checked, content_hash} where content_hash is the section's new hash.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Stable id of the item to update, e.g. \"R-001\"."
+                    },
+                    "expected_hash": {
+                        "type": "string",
+                        "description": "content_hash of the section as last read (handoff_review_read). A mismatch fails the call and returns current_hash."
+                    },
+                    "updates": {
+                        "type": "object",
+                        "description": "Fields to change; omitted keys leave the section content unchanged.",
+                        "properties": {
+                            "body": { "type": "string", "description": "New body text (replaces the existing body, image links included)." },
+                            "priority": { "type": "string", "description": "Priority attribute value; empty string removes the line." },
+                            "assignee": { "type": "string", "description": "Assignee attribute value; empty string removes the line." },
+                            "checkbox_checked": { "type": "boolean", "description": "Tick or untick the item's confirmation checkbox." },
+                            "memo": { "type": "string", "description": "Memo text after `メモ:`; empty string clears it." },
+                            "images": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Image paths (`.handoff/review_board_assets/...` or project-relative); replaces the body's standalone image-link lines."
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["id", "expected_hash", "updates"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_review_init".to_string(),
+            description: "Create the User Review Board, `.handoff/review_board.md`, with the default category sections (設計判断, 実装確認, テスト確認, その他). The board is a plain Markdown file (no frontmatter) the user reads and answers in any editor or Markdown preview: `##` headings are categories, `###` headings are items. An existing board is left byte-identical. handoff_review_add creates the board on first use, so calling this is optional. Returns {created, path, exists}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_review_add".to_string(),
+            description: "Add an item to the User Review Board (`.handoff/review_board.md`) for the user to review. Appends a `### <title> <!-- rb-id: R-NNN -->` section at the end of the `##` category section named `category` (the section is created when missing, and so is the board). The section holds visible `- priority:` / `- assignee:` / `- task_id:` / `- doc_id:` lines (only those given), `- date: YYYY-MM-DD`, the body with any image links, a `- [ ] 確認済み` checkbox and an empty `メモ:` line the user fills in. The stable id R-NNN is one more than the highest id used so far. Titles, attributes and image paths must be single-line; the body must not contain `##` or `###` heading lines (use `####` or bold) or an unclosed code fence. Nothing is written when the input is rejected. Returns {id, category, category_created, board_created, path}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Item title (single line, no HTML comment markers)."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Text of the `##` category heading to add the item under, e.g. \"設計判断\". A category that does not exist is created."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Markdown body: the question or the material to review."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "Priority, written as `- priority: <value>` (e.g. high, medium, low)."
+                    },
+                    "assignee": {
+                        "type": "string",
+                        "description": "Assignee key, written as `- assignee: <value>` (matches an `[assignees.<key>]` entry in config.toml)."
+                    },
+                    "image_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Image paths embedded as Markdown image links after the body: `.handoff/review_board_assets/...` (relative to `.handoff/`: `review_board_assets/x.png`) or a project-relative path as seen from `.handoff/` (`../design/x.png`)."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Related task id, written as `- task_id: <value>`."
+                    },
+                    "doc_id": {
+                        "type": "string",
+                        "description": "Related document id or slug, written as `- doc_id: <value>`."
+                    }
+                },
+                "required": ["title", "category"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_overview".to_string(),
             description: "Cross-worktree overview of a single project's multi-agent state: registered agents, a task x agent claim matrix, and a worktree x branch x session mapping. Call from the primary worktree to monitor every worktree working the same project. Works with zero registered agents/claims (single-WT environments).".to_string(),
             input_schema: json!({

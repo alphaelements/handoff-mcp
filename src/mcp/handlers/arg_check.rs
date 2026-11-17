@@ -1,5 +1,5 @@
-//! Unknown-argument rejection for the `handoff_trace_*` tools and the
-//! onboarding tools (`handoff_doctor`, `handoff_release_check`,
+//! Unknown-argument rejection for the `handoff_trace_*` and
+//! `handoff_review_*` tools and the onboarding tools (`handoff_doctor`, `handoff_release_check`,
 //! `handoff_next_step`).
 //!
 //! A misspelled argument (`dryrun`, `layer`) or scope key (`item`) used to be
@@ -25,7 +25,11 @@ use serde_json::Value;
 /// Tool-name prefix this check applies to.
 const TRACE_TOOL_PREFIX: &str = "handoff_trace_";
 
-/// Tools outside that prefix this check applies to as well.
+/// The User Review Board tools: a dropped `prioriti` would write an item
+/// without the priority the caller meant to set.
+const REVIEW_TOOL_PREFIX: &str = "handoff_review_";
+
+/// Tools outside those prefixes this check applies to as well.
 const OTHER_CHECKED_TOOLS: &[&str] = &[
     "handoff_doctor",
     "handoff_release_check",
@@ -33,7 +37,9 @@ const OTHER_CHECKED_TOOLS: &[&str] = &[
 ];
 
 fn is_checked(tool: &str) -> bool {
-    tool.starts_with(TRACE_TOOL_PREFIX) || OTHER_CHECKED_TOOLS.contains(&tool)
+    tool.starts_with(TRACE_TOOL_PREFIX)
+        || tool.starts_with(REVIEW_TOOL_PREFIX)
+        || OTHER_CHECKED_TOOLS.contains(&tool)
 }
 
 /// `name -> input_schema` for every checked tool, built once: the definitions

@@ -377,7 +377,7 @@ working on it so two agents don't pick the same one:
 
 `handoff_dashboard(scan_dirs?, max_depth?, exclude_patterns?, include_completed?)`
 summarizes every handoff project under the configured scan directories
-(defaults from `config.toml [dashboard]`).
+(defaults from `config.toml [dashboard]`). Questions the user answers by ticking a box in a Markdown file (the User Review Board): `handoff_review_init()`, `handoff_review_add(title, category, ...)` — see [references/review-board.md](references/review-board.md).
 
 ### Bulk Operations
 
