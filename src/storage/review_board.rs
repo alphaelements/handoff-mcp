@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 
-use super::review_scan::{heading, heading_id_numbers, split_eol, Fence};
+use super::review_assets::{ensure_assets_ignored, normalize_image_path};
+use super::review_lock::BoardLock;
+use super::review_scan::{
+    board_warnings, heading, heading_id_numbers, normalize_mixed_line_endings, split_eol, Fence,
+};
 
 /// File name of the board inside `.handoff/`.
 pub const BOARD_FILE: &str = "review_board.md";
@@ -60,12 +64,22 @@ pub struct AddedItem {
     pub board_created: bool,
     /// No `##` section matched the category, so one was appended.
     pub category_created: bool,
+    /// Non-fatal findings about the board (mixed line endings, items with a
+    /// missing or corrupted id). The add still happened.
+    pub warnings: Vec<String>,
 }
 
 /// Creates the board with the default categories when it does not exist.
 /// Returns `true` when the file was created, `false` when it already existed
-/// (left byte-identical).
+/// (left byte-identical). Runs under the board write lock.
 pub fn init_board(handoff_dir: &Path) -> Result<bool> {
+    let _lock = BoardLock::acquire(handoff_dir)?;
+    create_board_if_missing(handoff_dir)
+}
+
+/// [`init_board`] for a caller that already holds the [`BoardLock`] (the lock
+/// is not reentrant, so taking it again would deadlock).
+fn create_board_if_missing(handoff_dir: &Path) -> Result<bool> {
     use std::io::Write;
 
     let path = board_path(handoff_dir);
@@ -97,17 +111,25 @@ pub fn init_board(handoff_dir: &Path) -> Result<bool> {
 /// The input is validated before anything is read or written, so a rejected
 /// call leaves the board (or its absence) untouched. A missing board is
 /// initialized first; a missing category is appended as a new `##` section.
+///
+/// Everything after validation runs under the board write lock, and the board
+/// is read inside it, so a concurrent writer's change is never overwritten. A
+/// board with mixed LF/CRLF line endings is rewritten with LF only and the
+/// finding is returned in [`AddedItem::warnings`].
 pub fn add_item(
     handoff_dir: &Path,
     item: &NewReviewItem<'_>,
     date: NaiveDate,
 ) -> Result<AddedItem> {
     let valid = ValidItem::new(item)?;
-    let board_created = init_board(handoff_dir)?;
+    let _lock = BoardLock::acquire(handoff_dir)?;
+    let board_created = create_board_if_missing(handoff_dir)?;
 
     let path = board_path(handoff_dir);
-    let text = std::fs::read_to_string(&path)
+    let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
+    let warnings = board_warnings(&raw);
+    let text = normalize_mixed_line_endings(&raw);
     let decisions = read_optional(&handoff_dir.join(DECISIONS_FILE))?;
 
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
@@ -116,11 +138,14 @@ pub fn add_item(
     let (new_text, category_created) = insert_item(&text, valid.category, &block, eol);
 
     crate::storage::atomic_write(&path, new_text.as_bytes())?;
+    // After the write, so a rejected or failed add never touches `.gitignore`.
+    ensure_assets_ignored(handoff_dir, &valid.images)?;
     Ok(AddedItem {
         id,
         category: valid.category.to_string(),
         board_created,
         category_created,
+        warnings,
     })
 }
 
@@ -154,7 +179,8 @@ struct ValidItem<'a> {
     category: &'a str,
     body: Option<&'a str>,
     attributes: Vec<(&'static str, &'a str)>,
-    images: Vec<&'a str>,
+    /// Image paths as written in the board (see [`normalize_image_path`]).
+    images: Vec<String>,
 }
 
 impl<'a> ValidItem<'a> {
@@ -187,7 +213,7 @@ impl<'a> ValidItem<'a> {
         let images = item
             .image_paths
             .iter()
-            .map(|p| image_path(p))
+            .map(|p| image_path(p).map(|p| normalize_image_path(p).into_owned()))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -545,6 +571,205 @@ Option A or B.
         assert!(read(&h).contains("![a (1).png](<my shots/a (1).png>)"));
     }
 
+    // --- add: images (RB-010, SPEC-RB-027..030) -------------------------
+
+    fn text_of(h: &Path) -> String {
+        read(h)
+    }
+
+    fn gitignore(handoff: &Path) -> Option<String> {
+        std::fs::read_to_string(handoff.join(".gitignore")).ok()
+    }
+
+    fn add_with_images(h: &Path, paths: &[&str]) -> AddedItem {
+        let paths: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
+        let mut it = item("Img", "その他");
+        it.image_paths = &paths;
+        add_item(h, &it, date()).unwrap()
+    }
+
+    #[test]
+    fn handoff_prefixed_asset_path_is_written_relative_to_the_board() {
+        let (_d, h) = setup();
+        add_with_images(&h, &[".handoff/review_board_assets/shot.png"]);
+        let text = read(&h);
+        assert!(text.contains("![shot.png](review_board_assets/shot.png)"));
+        assert!(!text.contains("(.handoff/"));
+    }
+
+    #[test]
+    fn project_relative_path_is_stored_as_given_and_resolves_from_handoff() {
+        let (d, h) = setup();
+        add_with_images(&h, &["../design/mockup.png"]);
+        assert!(read(&h).contains("![mockup.png](../design/mockup.png)"));
+        std::fs::create_dir_all(d.path().join("design")).unwrap();
+        std::fs::write(d.path().join("design/mockup.png"), b"x").unwrap();
+        assert!(h.join("../design/mockup.png").is_file());
+    }
+
+    #[test]
+    fn mixed_image_types_keep_order_between_body_and_checkbox() {
+        let (_d, h) = setup();
+        add_with_images(&h, &["review_board_assets/a.png", "../design/b.png"]);
+        let text = read(&h);
+        let a = text.find("![a.png](review_board_assets/a.png)").unwrap();
+        let b = text.find("![b.png](../design/b.png)").unwrap();
+        let cb = text.find(CHECKBOX_LINE).unwrap();
+        assert!(a < b && b < cb);
+    }
+
+    #[test]
+    fn asset_image_adds_the_assets_dir_to_gitignore_once() {
+        let (_d, h) = setup();
+        std::fs::write(h.join(".gitignore"), "*.lock\n").unwrap();
+        add_with_images(&h, &["review_board_assets/a.png"]);
+        add_with_images(&h, &[".handoff/review_board_assets/b.png"]);
+        assert_eq!(gitignore(&h).unwrap(), "*.lock\nreview_board_assets/\n");
+    }
+
+    #[test]
+    fn project_relative_image_leaves_gitignore_and_assets_dir_alone() {
+        let (_d, h) = setup();
+        add_with_images(&h, &["../design/mockup.png"]);
+        assert!(gitignore(&h).is_none());
+        assert!(!h.join("review_board_assets").exists());
+    }
+
+    #[test]
+    fn rejected_item_does_not_touch_gitignore() {
+        let (_d, h) = setup();
+        let paths = vec!["review_board_assets/a.png".to_string(), "<bad>".to_string()];
+        let mut it = item("A", "その他");
+        it.image_paths = &paths;
+        assert!(add_item(&h, &it, date()).is_err());
+        assert!(gitignore(&h).is_none());
+    }
+
+    #[test]
+    fn mixed_images_are_read_back_and_listed() {
+        use crate::storage::review_section::{read_item, SectionRef};
+        let (_d, h) = setup();
+        let added = add_with_images(
+            &h,
+            &[
+                "review_board_assets/a.png",
+                "../design/b.png",
+                "my dir/c (1).png",
+            ],
+        );
+        let read = read_item(&h, SectionRef::Id(&added.id)).unwrap();
+        assert_eq!(
+            read.images,
+            vec![
+                "review_board_assets/a.png",
+                "../design/b.png",
+                "my dir/c (1).png"
+            ]
+        );
+        let items = crate::storage::review_board_items::parse_items(&text_of(&h));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].has_images);
+    }
+
+    // --- RB-009: lock, concurrency, mixed line endings (SPEC-RB-024..026) ---
+
+    #[test]
+    fn add_creates_the_lock_file_and_init_takes_the_lock_too() {
+        let (_d, h) = setup();
+        init_board(&h).unwrap();
+        assert!(crate::storage::review_lock::lock_path(&h).exists());
+    }
+
+    #[test]
+    fn add_waits_for_a_held_lock_and_then_succeeds() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_d, h) = setup();
+        let guard = crate::storage::review_lock::BoardLock::acquire(&h).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let h2 = h.clone();
+        let t = std::thread::spawn(move || {
+            let added = add_item(&h2, &item("Waits", "その他"), date()).unwrap();
+            tx.send(added.id).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "add must wait while the lock is held"
+        );
+        assert!(
+            !board_path(&h).exists(),
+            "nothing is written before the lock is free"
+        );
+        drop(guard);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), "R-001");
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_adds_get_distinct_ids_and_both_land() {
+        let (_d, h) = setup();
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    add_item(&h, &item(&format!("T{n}"), "その他"), date())
+                        .unwrap()
+                        .id
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 8, "every add gets its own id");
+        let text = read(&h);
+        for n in 0..8 {
+            assert!(
+                text.contains(&format!("### T{n} <!--")),
+                "T{n} missing:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_line_endings_are_normalized_to_lf_with_a_warning() {
+        let (_d, h) = setup();
+        std::fs::write(
+            board_path(&h),
+            "# Board\r\n\r\n## その他\n\n### Old <!-- rb-id: R-001 -->\r\n",
+        )
+        .unwrap();
+        let added = add_item(&h, &item("A", "その他"), date()).unwrap();
+        assert!(
+            added.warnings.iter().any(|w| w.contains("LF and CRLF")),
+            "{:?}",
+            added.warnings
+        );
+        let bytes = std::fs::read(board_path(&h)).unwrap();
+        assert!(!bytes.contains(&b'\r'), "no CR left");
+        assert!(read(&h).contains("### A <!-- rb-id: R-002 -->\n"));
+    }
+
+    #[test]
+    fn uniform_boards_give_no_line_ending_warning() {
+        let (_d, h) = setup();
+        let added = add_item(&h, &item("A", "その他"), date()).unwrap();
+        assert!(added.warnings.is_empty(), "{:?}", added.warnings);
+    }
+
+    #[test]
+    fn a_board_with_a_missing_id_comment_still_accepts_adds_and_warns() {
+        let (_d, h) = setup();
+        std::fs::write(board_path(&h), "## その他\n\n### Hand typed\n").unwrap();
+        let added = add_item(&h, &item("A", "その他"), date()).unwrap();
+        assert_eq!(added.id, "R-001");
+        assert!(
+            added.warnings.iter().any(|w| w.contains("Hand typed")),
+            "{:?}",
+            added.warnings
+        );
+    }
+
     // --- add: ids (SPEC-RB-005) ----------------------------------------
 
     #[test]
@@ -801,6 +1026,14 @@ Option A or B.
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec![BOARD_FILE.to_string()]);
+        // The board and its lock file only; no `.tmp` leftovers.
+        let mut expected = vec![
+            BOARD_FILE.to_string(),
+            crate::storage::review_lock::LOCK_FILE.to_string(),
+        ];
+        let mut names = names;
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected);
     }
 }

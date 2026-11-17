@@ -11,7 +11,9 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use super::HandlerContext;
-use crate::storage::review_section::{read_item, update_item, ReviewUpdates, SectionRef};
+use crate::storage::review_section::{
+    read_item_with_warnings, update_item, ReviewUpdates, SectionRef,
+};
 
 /// `format` values of `handoff_review_read`.
 const FORMAT_FULL: &str = "full";
@@ -48,8 +50,10 @@ pub fn handle_read(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         (None, None) => bail!("either 'id' (e.g. \"R-001\") or 'seq' (0-based) is required"),
     };
 
-    let item = read_item(&ctx.handoff_dir, which)?;
-    serde_json::to_string_pretty(&item.to_json(meta)).map_err(Into::into)
+    let (item, warnings) = read_item_with_warnings(&ctx.handoff_dir, which)?;
+    let mut result = item.to_json(meta);
+    result["warnings"] = json!(warnings);
+    serde_json::to_string_pretty(&result).map_err(Into::into)
 }
 
 pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -70,6 +74,7 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "status": done.item.status,
         "checkbox_checked": done.item.checkbox_checked,
         "content_hash": done.item.content_hash,
+        "warnings": done.warnings,
     });
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
@@ -229,5 +234,40 @@ Body two.
         .to_string();
         assert!(err.contains("expected_hash mismatch"), "{err}");
         assert!(err.contains(&current), "{err}");
+    }
+
+    #[test]
+    fn read_and_update_report_warnings_for_a_mixed_board_and_a_broken_id() {
+        let (_d, ctx) = ctx();
+        let path = ctx.handoff_dir.join("review_board.md");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\n### Hand typed\r\n");
+        std::fs::write(&path, text).unwrap();
+
+        let v = read(&ctx, json!({"id": "R-001"}));
+        let warnings = v["warnings"].as_array().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("LF and CRLF")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("Hand typed")));
+
+        let hash = v["content_hash"].as_str().unwrap().to_string();
+        let out: Value = serde_json::from_str(
+            &handle_update(
+                &ctx,
+                &json!({"id": "R-001", "expected_hash": hash, "updates": {"memo": "ok"}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["warnings"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_clean_board_returns_an_empty_warnings_array() {
+        let (_d, ctx) = ctx();
+        assert_eq!(read(&ctx, json!({"id": "R-001"}))["warnings"], json!([]));
     }
 }

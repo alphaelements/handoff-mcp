@@ -76,7 +76,49 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "category": added.category,
         "category_created": added.category_created,
         "board_created": added.board_created,
+        "warnings": added.warnings,
         "path": format!(".handoff/{BOARD_FILE}"),
     });
     serde_json::to_string_pretty(&result).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> (tempfile::TempDir, HandlerContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff_dir = dir.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        let ctx = HandlerContext {
+            agent_id: None,
+            project_dir: dir.path().to_path_buf(),
+            handoff_dir,
+        };
+        (dir, ctx)
+    }
+
+    #[test]
+    fn add_returns_warnings_for_a_mixed_line_ending_board() {
+        let (_d, ctx) = ctx();
+        std::fs::write(board_path(&ctx.handoff_dir), "## X\r\n\n").unwrap();
+        let out: Value = serde_json::from_str(
+            &handle_add(&ctx, &json!({"title": "A", "category": "X"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["id"], "R-001");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].as_str().unwrap().contains("LF and CRLF"));
+    }
+
+    #[test]
+    fn add_on_a_clean_board_returns_an_empty_warnings_array() {
+        let (_d, ctx) = ctx();
+        let out: Value = serde_json::from_str(
+            &handle_add(&ctx, &json!({"title": "A", "category": "X"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["warnings"], json!([]));
+    }
 }

@@ -2663,7 +2663,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "image_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Image paths embedded as Markdown image links after the body: `.handoff/review_board_assets/...` (relative to `.handoff/`: `review_board_assets/x.png`) or a project-relative path as seen from `.handoff/` (`../design/x.png`)."
+                        "description": "Image paths embedded as Markdown image links after the body: `.handoff/review_board_assets/...` (relative to `.handoff/`: `review_board_assets/x.png`) or a project-relative path as seen from `.handoff/` (`../design/x.png`). A `.handoff/review_board_assets/...` path is written as `review_board_assets/...`; the first asset path adds `review_board_assets/` to `.handoff/.gitignore`. Files are not copied."
                     },
                     "task_id": {
                         "type": "string",

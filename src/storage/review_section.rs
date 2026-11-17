@@ -28,11 +28,13 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+use super::review_assets::{ensure_assets_ignored, normalize_image_path};
 use super::review_board::{board_path, CHECKBOX_LINE, MEMO_LINE};
 use super::review_board_items::{detect_status, ReviewStatus};
+use super::review_lock::BoardLock;
 use super::review_scan::{
-    attr_block_end, checkbox_state, fenced_flags, find_footer, heading, memo_rest, parse_attr,
-    parse_item_heading, split_eol, Fence,
+    attr_block_end, board_warnings, checkbox_state, fenced_flags, find_footer, heading, memo_rest,
+    normalize_mixed_line_endings, parse_attr, parse_item_heading, split_eol, Fence,
 };
 
 /// Attribute keys in the order the tool writes them. A key the tool adds to
@@ -324,10 +326,22 @@ pub fn index_sections(text: &str) -> Vec<SectionSpan> {
 /// Reads one section of the board. Returns only that section's data; the
 /// rest of the file is never part of the result.
 pub fn read_item(handoff_dir: &Path, which: SectionRef<'_>) -> Result<ReviewSection> {
-    let text = read_board(handoff_dir)?;
-    let spans = index_sections(&text);
+    read_item_with_warnings(handoff_dir, which).map(|(item, _)| item)
+}
+
+/// [`read_item`] plus the board's warnings (mixed line endings, items with a
+/// missing, corrupted or duplicated id). Reading takes no lock. A board with
+/// mixed line endings is read as LF, the same view a writer works on, so the
+/// `content_hash` returned here is the one `update_item` accepts.
+pub fn read_item_with_warnings(
+    handoff_dir: &Path,
+    which: SectionRef<'_>,
+) -> Result<(ReviewSection, Vec<String>)> {
+    let board = read_board(handoff_dir)?;
+    let spans = index_sections(&board.text);
     let span = locate(&spans, which)?;
-    Ok(parse_item(&text[span.start..span.end], span))
+    let item = parse_item(&board.text[span.start..span.end], span);
+    Ok((item, board.warnings))
 }
 
 /// Result of a successful [`update_item`].
@@ -335,6 +349,8 @@ pub fn read_item(handoff_dir: &Path, which: SectionRef<'_>) -> Result<ReviewSect
 pub struct UpdatedItem {
     pub item: ReviewSection,
     pub fields: Vec<&'static str>,
+    /// Non-fatal findings about the board; the update still happened.
+    pub warnings: Vec<String>,
 }
 
 /// Applies `updates` to the section with stable id `id`, provided its current
@@ -343,6 +359,11 @@ pub struct UpdatedItem {
 ///
 /// A stale `expected_hash` yields a [`HashMismatch`] error and leaves the file
 /// untouched.
+///
+/// The board is re-read inside the write lock ([`BoardLock`]), so the hash is
+/// checked against the current bytes of the target section only: edits to other
+/// sections made before or while the lock was awaited are kept. A board with
+/// mixed line endings is written back with LF only.
 pub fn update_item(
     handoff_dir: &Path,
     id: &str,
@@ -350,7 +371,8 @@ pub fn update_item(
     updates: &ReviewUpdates,
 ) -> Result<UpdatedItem> {
     updates.validate()?;
-    let text = read_board(handoff_dir)?;
+    let _lock = BoardLock::acquire(handoff_dir)?;
+    let Board { text, warnings } = read_board(handoff_dir)?;
     let spans = index_sections(&text);
     let span = locate(&spans, SectionRef::Id(id))?;
 
@@ -382,12 +404,17 @@ pub fn update_item(
 
     super::atomic_write(board_path(handoff_dir), new_text.as_bytes())
         .context("Failed to write review_board.md")?;
+    if let Some(images) = &updates.images {
+        let written: Vec<_> = images.iter().map(|p| normalize_image_path(p)).collect();
+        ensure_assets_ignored(handoff_dir, &written)?;
+    }
 
     let new_span = &new_spans[span.seq];
     let item = parse_item(&new_text[new_span.start..new_span.end], new_span);
     Ok(UpdatedItem {
         item,
         fields: updates.field_names(),
+        warnings,
     })
 }
 
@@ -400,10 +427,20 @@ pub fn section_hash(section: &str) -> String {
 // Locating and reading
 // ---------------------------------------------------------------------------
 
-fn read_board(handoff_dir: &Path) -> Result<String> {
+/// The board text as readers and writers see it, with its warnings.
+struct Board {
+    /// Mixed LF/CRLF turned into LF; a uniform board is as on disk.
+    text: String,
+    warnings: Vec<String>,
+}
+
+fn read_board(handoff_dir: &Path) -> Result<Board> {
     let path = board_path(handoff_dir);
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(text),
+        Ok(raw) => Ok(Board {
+            warnings: board_warnings(&raw),
+            text: normalize_mixed_line_endings(&raw).into_owned(),
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             bail!(
                 "review board not found at {} — add an item first to create it",
@@ -704,7 +741,7 @@ fn set_body(lines: &mut Vec<Line>, eol: &str, body: &str) {
 fn set_images(lines: &mut Vec<Line>, eol: &str, images: &[String]) -> Result<()> {
     let new_links = images
         .iter()
-        .map(|p| image_link(p))
+        .map(|p| image_link(&normalize_image_path(p)))
         .collect::<Result<Vec<_>>>()?;
     let lay = layout(lines);
     let fenced = fenced_lines(lines);
@@ -1304,11 +1341,19 @@ second memo line
             },
         )
         .unwrap();
-        let names: Vec<String> = std::fs::read_dir(&h)
+        let mut names: Vec<String> = std::fs::read_dir(&h)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, [crate::storage::review_board::BOARD_FILE]);
+        names.sort();
+        // The board and its write lock only; no `.tmp` leftovers.
+        assert_eq!(
+            names,
+            [
+                crate::storage::review_lock::LOCK_FILE,
+                crate::storage::review_board::BOARD_FILE
+            ]
+        );
     }
 
     // --- update: field semantics ---------------------------------------
@@ -1466,6 +1511,50 @@ second memo line
         .unwrap();
         assert!(out.item.images.is_empty());
         assert_eq!(out.item.body, "Body one.");
+    }
+
+    #[test]
+    fn images_update_normalizes_asset_paths_and_ignores_the_assets_dir() {
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        let out = update_item(
+            &h,
+            "R-001",
+            &hash,
+            &ReviewUpdates {
+                images: Some(vec![
+                    ".handoff/review_board_assets/a.png".into(),
+                    "../design/m.png".into(),
+                ]),
+                ..upd()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.item.images,
+            ["review_board_assets/a.png", "../design/m.png"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.join(".gitignore")).unwrap(),
+            "review_board_assets/\n"
+        );
+    }
+
+    #[test]
+    fn images_update_with_only_project_relative_paths_leaves_gitignore_alone() {
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        update_item(
+            &h,
+            "R-001",
+            &hash,
+            &ReviewUpdates {
+                images: Some(vec!["../design/m.png".into()]),
+                ..upd()
+            },
+        )
+        .unwrap();
+        assert!(!h.join(".gitignore").exists());
     }
 
     #[test]
@@ -1642,5 +1731,266 @@ second memo line
         let spans = image_spans("![c (1).png](<a b/c (1).png>)");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].path, "a b/c (1).png");
+    }
+
+    // --- RB-008: hybrid metadata (SPEC-RB-021..023) -----------------------
+
+    #[test]
+    fn hand_edited_attribute_changes_the_value_but_not_the_id() {
+        let (_d, h) = setup(&board_text());
+        let edited = file(&h).replace("- priority: high", "- priority: low");
+        std::fs::write(board_path(&h), edited).unwrap();
+        let item = read_item(&h, SectionRef::Id("R-001")).unwrap();
+        assert_eq!(item.priority.as_deref(), Some("low"));
+        assert_eq!(item.id.as_deref(), Some("R-001"));
+
+        let edited = file(&h).replace("- assignee: ryoma", "- assignee: someone");
+        std::fs::write(board_path(&h), edited).unwrap();
+        let item = read_item(&h, SectionRef::Id("R-001")).unwrap();
+        assert_eq!(item.assignee.as_deref(), Some("someone"));
+    }
+
+    #[test]
+    fn update_priority_keeps_the_rb_id_comment_on_the_heading() {
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        update_item(
+            &h,
+            "R-001",
+            &hash,
+            &ReviewUpdates {
+                priority: Some("low".into()),
+                ..upd()
+            },
+        )
+        .unwrap();
+        assert!(file(&h).contains("### First <!-- rb-id: R-001 -->\n- priority: low\n"));
+    }
+
+    #[test]
+    fn all_five_attribute_keys_are_read_and_a_body_list_line_is_not_an_attribute() {
+        let text = "## C\n\n### A <!-- rb-id: R-001 -->\n- priority: p\n- assignee: a\n- date: 2026-01-02\n- task_id: t-1\n- doc_id: d-1\n\nBody\n- priority: low\n\n- [ ] 確認済み\n\nメモ:\n";
+        let (_d, h) = setup(text);
+        let item = read_item(&h, SectionRef::Id("R-001")).unwrap();
+        assert_eq!(item.priority.as_deref(), Some("p"));
+        assert_eq!(item.assignee.as_deref(), Some("a"));
+        assert_eq!(item.date.as_deref(), Some("2026-01-02"));
+        assert_eq!(item.task_id.as_deref(), Some("t-1"));
+        assert_eq!(item.doc_id.as_deref(), Some("d-1"));
+        assert!(item.body.contains("- priority: low"));
+    }
+
+    #[test]
+    fn broken_comment_does_not_block_later_items_and_is_warned() {
+        let text = "## C\n\n### First <!-- rb-id: R-001 -->\n- date: 2026-01-01\n\n### Broken <!-- rb-id: R-002\n- date: 2026-01-01\n\n### Third <!-- rb-id: R-003 -->\n- date: 2026-01-01\n";
+        let (_d, h) = setup(text);
+        let (third, warnings) = read_item_with_warnings(&h, SectionRef::Id("R-003")).unwrap();
+        assert_eq!(third.title, "Third");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Broken") && warnings[0].contains("corrupted"));
+        let broken = read_item(&h, SectionRef::Seq(1)).unwrap();
+        assert_eq!(broken.id, None);
+    }
+
+    #[test]
+    fn an_intact_board_reads_without_warnings() {
+        let (_d, h) = setup(&board_text());
+        let (_, warnings) = read_item_with_warnings(&h, SectionRef::Id("R-001")).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    // --- RB-009: lock, concurrency, mixed line endings (SPEC-RB-024..026) ---
+
+    #[test]
+    fn update_waits_for_a_held_lock_and_reads_inside_it() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        let guard = crate::storage::review_lock::BoardLock::acquire(&h).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let h2 = h.clone();
+        let t = std::thread::spawn(move || {
+            let r = update_item(
+                &h2,
+                "R-001",
+                &hash,
+                &ReviewUpdates {
+                    memo: Some("done".into()),
+                    ..ReviewUpdates::default()
+                },
+            );
+            tx.send(r.is_ok()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "must wait"
+        );
+        // A user edit of ANOTHER section while the writer is blocked: the
+        // writer re-reads inside the lock, so the edit survives (SPEC-RB-025 AC3).
+        let edited = file(&h).replace("Body two.", "Body two, edited by hand.");
+        std::fs::write(board_path(&h), edited).unwrap();
+        drop(guard);
+        assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        t.join().unwrap();
+        let text = file(&h);
+        assert!(text.contains("Body two, edited by hand."));
+        assert!(text.contains("メモ: done"));
+    }
+
+    #[test]
+    fn concurrent_updates_to_different_sections_both_land() {
+        let (_d, h) = setup(&board_text());
+        let ids = ["R-001", "R-002", "R-003"];
+        let hashes: Vec<String> = ids.iter().map(|id| hash_of(&h, id)).collect();
+        let threads: Vec<_> = ids
+            .iter()
+            .zip(hashes)
+            .map(|(id, hash)| {
+                let h = h.clone();
+                let id = id.to_string();
+                std::thread::spawn(move || {
+                    update_item(
+                        &h,
+                        &id,
+                        &hash,
+                        &ReviewUpdates {
+                            memo: Some(format!("memo for {id}")),
+                            ..ReviewUpdates::default()
+                        },
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let text = file(&h);
+        for id in ids {
+            assert!(
+                text.contains(&format!("メモ: memo for {id}")),
+                "{id}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_add_and_update_both_land() {
+        use crate::storage::review_board::{add_item, NewReviewItem};
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        let h1 = h.clone();
+        let updater = std::thread::spawn(move || {
+            update_item(
+                &h1,
+                "R-001",
+                &hash,
+                &ReviewUpdates {
+                    memo: Some("updated".into()),
+                    ..ReviewUpdates::default()
+                },
+            )
+            .unwrap();
+        });
+        let h2 = h.clone();
+        let adder = std::thread::spawn(move || {
+            add_item(
+                &h2,
+                &NewReviewItem {
+                    title: "Fresh",
+                    category: "その他",
+                    ..Default::default()
+                },
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 17).unwrap(),
+            )
+            .unwrap();
+        });
+        updater.join().unwrap();
+        adder.join().unwrap();
+        let text = file(&h);
+        assert!(text.contains("メモ: updated"));
+        assert!(text.contains("### Fresh <!-- rb-id: R-004 -->"));
+    }
+
+    #[test]
+    fn a_failed_update_releases_the_lock_for_the_next_writer() {
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        let memo = ReviewUpdates {
+            memo: Some("x".into()),
+            ..upd()
+        };
+        let before = std::fs::read(board_path(&h)).unwrap();
+        let err = update_item(&h, "R-001", "stale", &memo).unwrap_err();
+        assert!(err.downcast_ref::<HashMismatch>().is_some());
+        assert_eq!(std::fs::read(board_path(&h)).unwrap(), before);
+        // Would block forever if the failed call leaked the lock.
+        update_item(&h, "R-001", &hash, &memo).unwrap();
+    }
+
+    #[test]
+    fn mixed_line_endings_are_normalized_on_read_and_write_with_a_warning() {
+        let mixed = board_text().replacen(
+            "### First <!-- rb-id: R-001 -->\n",
+            "### First <!-- rb-id: R-001 -->\r\n",
+            1,
+        );
+        let (_d, h) = setup(&mixed);
+        // Read: LF content, warning, not an error.
+        let (item, warnings) = read_item_with_warnings(&h, SectionRef::Id("R-002")).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("LF and CRLF")),
+            "{warnings:?}"
+        );
+        assert!(!item.body.contains('\r'));
+        // The hash a reader sees is the one the writer accepts.
+        let hash = item.content_hash.clone();
+        let done = update_item(
+            &h,
+            "R-002",
+            &hash,
+            &ReviewUpdates {
+                memo: Some("ok".into()),
+                ..upd()
+            },
+        )
+        .unwrap();
+        assert!(done.warnings.iter().any(|w| w.contains("LF and CRLF")));
+        assert!(!std::fs::read(board_path(&h)).unwrap().contains(&b'\r'));
+    }
+
+    #[test]
+    fn uniform_lf_board_has_no_line_ending_warning_and_uniform_crlf_stays_crlf() {
+        let (_d, h) = setup(&board_text());
+        let hash = hash_of(&h, "R-001");
+        let done = update_item(
+            &h,
+            "R-001",
+            &hash,
+            &ReviewUpdates {
+                memo: Some("m".into()),
+                ..upd()
+            },
+        )
+        .unwrap();
+        assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+
+        let crlf = board_text().replace('\n', "\r\n");
+        let (_d2, h2) = setup(&crlf);
+        let hash = hash_of(&h2, "R-001");
+        let done = update_item(
+            &h2,
+            "R-001",
+            &hash,
+            &ReviewUpdates {
+                memo: Some("m".into()),
+                ..upd()
+            },
+        )
+        .unwrap();
+        assert!(done.warnings.is_empty());
+        let text = file(&h2);
+        assert!(text.contains("\r\n") && !text.replace("\r\n", "").contains('\n'));
     }
 }

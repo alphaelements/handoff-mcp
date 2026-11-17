@@ -18,6 +18,7 @@
 //!   a memo line after it, so a task list in the body or in the memo is not
 //!   mistaken for it. Without a checkbox the memo is the last memo line.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// Marker inside the heading's HTML comment that introduces the stable id.
@@ -147,6 +148,103 @@ pub fn heading_id_numbers(text: &str) -> Vec<u64> {
         }
     }
     numbers
+}
+
+/// Warning returned when a board mixes LF and CRLF line endings (SPEC-RB-026).
+pub const MIXED_EOL_WARNING: &str =
+    "review_board.md mixes LF and CRLF line endings; they are normalized to LF (a write rewrites the file with LF only)";
+
+/// `true` when `text` has both CRLF and bare-LF line terminators. A uniform
+/// board (all LF or all CRLF) is not mixed.
+pub fn has_mixed_line_endings(text: &str) -> bool {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count();
+    crlf > 0 && lf > crlf
+}
+
+/// `text` with every CRLF turned into LF when the line endings are mixed;
+/// uniform text is returned as is, so a pure-CRLF board stays CRLF.
+pub fn normalize_mixed_line_endings(text: &str) -> Cow<'_, str> {
+    if has_mixed_line_endings(text) {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Why an item heading's stable id cannot be used.
+enum IdProblem {
+    /// No `rb-id` mention at all (a heading a user typed by hand).
+    Missing,
+    /// An `rb-id` mention that does not parse to a well-formed `R-NNN` id.
+    Corrupted,
+}
+
+/// `true` for `R-` followed by one or more ASCII digits and nothing else.
+fn is_well_formed_id(id: &str) -> bool {
+    id.strip_prefix("R-")
+        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn id_problem(rest: &str) -> Result<String, IdProblem> {
+    match parse_item_heading(rest).1 {
+        Some(id) if is_well_formed_id(&id) => Ok(id),
+        Some(_) => Err(IdProblem::Corrupted),
+        None if rest.contains(RB_ID_MARKER) => Err(IdProblem::Corrupted),
+        None => Err(IdProblem::Missing),
+    }
+}
+
+/// Warnings about item (`###`) headings whose stable id is missing, corrupted
+/// or duplicated (NFR-RB-REL-002). The sections stay in the board and keep
+/// their `seq`; nothing is repaired here. `seq` matches the 0-based index the
+/// readers use for `###` sections outside code fences.
+pub fn id_warnings(text: &str) -> Vec<String> {
+    let mut fence = Fence::default();
+    let mut warnings = Vec::new();
+    let mut seen: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut seq = 0;
+    for raw in text.split_inclusive('\n') {
+        let (line, _) = split_eol(raw);
+        if fence.skips(line) {
+            continue;
+        }
+        let Some((3, rest)) = heading(line) else {
+            continue;
+        };
+        let title = parse_item_heading(rest).0;
+        match id_problem(rest) {
+            Ok(id) => match seen.iter_mut().find(|(known, _)| *known == id) {
+                Some((_, seqs)) => seqs.push(seq),
+                None => seen.push((id, vec![seq])),
+            },
+            Err(IdProblem::Missing) => warnings.push(format!(
+                "item \"{title}\" (seq {seq}) has no rb-id comment; address it by seq"
+            )),
+            Err(IdProblem::Corrupted) => warnings.push(format!(
+                "item \"{title}\" (seq {seq}) has a corrupted rb-id comment; address it by seq"
+            )),
+        }
+        seq += 1;
+    }
+    for (id, seqs) in seen.into_iter().filter(|(_, seqs)| seqs.len() > 1) {
+        let list: Vec<String> = seqs.iter().map(usize::to_string).collect();
+        warnings.push(format!(
+            "id {id} appears more than once (seq {}); fix the duplicate heading",
+            list.join(", ")
+        ));
+    }
+    warnings
+}
+
+/// Every warning about the board text: line endings first, then ids.
+pub fn board_warnings(text: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if has_mixed_line_endings(text) {
+        warnings.push(MIXED_EOL_WARNING.to_string());
+    }
+    warnings.extend(id_warnings(text));
+    warnings
 }
 
 /// `(key, value)` of a `- key: value` attribute line.
@@ -335,5 +433,84 @@ body quoting rb-id: R-9999
         assert_eq!(attr_block_end(&lines), 3);
         assert_eq!(attr_block_end(&["### T", "", "- a: b"]), 1);
         assert_eq!(attr_block_end(&[]), 0);
+    }
+
+    // --- RB-008 / RB-009 (SPEC-RB-021..023, SPEC-RB-026) ---------------
+
+    #[test]
+    fn intact_ids_produce_no_warnings() {
+        let text = "## C\n\n### A <!-- rb-id: R-001 -->\n- date: 2026-01-01\n\n### B <!-- rb-id: R-002 -->\n";
+        assert!(id_warnings(text).is_empty());
+    }
+
+    #[test]
+    fn missing_id_comment_is_warned_with_title_and_seq() {
+        let text = "### A <!-- rb-id: R-001 -->\n### Hand typed\n";
+        let w = id_warnings(text);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("Hand typed") && w[0].contains("seq 1"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("no rb-id"), "{w:?}");
+    }
+
+    #[test]
+    fn corrupted_id_comments_are_warned() {
+        for rest in [
+            "Broken <!-- rb-id: R-002",
+            "Empty <!-- rb-id: -->",
+            "Bare rb-id: R-002",
+            "Odd <!-- rb-id: banana -->",
+            "Trailing <!-- rb-id: R-12x -->",
+        ] {
+            let w = id_warnings(&format!("### {rest}\n"));
+            assert_eq!(w.len(), 1, "{rest}: {w:?}");
+            assert!(w[0].contains("corrupted"), "{rest}: {w:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_ids_are_warned_once() {
+        let text = "### A <!-- rb-id: R-001 -->\n### B <!-- rb-id: R-001 -->\n";
+        let w = id_warnings(text);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("R-001") && w[0].contains("more than once"),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn id_warnings_ignore_fences_and_other_levels() {
+        let text = "## Category\n#### deep\n```\n### Fake\n```\n";
+        assert!(id_warnings(text).is_empty());
+    }
+
+    #[test]
+    fn mixed_line_endings_are_detected_only_when_both_kinds_occur() {
+        assert!(has_mixed_line_endings("a\r\nb\n"));
+        assert!(has_mixed_line_endings("a\nb\r\n"));
+        assert!(!has_mixed_line_endings("a\nb\n"));
+        assert!(!has_mixed_line_endings("a\r\nb\r\n"));
+        assert!(!has_mixed_line_endings(""));
+    }
+
+    #[test]
+    fn normalize_converts_only_mixed_text() {
+        assert_eq!(normalize_mixed_line_endings("a\r\nb\n").as_ref(), "a\nb\n");
+        assert_eq!(
+            normalize_mixed_line_endings("a\r\nb\r\n").as_ref(),
+            "a\r\nb\r\n"
+        );
+        assert_eq!(normalize_mixed_line_endings("a\nb\n").as_ref(), "a\nb\n");
+    }
+
+    #[test]
+    fn board_warnings_combine_eol_and_id_findings() {
+        assert!(board_warnings("### A <!-- rb-id: R-001 -->\n").is_empty());
+        let w = board_warnings("### A <!-- rb-id: R-001 -->\r\n### B\n");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().any(|m| m == MIXED_EOL_WARNING));
     }
 }

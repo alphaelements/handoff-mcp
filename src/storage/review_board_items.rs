@@ -98,6 +98,62 @@ pub fn parse_items(text: &str) -> Vec<ReviewItem> {
         .collect()
 }
 
+/// Longest `answer_summary`, counted in Unicode characters so Japanese text
+/// is never cut inside a character.
+pub const ANSWER_SUMMARY_MAX_CHARS: usize = 100;
+
+/// `answer_summary` of `load_context` for an answered item: the first
+/// [`ANSWER_SUMMARY_MAX_CHARS`] characters of the memo, or `checked` when the
+/// item is answered by its checkbox alone.
+pub fn answer_summary(item: &ReviewItem) -> String {
+    if item.memo.trim().is_empty() {
+        "checked".to_string()
+    } else {
+        item.memo.chars().take(ANSWER_SUMMARY_MAX_CHARS).collect()
+    }
+}
+
+/// An answered item as listed in `handoff_load_context`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnsweredItem {
+    pub id: Option<String>,
+    pub title: String,
+    pub answer_summary: String,
+}
+
+/// Board counts and the answered items, for `handoff_load_context`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoardSummary {
+    pub pending_count: usize,
+    pub answered_count: usize,
+    /// Answered items in file order. Resolved items live in the decisions
+    /// file, so every answered item still on the board is unresolved.
+    pub answered_items: Vec<AnsweredItem>,
+}
+
+/// Summarizes a board text using the same parse as `handoff_review_list`.
+pub fn summarize_board(text: &str) -> BoardSummary {
+    let items = parse_items(text);
+    let pending_count = items
+        .iter()
+        .filter(|i| i.status == ReviewStatus::Pending)
+        .count();
+    let answered_items: Vec<AnsweredItem> = items
+        .iter()
+        .filter(|i| i.status == ReviewStatus::Answered)
+        .map(|i| AnsweredItem {
+            id: i.id.clone(),
+            title: i.title.clone(),
+            answer_summary: answer_summary(i),
+        })
+        .collect();
+    BoardSummary {
+        pending_count,
+        answered_count: answered_items.len(),
+        answered_items,
+    }
+}
+
 impl From<ReviewSection> for ReviewItem {
     fn from(section: ReviewSection) -> Self {
         ReviewItem {
@@ -322,6 +378,84 @@ mod tests {
         assert!(!items[0].checkbox_checked);
         assert_eq!(items[0].memo, "done\n- [x] memo task");
         assert!(items[1].checkbox_checked);
+    }
+
+    #[test]
+    fn answer_detection_edge_cases() {
+        // Single character memo is content; tab-only memo is empty.
+        assert_eq!(
+            one("### T\n- [ ] 確認済み\nメモ: y\n").status,
+            ReviewStatus::Answered
+        );
+        assert_eq!(
+            one("### T\n- [ ] 確認済み\nメモ:\t \t\n").status,
+            ReviewStatus::Pending
+        );
+        // [x] with an empty memo: answered, memo empty.
+        let it = one("### T\n- [x] 確認済み\nメモ:\n");
+        assert_eq!(it.status, ReviewStatus::Answered);
+        assert_eq!(it.memo, "");
+        // [x] together with a memo.
+        assert_eq!(
+            one("### T\n- [x] 確認済み\nメモ: ok\n").status,
+            ReviewStatus::Answered
+        );
+    }
+
+    #[test]
+    fn checkbox_in_body_or_fence_or_neighbour_does_not_answer() {
+        let items = parse_items(
+            "## C\n### A <!-- rb-id: R-001 -->\n- [x] sample step\n```\n- [x] fenced\n```\n- [ ] 確認済み\nメモ:\n### B <!-- rb-id: R-002 -->\n- [ ] 確認済み\nメモ:\n",
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, ReviewStatus::Pending);
+        assert_eq!(items[1].status, ReviewStatus::Pending);
+        let items = parse_items(
+            "### A <!-- rb-id: R-001 -->\n- [x] 確認済み\nメモ:\n### B <!-- rb-id: R-002 -->\n- [ ] 確認済み\nメモ:\n",
+        );
+        assert_eq!(items[0].status, ReviewStatus::Answered);
+        assert_eq!(items[1].status, ReviewStatus::Pending);
+    }
+
+    #[test]
+    fn summary_counts_and_lists_only_answered_in_file_order() {
+        let text = "## C\n\
+### A <!-- rb-id: R-002 -->\n- [x] 確認済み\nメモ:\n\
+### B <!-- rb-id: R-003 -->\n- [ ] 確認済み\nメモ:\n\
+### C <!-- rb-id: R-005 -->\n- [ ] 確認済み\nメモ: この方針で進めてください\n\
+### D <!-- rb-id: R-006 -->\n- [x] 確認済み\nメモ: OK\n";
+        let s = summarize_board(text);
+        assert_eq!(s.pending_count, 1);
+        assert_eq!(s.answered_count, 3);
+        let ids: Vec<_> = s.answered_items.iter().map(|i| i.id.as_deref()).collect();
+        assert_eq!(ids, [Some("R-002"), Some("R-005"), Some("R-006")]);
+        assert_eq!(s.answered_items[0].answer_summary, "checked");
+        assert_eq!(
+            s.answered_items[1].answer_summary,
+            "この方針で進めてください"
+        );
+        assert_eq!(s.answered_items[1].title, "C");
+        assert_eq!(s.answered_items[2].answer_summary, "OK");
+    }
+
+    #[test]
+    fn summary_truncates_by_characters_not_bytes() {
+        let memo: String = "あ".repeat(120);
+        let s = summarize_board(&format!(
+            "### A <!-- rb-id: R-001 -->\n- [ ] 確認済み\nメモ: {memo}\n"
+        ));
+        assert_eq!(s.answered_items[0].answer_summary.chars().count(), 100);
+        let exact = "x".repeat(100);
+        let s = summarize_board(&format!("### A\n- [ ] 確認済み\nメモ: {exact}\n"));
+        assert_eq!(s.answered_items[0].answer_summary, exact);
+        assert_eq!(s.answered_items[0].id, None);
+    }
+
+    #[test]
+    fn empty_board_summary_is_zero() {
+        let s = summarize_board("# Board\n## C\n");
+        assert_eq!((s.pending_count, s.answered_count), (0, 0));
+        assert!(s.answered_items.is_empty());
     }
 
     #[test]
