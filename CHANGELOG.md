@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] - 2026-11-18
+
+### Added
+
+- **Review Board** (`handoff_review_*`): six new MCP tools for collecting and managing user confirmations on structured items (design decisions, visual regression screenshots, acceptance criteria). `handoff_review_init` scans a task or document for items that need user confirmation and creates a review board. `handoff_review_list` lists all boards with pending/confirmed/total counts. `handoff_review_read` returns a board's items with their status. `handoff_review_update` checks/unchecks items and records memos. `handoff_review_add` adds custom items to an existing board. `handoff_review_resolve` marks a board as resolved (all items confirmed).
+  - **VRT metadata**: review board items created from GUI VRT results carry image paths (mock, golden, actual, diff) for the VSCode extension's image comparison view.
+  - **Assignee validation**: items can be assigned to a specific person; `handoff_review_update` rejects updates from other assignees.
+  - **Session decisions**: a review board can hold session-level decisions (proceed / revise / abort) with a reason; the decision is recorded in the board's history.
+  - **Locking**: a board can be locked to prevent further changes after resolution.
+  - **Image support**: review items can carry image paths for visual comparison.
+  - `handoff_load_context` now includes `review_boards` summary (pending boards count and IDs) so agents discover work waiting for user confirmation at session start.
+- **Elite confirmation guard**: all five task-loop workflow scripts (session-execute, requirement-execute, brainstorm-execute, research-execute, spec-execute) now require `elite_confirmed: true` in args when the resolved profile is `elite`. This prevents automated workflows from selecting the elite profile (Fable model, 3–5x cost) without explicit user approval.
+
+### Fixed
+
+- **Session-execute crash recovery**: when a tester or reviewer agent crashes (returns null/empty), the session-execute workflow now aborts immediately (fail-closed) instead of treating the crash as a normal failure and wasting remaining rework rounds with no new feedback. This matches the existing behavior for crashed developers.
+
+### Internal
+
+- `deny.toml`: ignore RUSTSEC-2026-0543 (chrono crate unmaintained advisory; no vulnerability, no alternative).
+
 ## [0.48.0] - 2026-11-17
 
 ### Added
