@@ -248,6 +248,12 @@ pub(crate) struct LocalLayerSync {
     /// (`LayerSyncOutcome::removed`) — `doc_save` feeds them to
     /// [`unlink_removed_requirements`] once the document is written.
     pub removed_requirements: Vec<String>,
+    /// FR-ZSW-001: `DIAG-D002` when this sync left the document with no
+    /// body-origin item at all (see [`zero_item_warning`]). Only
+    /// `doc_save`/`doc_update_section` surface it (via
+    /// [`RequirementSyncDiag::warnings`]); batch resync callers ignore it, as
+    /// they report a corpus, not one document the caller just authored.
+    pub zero_item_warning: Option<StructuredWarning>,
 }
 
 /// What one or more layer syncs changed, as `suspect_introduced` reports it
@@ -609,9 +615,18 @@ pub(crate) fn sync_layer_items_local(
     // M2-06: captured before `outcome.warnings` is moved out below —
     // `def_changed` (§2.5 step 5/§4.11) is this function's own return value.
     let def_changed = outcome.def_changed.clone();
+    let synced = outcome.synced;
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
     doc.source.layer_sync_stamp = Some(stamp);
+
+    // Only a sync that actually ran can have produced "zero items": an
+    // unregistered layer leaves `doc.verification` untouched (`synced: false`).
+    let zero_item_warning = if synced {
+        zero_item_warning(doc, &registry, &trace_config.id_prefixes)
+    } else {
+        None
+    };
 
     // M3 (wiki/270-vmodel-m3-design.md §3.2, M3-03, FR-406): automatic
     // approval rollback — every item in `def_changed` (its `def_hash` just
@@ -792,6 +807,49 @@ pub(crate) fn sync_layer_items_local(
         config_id_prefixes: trace_config.id_prefixes,
         requirement_warnings,
         removed_requirements: outcome.removed,
+        zero_item_warning,
+    })
+}
+
+/// Structured warning code for a layer document whose sync produced no
+/// body-origin item (FR-ZSW-001).
+const CODE_ZERO_ITEMS: &str = "DIAG-D002";
+
+/// FR-ZSW-001: `DIAG-D002` when a layer sync left `doc` with zero body-origin
+/// `SubItem`s — typically headings using an ID prefix the layer does not allow
+/// (`RB4-P-001` parses as prefix `RB`), which `layer_parse` otherwise drops
+/// silently. Lists the layer's effective prefixes (defaults plus
+/// `[trace.id_prefixes]`) so the author can fix the heading or register the
+/// prefix.
+fn zero_item_warning(
+    doc: &DocMetadata,
+    registry: &LayerRegistry,
+    config_id_prefixes: &HashMap<String, Vec<String>>,
+) -> Option<StructuredWarning> {
+    let layer = doc.layer.as_deref()?;
+    let has_body_item = doc.verification.as_ref().is_some_and(|v| {
+        v.items
+            .iter()
+            .flat_map(|i| &i.sub_items)
+            .any(|s| s.origin.as_deref() == Some("body"))
+    });
+    if has_body_item {
+        return None;
+    }
+    let prefixes = registry.id_prefixes_for(layer, config_id_prefixes);
+    Some(StructuredWarning {
+        severity: "warning".to_string(),
+        code: CODE_ZERO_ITEMS.to_string(),
+        message: format!(
+            "Layer '{layer}' document has 0 ID-prefixed items. Headings must use the format \
+             `### <PREFIX>-<NUMBER> <title>`."
+        ),
+        fix_hint: Some(format!(
+            "Registered prefixes for layer '{layer}': [{}]. Register custom prefixes via \
+             [trace.id_prefixes.{layer}] in config.toml.",
+            prefixes.join(", ")
+        )),
+        affected_doc_ids: vec![doc.id.clone()],
     })
 }
 
@@ -829,6 +887,9 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
     requirement_diag
         .warnings
         .append(&mut local.requirement_warnings);
+    requirement_diag
+        .warnings
+        .extend(local.zero_item_warning.take());
     requirement_diag
         .removed
         .append(&mut local.removed_requirements);
@@ -14470,5 +14531,93 @@ mod requirement_change_diag_tests {
             sync.requirement_warnings
         );
         assert_eq!(sync.created.len(), 2, "the sync itself must still succeed");
+    }
+
+    fn sync_body(doc: &mut DocMetadata, body: &str, structural: bool) -> Option<LocalLayerSync> {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        let mut warnings = Vec::new();
+        sync_layer_items_local(&handoff, doc, body, "now", structural, &mut warnings)
+    }
+
+    #[test]
+    fn zero_item_warning_fires_for_unrecognized_prefix() {
+        let body = "# Spec\n\n### RB4-P-001 Odd id\n\nBody.\n";
+        let mut doc = layer_doc();
+        let sync = sync_body(&mut doc, body, true).expect("layer doc must sync");
+
+        let w = sync.zero_item_warning.expect("DIAG-D002 expected");
+        assert_eq!(w.code, "DIAG-D002");
+        assert_eq!(w.severity, "warning");
+        assert!(w.message.contains("'requirement'"), "{w:?}");
+        assert!(w.message.contains("### <PREFIX>-<NUMBER>"), "{w:?}");
+        let hint = w.fix_hint.expect("fix_hint");
+        assert!(
+            hint.contains("REQ") && hint.contains("FR") && hint.contains("NFR"),
+            "{hint}"
+        );
+        assert!(hint.contains("[trace.id_prefixes.requirement]"), "{hint}");
+        assert_eq!(w.affected_doc_ids, vec!["doc-1".to_string()]);
+    }
+
+    #[test]
+    fn zero_item_warning_absent_when_items_recognized() {
+        let mut doc = layer_doc();
+        let sync = sync_body(&mut doc, BODY, true).expect("layer doc must sync");
+        assert!(
+            sync.zero_item_warning.is_none(),
+            "{:?}",
+            sync.zero_item_warning
+        );
+    }
+
+    #[test]
+    fn zero_item_warning_absent_for_non_layer_doc() {
+        let mut doc = layer_doc();
+        doc.layer = None;
+        let body = "# Spec\n\n### RB4-P-001 Odd id\n";
+        assert!(sync_body(&mut doc, body, true).is_none());
+    }
+
+    #[test]
+    fn zero_item_warning_absent_on_unchanged_body_short_circuit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        let body = "# Spec\n\n### RB4-P-001 Odd id\n";
+        let mut doc = layer_doc();
+        let mut warnings = Vec::new();
+        let first = sync_layer_items_local(&handoff, &mut doc, body, "now", true, &mut warnings)
+            .expect("first sync runs");
+        assert!(first.zero_item_warning.is_some());
+        // Same body, same config, no structural change: the sync short-circuits.
+        let second = sync_layer_items_local(&handoff, &mut doc, body, "now", false, &mut warnings);
+        assert!(second.is_none(), "short-circuit must return None");
+    }
+
+    #[test]
+    fn zero_item_warning_lists_custom_prefixes_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n[trace.id_prefixes]\nrequirement = [\"RB\"]\n",
+        )
+        .unwrap();
+        let mut doc = layer_doc();
+        let mut warnings = Vec::new();
+        let sync = sync_layer_items_local(
+            &handoff,
+            &mut doc,
+            "# Spec\n\n### ZZ-001 Nope\n",
+            "now",
+            true,
+            &mut warnings,
+        )
+        .expect("layer doc must sync");
+        let hint = sync.zero_item_warning.expect("DIAG-D002").fix_hint.unwrap();
+        assert!(hint.contains("RB"), "custom prefix must be listed: {hint}");
     }
 }

@@ -794,6 +794,124 @@ fn doc_save_layer_missing_silent_when_layer_set() {
     );
 }
 
+fn zero_item_warning_of(save: &Value) -> Option<Value> {
+    payload(save)["warnings"]
+        .as_array()?
+        .iter()
+        .find(|w| w["code"] == "DIAG-D002")
+        .cloned()
+}
+
+/// FR-ZSW-001: a layer document whose headings use an unrecognized ID prefix
+/// (`RB4-P-001` parses as prefix `RB`) yields zero SubItems — `doc_save` must
+/// say so with `DIAG-D002` instead of staying silent.
+#[test]
+fn doc_save_layer_doc_with_unrecognized_prefix_warns_diag_d002() {
+    let (_tmp, dir) = setup_project();
+    let save = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("zero-items"),
+            "title": "Zero Items",
+            "doc_type": "spec",
+            "layer": "requirement",
+            "body": "# Zero Items\n\n### RB4-P-001 Odd id\n\nBody.\n",
+        }),
+    );
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    let w = zero_item_warning_of(&save)
+        .unwrap_or_else(|| panic!("DIAG-D002 missing: {}", payload(&save)["warnings"]));
+    assert_eq!(w["severity"], "warning");
+    let hint = w["fix_hint"].as_str().unwrap();
+    assert!(hint.contains("REQ") && hint.contains("FR"), "{hint}");
+    assert!(hint.contains("[trace.id_prefixes.requirement]"), "{hint}");
+    assert_eq!(w["affected_doc_ids"][0], payload(&save)["doc_id"]);
+}
+
+/// FR-ZSW-001 negative cases: recognized prefix, no layer, and an unchanged
+/// body (the sync short-circuits) all stay free of `DIAG-D002`.
+#[test]
+fn doc_save_diag_d002_absent_for_valid_items_non_layer_and_unchanged_body() {
+    let (_tmp, dir) = setup_project();
+    let valid = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("valid-items"),
+            "title": "Valid",
+            "doc_type": "spec",
+            "layer": "requirement",
+            "body": "# Valid\n\n### REQ-001 Real item\n\nBody.\n",
+        }),
+    );
+    assert!(zero_item_warning_of(&valid).is_none());
+
+    let no_layer = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("no-layer"),
+            "title": "No Layer",
+            "doc_type": "spec",
+            "body": "# No Layer\n\n### RB4-P-001 Odd id\n\nBody.\n",
+        }),
+    );
+    assert!(zero_item_warning_of(&no_layer).is_none());
+
+    let body = "# Again\n\n### RB4-P-001 Odd id\n\nBody.\n";
+    let slug = unique_slug("unchanged");
+    let first = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": &slug, "title": "Again", "doc_type": "spec",
+            "layer": "requirement", "body": body,
+        }),
+    );
+    assert!(zero_item_warning_of(&first).is_some());
+    let doc_id = payload(&first)["doc_id"].as_str().unwrap().to_string();
+    let second = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Again", "body": body }),
+    );
+    assert!(!is_error(&second), "error: {}", payload_text(&second));
+    assert!(
+        zero_item_warning_of(&second).is_none(),
+        "unchanged body must short-circuit the sync: {}",
+        payload(&second)["warnings"]
+    );
+}
+
+/// FR-ZSW-002: the `layer` parameter description tells the caller the heading
+/// format, the default prefixes per layer and where to register custom ones.
+#[test]
+fn doc_save_layer_param_description_documents_id_prefix_format() {
+    let resp = send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#).unwrap();
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let doc_save = tools
+        .iter()
+        .find(|t| t["name"] == "handoff_doc_save")
+        .expect("handoff_doc_save listed");
+    let desc = doc_save["inputSchema"]["properties"]["layer"]["description"]
+        .as_str()
+        .unwrap();
+    for needle in [
+        "### <PREFIX>-<NUMBER>",
+        "REQ-001",
+        "requirement=REQ/FR/NFR",
+        "basic_spec=SPEC/BS",
+        "detailed_spec=DS",
+        "acceptance=AT/AC",
+        "system_test=ST",
+        "unit_test=UT",
+        "[trace.id_prefixes.<layer>]",
+    ] {
+        assert!(desc.contains(needle), "missing {needle:?} in: {desc}");
+    }
+}
+
 /// Enables `[trace] auto_layer = true` in the project's `config.toml`
 /// (t391.1, REQ-VGAP-007).
 fn enable_auto_layer(dir: &std::path::Path) {

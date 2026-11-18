@@ -745,7 +745,9 @@ fn is_final_id_segment(seg: &str) -> bool {
 ///
 /// - immediately followed by `-<digit>` (`HTTP-2`, `UTF-8`, `ISO-26262`), or
 /// - the heading's start matches [`match_item_id`]'s full grammar once that
-///   prefix is treated as allowed (`RQ-VGAP-001`, the multi-segment form).
+///   prefix is treated as allowed (`RQ-VGAP-001`, the multi-segment form), or
+/// - the prefix is directly followed by digits and then a dash-led segment
+///   (`RB4-P-001`, `ABC123-X-456`).
 ///
 /// An *allowed* prefix followed by a malformed ID body (e.g. `REQ-abc`) is
 /// left as a silent ordinary heading, not a warning, since §2.2 only calls
@@ -767,7 +769,24 @@ fn is_id_like_but_disallowed(heading_text: &str, allowed: &HashSet<&str>) -> boo
         .strip_prefix('-')
         .and_then(|rest| rest.as_bytes().first().copied())
         .is_some_and(|b: u8| b.is_ascii_digit());
-    digit_after_dash || match_item_id(heading_text, &HashSet::from([prefix])).is_some()
+    if digit_after_dash {
+        return true;
+    }
+    // Digits glued to the prefix (`RB4-P-001`, `ABC123-X-456`): ID-like when a
+    // dash followed by another alphanumeric segment comes right after them.
+    // Digits with no such tail (`RB4`, `AB3`) are ordinary text.
+    let rest = &heading_text[prefix_len..];
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len > 0 {
+        let dash_tail_starts_segment = rest[digits_len..]
+            .strip_prefix('-')
+            .and_then(|tail| tail.as_bytes().first().copied())
+            .is_some_and(|b: u8| b.is_ascii_alphanumeric());
+        if dash_tail_starts_segment {
+            return true;
+        }
+    }
+    match_item_id(heading_text, &HashSet::from([prefix])).is_some()
 }
 
 // -- Attribute-line parsing (§2.2) --
@@ -1771,6 +1790,27 @@ mod tests {
         assert!(!is_id_like_but_disallowed("RQ-VGAP-abc", &allowed));
         assert!(!is_id_like_but_disallowed("RQ-VGAP", &allowed));
         assert!(!is_id_like_but_disallowed("RQ Overview", &allowed));
+    }
+
+    #[test]
+    fn is_id_like_but_disallowed_digits_between_prefix_and_dash() {
+        let allowed: HashSet<&str> = ["REQ", "FR"].into_iter().collect();
+        // Digits inside the prefix segment, then a dash-separated tail: warn.
+        assert!(is_id_like_but_disallowed("RB4-P-001", &allowed));
+        assert!(is_id_like_but_disallowed("RB4-P-001 title", &allowed));
+        assert!(is_id_like_but_disallowed("ABC123-X-456", &allowed));
+        // Not enough structure (no dash after the digits): no warning.
+        assert!(!is_id_like_but_disallowed("RB4", &allowed));
+        assert!(!is_id_like_but_disallowed("AB3", &allowed));
+        assert!(!is_id_like_but_disallowed("RB4 Overview", &allowed));
+        assert!(!is_id_like_but_disallowed("RB4-", &allowed));
+        // Ordinary headings stay silent.
+        assert!(!is_id_like_but_disallowed("Overview", &allowed));
+        assert!(!is_id_like_but_disallowed("3DRendering", &allowed));
+        assert!(!is_id_like_but_disallowed("3D Rendering", &allowed));
+        // Existing behavior preserved.
+        assert!(is_id_like_but_disallowed("HTTP-2", &allowed));
+        assert!(!is_id_like_but_disallowed("REQ-001", &allowed));
     }
 
     #[test]
