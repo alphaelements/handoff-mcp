@@ -24,7 +24,9 @@ use crate::storage::sessions::{
     SessionData, SessionEntry,
 };
 use crate::storage::task_scope;
-use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
+use crate::storage::tasks::{
+    build_task_index, build_task_index_with_expiry, TaskIndex, TaskSummary,
+};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
 /// `.handoff/` child projects.
@@ -656,7 +658,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     // RB-007: answers the user left on the review board since the last
     // session. Read-only; `null` when the project has no board.
-    match review_board_summary(handoff) {
+    match review_board_summary(handoff, &task_summary) {
         Ok(summary) => result["review_board"] = summary,
         // A board that cannot be read must not cost the caller its context:
         // say so and report no board.
@@ -694,14 +696,29 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 }
 
 /// The `review_board` field of the response (RB-007): pending/answered counts
-/// and the answered items of `.handoff/review_board.md`, or `null` when the
-/// project has no board. A missing file is the normal "no board yet" state;
-/// any other read failure is an error for the caller to surface.
-fn review_board_summary(handoff: &Path) -> Result<Value> {
+/// and the answered items of `.handoff/review_board.md`. A missing file is the
+/// normal "no board yet" state (FR-RB-003): when tasks wait in `review` status
+/// the field falls back to their count (`source: "task_fallback"`) so the
+/// pending review work is still visible, and is `null` only when there is no
+/// board and no review task. Any other read failure is an error for the
+/// caller to surface.
+fn review_board_summary(handoff: &Path, task_summary: &TaskSummary) -> Result<Value> {
     let path = crate::storage::review_board::board_path(handoff);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let pending = task_summary.by_status.get("review").copied().unwrap_or(0);
+            // A status absent from the map means no task has it.
+            return Ok(if pending == 0 {
+                Value::Null
+            } else {
+                serde_json::json!({
+                    "pending_review_tasks_count": pending,
+                    "source": "task_fallback",
+                    "note": "No review_board.md found. Showing review-status task count as fallback.",
+                })
+            });
+        }
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
         }
@@ -1479,6 +1496,58 @@ mod suspect_summary_tests {
 
     fn load(ctx: &HandlerContext) -> Value {
         serde_json::from_str(&handle(ctx, &json!({})).unwrap()).unwrap()
+    }
+
+    fn create_task(ctx: &HandlerContext, title: &str, status: &str) {
+        let out = crate::mcp::handlers::update_task::handle(
+            ctx,
+            &json!({ "task": {
+                "title": title,
+                "status": status,
+                "schedule": { "estimate_hours": 1.0 },
+            } }),
+        )
+        .unwrap();
+        assert!(!out.contains("\"error\""), "{out}");
+    }
+
+    #[test]
+    fn review_board_falls_back_to_review_task_count_without_a_board_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        create_task(&ctx, "a", "review");
+        create_task(&ctx, "b", "review");
+        create_task(&ctx, "c", "todo");
+        let out = load(&ctx);
+        assert_eq!(
+            out["review_board"],
+            json!({
+                "pending_review_tasks_count": 2,
+                "source": "task_fallback",
+                "note": "No review_board.md found. Showing review-status task count as fallback."
+            })
+        );
+        assert!(!ctx.handoff_dir.join("review_board.md").exists());
+    }
+
+    #[test]
+    fn review_board_file_wins_over_the_task_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        create_task(&ctx, "a", "review");
+        crate::storage::review_board::init_board(&ctx.handoff_dir).unwrap();
+        assert_eq!(
+            load(&ctx)["review_board"],
+            json!({ "pending_count": 0, "answered_count": 0, "answered_items": [] })
+        );
+    }
+
+    #[test]
+    fn review_board_is_null_without_a_board_file_and_review_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = init_project(&tmp);
+        create_task(&ctx, "a", "todo");
+        assert!(load(&ctx)["review_board"].is_null());
     }
 
     #[test]

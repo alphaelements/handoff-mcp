@@ -1129,6 +1129,7 @@ fn handle_update(
                 status_changed,
                 schedule_stale,
                 preloaded_doc_set,
+                review_transition,
             } = result?;
             apply_requirement_updates_and_propagate(
                 handoff_dir,
@@ -1149,6 +1150,7 @@ fn handle_update(
                 status_changed && requested_status == Some("done"),
                 &mut msg,
             );
+            append_review_board_sync(handoff_dir, task_id, review_transition, &mut msg);
             Ok(msg)
         })();
         let _ = fs2::FileExt::unlock(&lock_file);
@@ -1172,6 +1174,7 @@ fn handle_update(
         status_changed,
         schedule_stale,
         preloaded_doc_set,
+        review_transition,
     } = result?;
 
     apply_requirement_updates_and_propagate(
@@ -1193,8 +1196,41 @@ fn handle_update(
         status_changed && requested_status == Some("done"),
         &mut msg,
     );
+    append_review_board_sync(handoff_dir, task_id, review_transition, &mut msg);
 
     Ok(msg)
+}
+
+/// FR-RB-001/002: keeps the Review Board in step with a status change into or
+/// out of `review` (see [`crate::storage::review_autosync`]). A successful sync
+/// adds nothing to the reply; only warnings are shown. Best-effort: the
+/// status change is already committed, so a board failure becomes a warning
+/// line instead of failing (and inviting a retry of) the update.
+fn append_review_board_sync(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    transition: Option<ReviewTransition>,
+    msg: &mut String,
+) {
+    let Some(t) = transition else {
+        return;
+    };
+    match crate::storage::review_autosync::on_status_change(
+        handoff_dir,
+        task_id,
+        &t.title,
+        &t.done_criteria,
+        &t.from,
+        &t.to,
+        Utc::now().date_naive(),
+    ) {
+        Ok(outcome) => {
+            for warning in outcome.warnings {
+                msg.push_str(&format!("\nWarning: review board: {warning}"));
+            }
+        }
+        Err(e) => msg.push_str(&format!("\nWarning: review board auto-sync failed: {e:#}")),
+    }
 }
 
 /// Appends the `schedule_stale: true` line when this update made the schedule
@@ -1295,6 +1331,18 @@ struct UpdateLockedResult {
     /// `None` under `warn`/`off`, when this call isn't transitioning into
     /// `review`/`done`, or when the task has no requirement link at all.
     preloaded_doc_set: Option<crate::storage::docs::DocSet>,
+    /// FR-RB-001/002: the task as it stood after a status change into or out
+    /// of `review`, for the Review Board sync. `None` for every other update.
+    review_transition: Option<ReviewTransition>,
+}
+
+/// A committed status change that touches `review`, with what the Review
+/// Board item needs from the task (captured under the task flock).
+struct ReviewTransition {
+    from: String,
+    to: String,
+    title: String,
+    done_criteria: Vec<crate::storage::tasks::DoneCriterion>,
 }
 
 /// Runs the flock-protected read-modify-write for `handoff_update_task` on an
@@ -1633,12 +1681,21 @@ fn handle_update_locked(
     }
 
     let status_changed = new_status != current_status;
+    let review_transition = (status_changed
+        && (new_status == "review" || current_status == "review"))
+        .then(|| ReviewTransition {
+            from: current_status.clone(),
+            to: new_status.to_string(),
+            title: data.title.clone(),
+            done_criteria: data.done_criteria.clone(),
+        });
     Ok(UpdateLockedResult {
         msg,
         existing_task_links,
         status_changed,
         schedule_stale: status_changed || schedule_inputs_before != ScheduleInputs::of(&data),
         preloaded_doc_set,
+        review_transition,
     })
 }
 
@@ -4089,5 +4146,172 @@ mod baseline_schedule_tests {
         let s = extract_schedule(&val).unwrap();
         assert_eq!(s.baseline_start.as_deref(), Some("2026-03-01"));
         assert_eq!(s.baseline_due, None);
+    }
+}
+
+/// FR-RB-001 / FR-RB-002: `handle_update` keeps the Review Board in step with
+/// status changes into and out of `review`.
+#[cfg(test)]
+mod review_board_sync_tests {
+    use super::*;
+
+    fn make_task(tmp: &std::path::Path, id: &str, criteria: Vec<DoneCriterion>) {
+        let task_dir = tmp.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: "Sync me".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: criteria,
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "in_progress", &data).unwrap();
+    }
+
+    fn set_status(tmp: &std::path::Path, id: &str, status: &str) -> String {
+        handle_update(
+            &tmp.join("tasks"),
+            id,
+            &serde_json::json!({ "status": status }),
+            false,
+            None,
+            tmp,
+            "off",
+            true,
+        )
+        .unwrap()
+    }
+
+    fn board(tmp: &std::path::Path) -> String {
+        std::fs::read_to_string(tmp.join("review_board.md")).unwrap_or_default()
+    }
+
+    fn decisions(tmp: &std::path::Path) -> String {
+        std::fs::read_to_string(tmp.join("review_board_decisions.md")).unwrap_or_default()
+    }
+
+    fn criterion(item: &str, checked: bool) -> DoneCriterion {
+        DoneCriterion {
+            item: item.to_string(),
+            checked,
+        }
+    }
+
+    #[test]
+    fn moving_to_review_creates_the_board_and_adds_an_item_with_unchecked_criteria() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            tmp.path(),
+            "t1",
+            vec![
+                criterion("open item", false),
+                criterion("closed item", true),
+            ],
+        );
+        assert!(!tmp.path().join("review_board.md").exists());
+        let msg = set_status(tmp.path(), "t1", "review");
+        assert!(!msg.contains("review_board"), "success is silent: {msg}");
+        let text = board(tmp.path());
+        assert!(text.contains("### Sync me <!-- rb-id: R-001 -->"), "{text}");
+        assert!(text.contains("- task_id: t1"));
+        assert!(text.contains("- open item"));
+        assert!(!text.contains("closed item"));
+    }
+
+    #[test]
+    fn repeating_the_review_update_does_not_duplicate_the_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        set_status(tmp.path(), "t1", "review");
+        set_status(tmp.path(), "t1", "review");
+        assert_eq!(board(tmp.path()).matches("task_id: t1").count(), 1);
+    }
+
+    #[test]
+    fn review_to_done_resolves_the_item_as_approved() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        set_status(tmp.path(), "t1", "review");
+        let msg = set_status(tmp.path(), "t1", "done");
+        assert!(!msg.contains("review_board"), "success is silent: {msg}");
+        assert!(!board(tmp.path()).contains("task_id: t1"));
+        assert!(decisions(tmp.path()).contains("resolution: approved"));
+    }
+
+    #[test]
+    fn review_to_in_progress_resolves_the_item_as_rework() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        set_status(tmp.path(), "t1", "review");
+        set_status(tmp.path(), "t1", "in_progress");
+        assert!(decisions(tmp.path()).contains("resolution: rework"));
+    }
+
+    #[test]
+    fn review_to_blocked_resolves_the_item_as_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        set_status(tmp.path(), "t1", "review");
+        set_status(tmp.path(), "t1", "blocked");
+        assert!(decisions(tmp.path()).contains("resolution: superseded"));
+    }
+
+    #[test]
+    fn a_manually_resolved_item_is_not_overwritten_by_the_status_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        set_status(tmp.path(), "t1", "review");
+        crate::storage::review_decisions::resolve_item(
+            tmp.path(),
+            "R-001",
+            "Manual verdict",
+            Utc::now().date_naive(),
+        )
+        .unwrap();
+        let before = decisions(tmp.path());
+        let msg = set_status(tmp.path(), "t1", "done");
+        assert!(!msg.contains("review_board"), "{msg}");
+        assert_eq!(decisions(tmp.path()), before);
+    }
+
+    #[test]
+    fn updates_that_do_not_touch_review_leave_the_board_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        let msg = set_status(tmp.path(), "t1", "blocked");
+        assert!(!msg.contains("review_board"), "{msg}");
+        assert!(!tmp.path().join("review_board.md").exists());
+    }
+
+    #[test]
+    fn a_board_failure_is_a_warning_and_the_status_change_still_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(tmp.path(), "t1", vec![]);
+        // A directory where the board file should be makes every board
+        // operation fail.
+        std::fs::create_dir(tmp.path().join("review_board.md")).unwrap();
+        let msg = set_status(tmp.path(), "t1", "review");
+        assert!(
+            msg.contains("Warning: review board auto-sync failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("[review]"), "{msg}");
+        let (_, status) = read_task(&tmp.path().join("tasks").join("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, "review");
     }
 }
