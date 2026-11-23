@@ -32,6 +32,11 @@ ignore = [
     # and transitively by typst-as-lib. Migration to jiff is tracked but not
     # yet done. No security vulnerability — just unmaintained.
     "RUSTSEC-2026-0543",
+    # url 2.5.8 stack overflow on nested blob: URLs (RUSTSEC-2026-0592).
+    # Transitive via typst-library -> hayagriva. handoff-mcp never parses
+    # nested blob: URLs; fix requires url >= 2.5.9 which hayagriva has not
+    # adopted yet.
+    "RUSTSEC-2026-0592",
 ]
 
 [licenses]

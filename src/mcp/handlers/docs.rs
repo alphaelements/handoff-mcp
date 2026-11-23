@@ -853,6 +853,41 @@ fn zero_item_warning(
     })
 }
 
+/// Structured warning code for a `plan` document that has neither a layer nor
+/// any `SubItem` (FR-RM-003).
+const CODE_PLAN_NOT_IN_ROADMAP: &str = "DIAG-D003";
+
+/// FR-RM-003: `DIAG-D003` when a `plan` document is saved with no `layer` and
+/// no `SubItem`, so the Roadmap tab has nothing to show for it. Distinct from
+/// `DIAG-D001` (no layer, V-model traceability) and `DIAG-D002` (layer set but
+/// no body item). Never emitted for other `doc_type`s.
+fn plan_roadmap_warning(doc: &DocMetadata) -> Option<StructuredWarning> {
+    if doc.doc_type != "plan" || doc.layer.is_some() {
+        return None;
+    }
+    let has_sub_items = doc
+        .verification
+        .as_ref()
+        .is_some_and(|v| v.items.iter().any(|i| !i.sub_items.is_empty()));
+    if has_sub_items {
+        return None;
+    }
+    Some(StructuredWarning {
+        severity: "warning".to_string(),
+        code: CODE_PLAN_NOT_IN_ROADMAP.to_string(),
+        message: "Plan document has no layer and no SubItems. It will not appear in the \
+                  Roadmap tab of handoff-vscode."
+            .to_string(),
+        fix_hint: Some(
+            "To display this plan in the Roadmap tab, set a layer (e.g. layer=\"requirement\") \
+             and use ID-prefixed headings (e.g. ### FR-001 Feature name). Alternatively, the \
+             Roadmap falls back to milestone-based progress when no SubItems exist."
+                .to_string(),
+        ),
+        affected_doc_ids: vec![doc.id.clone()],
+    })
+}
+
 /// M2-06 (wiki/260-vmodel-m2-design.md §4.11): like [`sync_layer_items_if_needed`]
 /// above, but also returns the sync's own `LayerSyncOutcome::def_changed` ids
 /// (`None` exactly when the plain function above would have returned `false`
@@ -2118,6 +2153,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // them in the same array (`Warning` is untagged, see handlers/mod.rs).
     let mut response_warnings: Vec<Warning> = warnings.into_iter().map(Warning::from).collect();
     response_warnings.extend(layer_missing_warning.map(Warning::from));
+    response_warnings.extend(plan_roadmap_warning(&doc).map(Warning::from));
     response_warnings.extend(requirement_diag.warnings.into_iter().map(Warning::from));
 
     // REQ-PLA-005: `task_ids` is the plan's schedule input, so a changed set

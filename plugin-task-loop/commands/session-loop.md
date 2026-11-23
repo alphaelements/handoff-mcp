@@ -527,6 +527,14 @@ the workflow's Stage 0 (Spec-Prep, `session-spec-writer`) has anything to genera
 4. Mention the result in the session plan ("Spec gate: N requirements missing
    basic_spec/system_test -> Stage 0 will generate them", or "Spec gate: skipped (minimal)").
 
+### 2g. Check pending Review Board items
+
+Before planning, check if the user has unresolved Review Board items:
+`handoff_review_list(status_filter="pending")`. If items are pending:
+- Surface them in the session plan: "N items await user review on the Review Board"
+- If any are blockers for this session's tasks, note it in the plan
+- Do not resolve them on the user's behalf
+
 ### 3. Assign developers
 
 - Assign tasks so **file scopes don't conflict** between developers
@@ -828,6 +836,17 @@ settled the same way.
 When you close tasks yourself (under `express`, on `passed: false`, or for a task in
 `closer_failed_tasks`), apply the same rule: read `orphan` first, and leave an orphan task in
 `review` with the note instead of marking it `done`.
+
+#### Review Board auto-sync
+
+Since v0.49.1, `handoff_update_task(status: "review")` automatically creates a Review Board
+item with the task's unchecked done_criteria. When the task later moves to `done`, the item
+is auto-resolved as `approved`; moving back to `in_progress` resolves it as `rework`.
+
+If the session produces **additional user-confirmation items** beyond the task's done_criteria
+(design decisions, spec choices, deployment approvals), register them manually:
+`handoff_review_add(title="...", category="User Decision", body="...")` — these are
+not covered by the automatic sync.
 
 #### On success (passed: true, pending_followups empty)
 

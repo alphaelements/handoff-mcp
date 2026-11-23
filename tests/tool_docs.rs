@@ -1184,6 +1184,90 @@ fn doc_save_auto_layer_applies_to_plan_with_config_override() {
     assert_eq!(doc_layer(&dir, &doc_id), json!("requirement"));
 }
 
+fn save_with_body(dir: &std::path::Path, slug: &str, extra: Value) -> Value {
+    let mut args = json!({ "slug": unique_slug(slug), "title": "T", "body": "# T\n\nBody.\n" });
+    for (k, v) in extra.as_object().expect("extra object") {
+        args[k] = v.clone();
+    }
+    let save = call(dir, "handoff_doc_save", args);
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    payload(&save)
+}
+
+/// FR-RM-003: a plan with no layer and no SubItems warns it will not appear in
+/// the Roadmap tab, with concrete steps to fix it.
+#[test]
+fn doc_save_layerless_plan_without_items_warns_diag_d003() {
+    let (_tmp, dir) = setup_project();
+    let p = save_with_body(&dir, "roadmap-plan", json!({ "doc_type": "plan" }));
+    let w = p["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "DIAG-D003")
+        .unwrap_or_else(|| panic!("DIAG-D003 missing: {}", p["warnings"]))
+        .clone();
+    assert_eq!(w["severity"], "warning");
+    assert!(w["message"].as_str().unwrap().contains("Roadmap"), "{w}");
+    let hint = w["fix_hint"].as_str().unwrap();
+    assert!(
+        hint.contains("layer") && hint.contains("### FR-001"),
+        "{hint}"
+    );
+    assert_eq!(w["affected_doc_ids"][0], p["doc_id"]);
+    // DIAG-D001 stays: the two warnings are independent.
+    assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"), "{p}");
+}
+
+/// FR-RM-003: a plan whose layer is set but yields zero items gets DIAG-D002
+/// (FR-ZSW-001), never DIAG-D003.
+#[test]
+fn doc_save_plan_with_layer_and_zero_items_warns_d002_not_d003() {
+    let (_tmp, dir) = setup_project();
+    let p = save_with_body(
+        &dir,
+        "layered-plan",
+        json!({ "doc_type": "plan", "layer": "requirement" }),
+    );
+    let codes = warning_codes(&p);
+    assert!(codes.iter().any(|c| c == "DIAG-D002"), "{p}");
+    assert!(!codes.iter().any(|c| c == "DIAG-D003"), "{p}");
+}
+
+/// FR-RM-003: other doc types never get DIAG-D003.
+#[test]
+fn doc_save_non_plan_without_layer_has_no_diag_d003() {
+    let (_tmp, dir) = setup_project();
+    for doc_type in ["note", "spec", "design", "adr", "guide"] {
+        let p = save_with_body(&dir, "other-doc", json!({ "doc_type": doc_type }));
+        assert!(
+            !warning_codes(&p).iter().any(|c| c == "DIAG-D003"),
+            "{doc_type}: {p}"
+        );
+    }
+}
+
+/// FR-RM-003: a layered plan with SubItems is fully shown in the Roadmap, so
+/// it gets no D002 or D003.
+#[test]
+fn doc_save_plan_with_layer_and_items_has_no_diag_d003_or_d002() {
+    let (_tmp, dir) = setup_project();
+    let p = save_with_body(
+        &dir,
+        "full-plan",
+        json!({
+            "doc_type": "plan",
+            "layer": "requirement",
+            "body": "# T\n\n### REQ-001 Feature\n\nBody.\n",
+        }),
+    );
+    let codes = warning_codes(&p);
+    assert!(
+        !codes.iter().any(|c| c == "DIAG-D003" || c == "DIAG-D002"),
+        "{p}"
+    );
+}
+
 /// REQ-PLA-002: `plan` is layerable, so a layerless plan reports DIAG-D001
 /// when auto_layer is off.
 #[test]

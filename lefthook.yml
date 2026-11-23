@@ -122,7 +122,7 @@ pre-push:
     # The typst compiler crates are released in lockstep; a partial upgrade
     # (e.g. Dependabot bumping only one of them) must not leave the branch.
     typst-version-check:
-      run: ./scripts/check-typst-versions.sh
+      run: . scripts/cargo-env.sh && ./scripts/check-typst-versions.sh
       fail_text: "typst crate versions are not aligned (wiki/390 section 6). Bump all typst* compiler crates together."
 
     secrets:

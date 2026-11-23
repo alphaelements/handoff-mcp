@@ -17,6 +17,7 @@ pub mod metrics_snapshots;
 pub mod orphan_tasks;
 pub mod referrals;
 pub mod review_assets;
+pub mod review_autosync;
 pub mod review_board;
 pub mod review_board_items;
 pub mod review_decisions;
