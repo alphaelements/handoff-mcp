@@ -739,3 +739,204 @@ fn dashboard_milestones_section_aggregates_tasks_and_requirement_coverage() {
         "a project with no milestones must omit the section"
     );
 }
+
+fn dashboard_project(scan_dir: &std::path::Path, name: &str) -> Value {
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    parsed["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("project {name} not in dashboard"))
+        .clone()
+}
+
+fn ok_call(name: &str, args: Value) {
+    let resp = call_tool(name, args);
+    assert!(!is_error(&resp), "{name} failed: {}", get_text(&resp));
+}
+
+/// SPEC-RBFIX-010/011 (FR-RM-001): with no plan SubItems the dashboard carries
+/// a `roadmap` section built from config milestones + task progress.
+#[test]
+fn dashboard_roadmap_milestone_fallback_has_metadata_progress_and_depends_on() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "rm");
+    let pd = scan_dir.path().join("rm").to_string_lossy().to_string();
+
+    ok_call(
+        "handoff_add_milestone",
+        json!({ "project_dir": &pd, "name": "v0.49.0", "order": 1 }),
+    );
+    ok_call(
+        "handoff_add_milestone",
+        json!({ "project_dir": &pd, "name": "v0.49.1", "version": "0.49.1",
+                "date": "2027-01-15", "description": "D", "order": 2,
+                "depends_on": ["v0.49.0"] }),
+    );
+    // 8 tasks on v0.49.1, 4 done; plus one on an undefined milestone.
+    for i in 0..8 {
+        ok_call(
+            "handoff_update_task",
+            json!({ "project_dir": &pd, "task": {
+                "title": format!("t{i}"),
+                "status": if i < 4 { "done" } else { "todo" },
+                "schedule": { "milestone": "v0.49.1" }
+            } }),
+        );
+    }
+    ok_call(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": {
+            "title": "stray", "status": "done", "schedule": { "milestone": "undefined-ms" }
+        } }),
+    );
+
+    let proj = dashboard_project(scan_dir.path(), "rm");
+    let roadmap = &proj["roadmap"];
+    assert_eq!(roadmap["source"], "milestone_fallback");
+    assert!(roadmap.get("plan_doc_id").is_none());
+    let rows = roadmap["milestones"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "rows: {rows:?}");
+
+    // Same order as the existing `milestones` section; that section is intact.
+    let existing: Vec<&Value> = proj["milestones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["name"])
+        .collect();
+    let roadmap_names: Vec<&Value> = rows.iter().map(|m| &m["name"]).collect();
+    assert_eq!(existing, roadmap_names);
+    assert!(proj["milestones"][0]["tasks"].is_object());
+
+    let empty = &rows[0];
+    assert_eq!(empty["name"], "v0.49.0");
+    assert_eq!(empty["status"], "planning");
+    assert!(empty["date"].is_null());
+    assert!(empty["version"].is_null());
+    assert!(empty["description"].is_null());
+    assert_eq!(empty["depends_on"], json!([]));
+    assert_eq!(
+        empty["progress"],
+        json!({ "done": 0, "total": 0, "rate": 0.0 })
+    );
+
+    let row = &rows[1];
+    assert_eq!(row["name"], "v0.49.1");
+    assert_eq!(row["version"], "0.49.1");
+    assert_eq!(row["date"], "2027-01-15");
+    assert_eq!(row["description"], "D");
+    assert_eq!(row["depends_on"], json!(["v0.49.0"]));
+    assert_eq!(
+        row["progress"],
+        json!({ "done": 4, "total": 8, "rate": 0.5 })
+    );
+}
+
+/// SPEC-RBFIX-012 (FR-RM-001): a plan document with SubItems wins; one without
+/// SubItems does not suppress the fallback.
+#[test]
+fn dashboard_roadmap_plan_with_subitems_takes_priority() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "rm-plan");
+    let pd = scan_dir
+        .path()
+        .join("rm-plan")
+        .to_string_lossy()
+        .to_string();
+    ok_call(
+        "handoff_add_milestone",
+        json!({ "project_dir": &pd, "name": "m1" }),
+    );
+
+    // No plan at all.
+    assert_eq!(
+        dashboard_project(scan_dir.path(), "rm-plan")["roadmap"]["source"],
+        "milestone_fallback"
+    );
+
+    // A plan without layer / SubItems does not count.
+    ok_call(
+        "handoff_doc_save",
+        json!({ "project_dir": &pd, "slug": "plain-plan", "title": "Plain",
+                "doc_type": "plan", "body": "# Plan\n\nNo ids here.\n" }),
+    );
+    assert_eq!(
+        dashboard_project(scan_dir.path(), "rm-plan")["roadmap"]["source"],
+        "milestone_fallback"
+    );
+
+    // A non-plan document with SubItems does not count either.
+    ok_call(
+        "handoff_update_config",
+        json!({ "project_dir": &pd, "updates": { "trace.auto_layer": true } }),
+    );
+    ok_call(
+        "handoff_doc_save",
+        json!({ "project_dir": &pd, "slug": "reqs", "title": "Reqs", "layer": "basic_spec",
+                "doc_type": "spec", "body": "# Spec\n\n### REQ-401 A\n\nA.\n" }),
+    );
+    assert_eq!(
+        dashboard_project(scan_dir.path(), "rm-plan")["roadmap"]["source"],
+        "milestone_fallback"
+    );
+
+    // A plan with SubItems switches the source; milestones are still listed.
+    ok_call(
+        "handoff_doc_save",
+        json!({ "project_dir": &pd, "slug": "real-plan", "title": "Real", "doc_type": "plan",
+                "layer": "basic_spec", "body": "# Plan\n\n### REQ-402 Step\n\nDo it.\n" }),
+    );
+    let proj = dashboard_project(scan_dir.path(), "rm-plan");
+    assert_eq!(proj["roadmap"]["source"], "plan_subitems");
+    assert_eq!(proj["roadmap"]["plan_slug"], "real-plan");
+    assert!(proj["roadmap"]["plan_doc_id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("doc-")));
+    assert_eq!(proj["roadmap"]["milestones"].as_array().unwrap().len(), 1);
+}
+
+/// A project without milestones keeps the pre-roadmap shape (no `roadmap`).
+#[test]
+fn dashboard_roadmap_omitted_without_milestones() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "rm-none");
+    let proj = dashboard_project(scan_dir.path(), "rm-none");
+    assert!(proj.get("roadmap").is_none());
+}
+
+/// SPEC-RBFIX-013 AC2: when the documents cannot be read, the roadmap falls
+/// back to `milestone_fallback` and the warning says that the roadmap source
+/// (not just requirement coverage) is unavailable.
+#[test]
+fn dashboard_roadmap_unreadable_docs_warns_and_falls_back() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "rm-bad");
+    let pd = scan_dir.path().join("rm-bad").to_string_lossy().to_string();
+    ok_call(
+        "handoff_add_milestone",
+        json!({ "project_dir": &pd, "name": "m1" }),
+    );
+    // A regular file where the `docs/` directory belongs makes the scan fail.
+    let docs = scan_dir.path().join("rm-bad/.handoff/docs");
+    let _ = std::fs::remove_dir_all(&docs);
+    std::fs::write(&docs, "not a directory").unwrap();
+
+    let proj = dashboard_project(scan_dir.path(), "rm-bad");
+    assert_eq!(proj["roadmap"]["source"], "milestone_fallback");
+    assert_eq!(proj["roadmap"]["milestones"].as_array().unwrap().len(), 1);
+    let warnings = proj["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| {
+            let w = w.as_str().unwrap_or_default();
+            w.contains("MILESTONES") && w.contains("roadmap")
+        }),
+        "expected a roadmap-aware docs warning, got {warnings:?}"
+    );
+}

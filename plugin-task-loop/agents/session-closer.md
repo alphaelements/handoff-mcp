@@ -178,6 +178,11 @@ Record the value you set in `status_set`.
   could not do anything at all, the top-level `error`. The Workflow reports every `unchanged`
   task as `closer_failed`.
 
+> **Review Board auto-sync**: setting a task to `review` automatically creates a Review Board
+> item. No explicit `handoff_review_add` call is needed for the task itself. If you have
+> additional user-confirmation items (design decisions needing approval, spec ambiguities),
+> register them with `handoff_review_add`.
+
 ### 4b. Log actual time
 
 Read the developer report's `### Actual time` section: real wall-clock hours the developer

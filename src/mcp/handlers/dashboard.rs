@@ -236,19 +236,20 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
 
     let agents = agents_summary(&agent_records);
 
-    // Requirement coverage needs the layer documents; only read them for a
-    // project that actually defines milestones.
+    // Requirement coverage and the roadmap source (plan SubItems) need the layer
+    // documents; only read them for a project that actually defines milestones.
     let docs = if config.milestones.is_empty() {
         Vec::new()
     } else {
         read_all_docs(&handoff_dir).unwrap_or_else(|e| {
             warnings.push(format!(
-                "⚠ MILESTONES: could not read documents, requirement coverage unavailable: {e}"
+                "⚠ MILESTONES: could not read documents, requirement coverage unavailable and roadmap source assumed milestone_fallback (a plan with SubItems cannot be detected): {e}"
             ));
             Vec::new()
         })
     };
     let milestones = milestones_summary(&config, &tree, &docs);
+    let roadmap = roadmap_summary(&config, &tree, &docs);
 
     let mut info = serde_json::json!({
         "name": config.project.name,
@@ -269,6 +270,12 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     if !milestones.is_empty() {
         info["milestones"] = Value::Array(milestones);
     }
+    // FR-RM-001/002: the roadmap sits next to `milestones` and only exists for
+    // a project that defines milestones (the plan SubItem scan is skipped
+    // otherwise, so `docs` is empty and nothing would be worth reporting).
+    if let Some(roadmap) = roadmap {
+        info["roadmap"] = roadmap;
+    }
     Ok(info)
 }
 
@@ -284,13 +291,7 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
 /// dev_stage `implemented` or beyond). `coverage_percent` is `null` — not 0 —
 /// for a milestone with no requirements, since there is nothing to cover.
 fn milestones_summary(config: &Config, tree: &[TaskIndex], docs: &[DocMetadata]) -> Vec<Value> {
-    let mut names: Vec<&String> = config.milestones.keys().collect();
-    names.sort_by_key(|n| {
-        let order = config.milestones[*n].order;
-        (order.is_none(), order, *n)
-    });
-
-    names
+    ordered_milestone_names(config)
         .into_iter()
         .map(|name| {
             let ms = &config.milestones[name];
@@ -312,6 +313,88 @@ fn milestones_summary(config: &Config, tree: &[TaskIndex], docs: &[DocMetadata])
             })
         })
         .collect()
+}
+
+/// Milestone names ordered by `order` (unordered last, ties by name) — the one
+/// ordering shared by the `milestones` and `roadmap` sections.
+fn ordered_milestone_names(config: &Config) -> Vec<&String> {
+    let mut names: Vec<&String> = config.milestones.keys().collect();
+    names.sort_by_key(|n| {
+        let order = config.milestones[*n].order;
+        (order.is_none(), order, *n)
+    });
+    names
+}
+
+/// Builds the per-project `roadmap` section (FR-RM-001/002, SPEC-RBFIX-010..013):
+/// `{ source, milestones[, plan_doc_id, plan_slug] }`. `None` when the project defines no
+/// milestones (same omission rule as the `milestones` section).
+///
+/// `source` is `plan_subitems` when a `doc_type: plan` document has at least
+/// one requirement SubItem (a `stable_id`; `plan_doc_id`/`plan_slug` then name the
+/// most recently updated such plan), otherwise `milestone_fallback`. The milestone
+/// rows are returned in both cases. Each row carries `name`, `status`
+/// (effective), `date`, `version`, `description`, `depends_on` (as written in
+/// config.toml, not validated) and `progress` = `{ done, total, rate }`, where
+/// `rate` is `done / total` and `0` for a milestone with no task so the field
+/// is always a number.
+fn roadmap_summary(config: &Config, tree: &[TaskIndex], docs: &[DocMetadata]) -> Option<Value> {
+    if config.milestones.is_empty() {
+        return None;
+    }
+    let rows: Vec<Value> = ordered_milestone_names(config)
+        .into_iter()
+        .map(|name| {
+            let ms = &config.milestones[name];
+            let (done, total) = milestone_task_counts(tree, name);
+            let rate = if total == 0 {
+                0.0
+            } else {
+                f64::from(done) / f64::from(total)
+            };
+            serde_json::json!({
+                "name": name,
+                "status": ms.effective_status(),
+                "date": ms.date,
+                "version": ms.version,
+                "description": ms.description,
+                "depends_on": ms.depends_on,
+                "progress": { "done": done, "total": total, "rate": rate },
+            })
+        })
+        .collect();
+
+    let mut roadmap = serde_json::json!({
+        "source": "milestone_fallback",
+        "milestones": rows,
+    });
+    if let Some(plan) = latest_plan_with_subitems(docs) {
+        roadmap["source"] = Value::String("plan_subitems".into());
+        roadmap["plan_doc_id"] = Value::String(plan.id.clone());
+        roadmap["plan_slug"] = Value::String(plan.slug.clone());
+    }
+    Some(roadmap)
+}
+
+/// The most recently updated `doc_type: plan` document that has at least one
+/// requirement SubItem (one with a `stable_id`). Ties on `updated_at` resolve
+/// to the lexicographically smaller slug so the choice is deterministic.
+fn latest_plan_with_subitems(docs: &[DocMetadata]) -> Option<&DocMetadata> {
+    docs.iter()
+        .filter(|d| d.doc_type == "plan")
+        .filter(|d| {
+            d.verification.as_ref().is_some_and(|v| {
+                v.items
+                    .iter()
+                    .flat_map(|i| &i.sub_items)
+                    .any(|s| s.stable_id.is_some())
+            })
+        })
+        .max_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| b.slug.cmp(&a.slug))
+        })
 }
 
 /// `(done, total)` over every task in `nodes` (recursively) scheduled on
@@ -677,5 +760,84 @@ mod tests {
             .map(|r| r["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["first", "zz", "aa", "bb"]);
+    }
+
+    /// SPEC-RBFIX-010/011: row fields, effective status, depends_on, progress
+    /// rate (0 for an empty milestone), tasks on undefined milestones ignored.
+    #[test]
+    fn roadmap_rows_carry_metadata_depends_on_and_progress_rate() {
+        let mut m2 = ms("0.2.0", None, Some("2027-01-15"), Some(2));
+        m2.depends_on = vec!["m1".into()];
+        m2.description = Some("D".into());
+        let config = config_with(vec![
+            ("m1", ms("0.1.0", Some("active"), None, Some(1))),
+            ("m2", m2),
+        ]);
+        let tree = vec![
+            task(
+                "a",
+                "done",
+                Some("m2"),
+                vec![task("a1", "done", Some("m2"), vec![])],
+            ),
+            task("b", "todo", Some("m2"), vec![]),
+            task("c", "todo", Some("m2"), vec![]),
+            task("d", "done", Some("nope"), vec![]),
+        ];
+        let roadmap = roadmap_summary(&config, &tree, &[]).unwrap();
+        assert_eq!(roadmap["source"], "milestone_fallback");
+        let rows = roadmap["milestones"].as_array().unwrap();
+        assert_eq!(rows[0]["name"], "m1");
+        assert_eq!(rows[0]["status"], "active");
+        assert_eq!(
+            rows[0]["progress"],
+            serde_json::json!({"done": 0, "total": 0, "rate": 0.0})
+        );
+        assert_eq!(rows[1]["status"], "planning");
+        assert_eq!(rows[1]["date"], "2027-01-15");
+        assert_eq!(rows[1]["description"], "D");
+        assert_eq!(rows[1]["depends_on"], serde_json::json!(["m1"]));
+        assert_eq!(
+            rows[1]["progress"],
+            serde_json::json!({"done": 2, "total": 4, "rate": 0.5})
+        );
+    }
+
+    #[test]
+    fn roadmap_is_none_without_milestones() {
+        assert!(roadmap_summary(&config_with(vec![]), &[], &[]).is_none());
+    }
+
+    /// SPEC-RBFIX-012: only a `plan` doc with a requirement SubItem switches
+    /// the source; among several the latest `updated_at` wins.
+    #[test]
+    fn roadmap_source_switches_only_for_plan_docs_with_subitems() {
+        let config = config_with(vec![("m1", ms("0.1.0", None, None, None))]);
+        let sub = || vec![requirement("R-1", None, None)];
+        let mut spec = doc(None, sub());
+        spec.id = "spec-id".into();
+        let mut empty_plan = doc(None, vec![]);
+        empty_plan.doc_type = "plan".into();
+        let docs = vec![spec.clone(), empty_plan.clone()];
+        assert_eq!(
+            roadmap_summary(&config, &[], &docs).unwrap()["source"],
+            "milestone_fallback"
+        );
+
+        let mut old = doc(None, sub());
+        old.doc_type = "plan".into();
+        old.id = "old-id".into();
+        old.slug = "old".into();
+        old.updated_at = "2026-01-01T00:00:00Z".into();
+        let mut new = old.clone();
+        new.id = "new-id".into();
+        new.slug = "new".into();
+        new.updated_at = "2026-02-01T00:00:00Z".into();
+        let docs = vec![spec, empty_plan, new, old];
+        let roadmap = roadmap_summary(&config, &[], &docs).unwrap();
+        assert_eq!(roadmap["source"], "plan_subitems");
+        assert_eq!(roadmap["plan_doc_id"], "new-id");
+        assert_eq!(roadmap["plan_slug"], "new");
+        assert_eq!(roadmap["milestones"].as_array().unwrap().len(), 1);
     }
 }
