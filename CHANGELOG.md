@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.1] - 2026-11-24
+
+### Added
+
+- **Review Board auto-sync**: `handoff_update_task` automatically syncs the review board when a task transitions to `review` or `done` status. The sync is best-effort — failures produce a `DIAG-D003` warning without blocking the task update.
+- **Roadmap in dashboard**: `handoff_dashboard` now includes a `roadmap` section. It reads plan documents for SubItem-based progress tracking; when no plan documents exist, it falls back to milestone-based aggregation (task counts and completion percentages per milestone).
+- **`pending_review_tasks_count` fallback**: `handoff_load_context` returns `pending_review_tasks_count` even when no review board file exists, by counting tasks in `review` status. This lets the VSCode extension show pending review counts without requiring a review board to be initialized first.
+- **Skill integration**: session-loop (Step 2g + Step 6), session-closer, and dev-cycle skill now include Review Board guidance for agents to follow during task lifecycle.
+
 ## [0.49.0] - 2026-11-18
 
 ### Added
