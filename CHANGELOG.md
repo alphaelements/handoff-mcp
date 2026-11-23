@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`pending_review_tasks_count` fallback**: `handoff_load_context` returns `pending_review_tasks_count` even when no review board file exists, by counting tasks in `review` status. This lets the VSCode extension show pending review counts without requiring a review board to be initialized first.
 - **Skill integration**: session-loop (Step 2g + Step 6), session-closer, and dev-cycle skill now include Review Board guidance for agents to follow during task lifecycle.
 
+### Internal
+
+- `cargo-env.sh`: check the effective target directory's filesystem instead of the working directory; skip `-j 1` when `.cargo/config.toml` redirects `target-dir` to a native filesystem.
+- `cargo-env.sh`: set `CARGO_INCREMENTAL=0` for hook-driven builds to prevent incremental cache accumulation.
+- `deny.toml`: ignore RUSTSEC-2026-0592 (`url` crate stack overflow on nested `blob:` URLs; transitive via typst, not reachable from handoff-mcp).
+
 ## [0.49.0] - 2026-11-18
 
 ### Added

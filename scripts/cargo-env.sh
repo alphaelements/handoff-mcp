@@ -35,10 +35,28 @@ unset _cargo_home
 # "crate `X` required to be available in rlib format, but was not found in
 # this form" or "can't find crate for `X`" — not a code problem, and `cargo
 # clean` does not fix it (the race just recurs on the next parallel build).
-# `-j 1` serializes rustc invocations, which sidesteps the race at the cost of
-# build time. Only set this where the race is known to happen: elsewhere
-# (native macOS, native Linux CI) parallel builds are fine and this would only
-# slow the build down for nothing.
-if [ "$(df -T . 2>/dev/null | awk 'NR==2 {print $2}')" = "fakeowner" ]; then
+#
+# The race affects only the target directory (where rustc writes), not the
+# source tree (read-only). When .cargo/config.toml redirects target-dir to a
+# native filesystem (ext4 on the Docker named volume), parallel builds are
+# safe and -j 1 is unnecessary. We resolve the effective target directory and
+# only throttle when it is still on fakeowner.
+_target_dir=""
+if [ -f .cargo/config.toml ]; then
+  _target_dir=$(sed -n 's/^target-dir *= *"\(.*\)"/\1/p' .cargo/config.toml 2>/dev/null)
+fi
+_target_dir="${_target_dir:-./target}"
+_target_fs="$(df -T "$_target_dir" 2>/dev/null | awk 'NR==2 {print $2}')"
+if [ "$_target_fs" = "fakeowner" ]; then
   export CARGO_BUILD_JOBS=1
 fi
+unset _target_dir _target_fs
+
+# Disable incremental compilation for hook-driven builds (clippy, test, fmt).
+# Incremental cache is session-scoped: only the immediately preceding session
+# with the same feature-flag combination is reused; every other session is
+# orphaned and never GC'd until `cargo clean`. With hooks running clippy twice
+# (default + bundled-typst) plus test on each push, thousands of dead sessions
+# accumulate — 178 GB was observed. Hooks are CI-like (full check, infrequent)
+# so incremental provides negligible speedup while consuming massive disk.
+export CARGO_INCREMENTAL=0
