@@ -730,7 +730,7 @@ fn prose_lines(body: &str) -> impl Iterator<Item = &str> {
 /// those prefixes are noise: they repeat across a document's fragments and
 /// share filler wording across documents, pulling every fragment's vector
 /// toward the same cluster. Measured on the 20-filler-document corpus in
-/// `tests/tool_docs_query.rs` (query "設定ファイルを変更したら開発サーバーを
+/// `tests/integration/tool_docs_query.rs` (query "設定ファイルを変更したら開発サーバーを
 /// 再起動してください"), the genuine "Dev Server Restart" fragment scored
 /// bonus 0.857 embedded with its title/heading prefix versus 0.909 embedded
 /// from prose alone, while the best unrelated fragment ("Vintage Typewriter

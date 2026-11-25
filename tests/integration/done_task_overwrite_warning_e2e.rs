@@ -10,8 +10,7 @@
 //! `notes_append` — which adds to the notes without replacing them — never
 //! warns.
 
-#[path = "support/onboarding_e2e.rs"]
-mod support;
+use crate::support::onboarding_e2e as support;
 
 use serde_json::{json, Value};
 use support::{Sandbox, Server};

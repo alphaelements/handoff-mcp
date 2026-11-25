@@ -28,6 +28,7 @@ mod doc_verify;
 mod doc_verify_check_all_layer_warning_e2e;
 mod docs_body_missing_and_config_warning_e2e;
 mod doctor_e2e;
+mod done_task_overwrite_warning_e2e;
 mod e2e_multi_agent;
 mod e2e_overview_reclaim_test;
 mod frontmatter_repair_e2e;

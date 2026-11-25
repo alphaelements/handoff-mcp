@@ -4088,8 +4088,8 @@ pub(crate) fn summary_compare_serialize_count(path: &Path) -> usize {
 /// (non-skipped) derived-file write appends one `"{path}\t{bytes}\n"` line
 /// to it — letting a test bracket a single request's log growth to assert
 /// the discipline directly, and read the exact byte count instead of
-/// approximating it via a `stat` before/after (`tests/perf_budget.rs`'s
-/// `measure_wchar_split`, `tests/derived_summary_write_discipline.rs`).
+/// approximating it via a `stat` before/after (`tests/integration/perf_budget.rs`'s
+/// `measure_wchar_split`, `tests/integration/derived_summary_write_discipline.rs`).
 /// A no-op (one extra `env::var` lookup, negligible next to the write it
 /// accompanies) whenever the env var is unset, i.e. always in normal
 /// operation — this never changes production behavior.

@@ -78,7 +78,7 @@ pub fn is_cli_process() -> bool {
 ///
 /// A test relying on that fallback must call this while holding its file's
 /// `AGENT_ID_GLOBAL` serialization lock (see the doc comment on that static
-/// in `tests/tool_dashboard.rs` / `tests/tool_claim_release.rs`), so the
+/// in `tests/integration/tool_dashboard.rs` / `tests/integration/tool_claim_release.rs`), so the
 /// reset is both immune to whatever earlier tests left behind and race-free
 /// against any test running concurrently that sets its own identity.
 ///

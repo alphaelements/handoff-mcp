@@ -48,7 +48,7 @@ const SEMANTIC_WEIGHT: f64 = 1.0;
 /// structure, not topical meaning. A lower floor would let that noise leak
 /// through as a false-positive cross-lingual match. 0.87 was chosen as the
 /// smallest floor that (a) still clears for a genuine cross-lingual
-/// paraphrase sharing an anchor term (see `tests/tool_memory.rs`'s
+/// paraphrase sharing an anchor term (see `tests/integration/tool_memory.rs`'s
 /// `cross_lingual_recall_reachable_at_production_min_score_default`) and
 /// (b) stays above the observed noise ceiling.
 const SEMANTIC_MIN_SCORE: f64 = 0.87;
@@ -69,7 +69,7 @@ const SEMANTIC_MIN_SCORE: f64 = 0.87;
 /// cost of merging unrelated memories. Lower alpha increases recall further
 /// but shrinks that separation margin — see
 /// `near_duplicate_conflict_fires_at_production_default_threshold` in
-/// tests/tool_memory.rs for the regression guard.
+/// tests/integration/tool_memory.rs for the regression guard.
 const HYBRID_DUP_ALPHA: f32 = 0.5;
 
 /// Load the memory tuning settings from the project's `config.toml`.

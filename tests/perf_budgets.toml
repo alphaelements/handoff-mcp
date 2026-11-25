@@ -719,7 +719,7 @@ ms = 1000
 # assertion that each call clears exactly 1 real link, so this can't
 # regress back to a silent no-op undetected. Re-measured (release build,
 # this task's dev report): first pass, S/M once each with another
-# developer's own `cargo test --release --test perf_budget` running
+# developer's own `cargo test --release --test integration -- perf_budget` running
 # concurrently in this shared session, gave S p50 59.8 ms / M p50
 # 93.2-95.8 ms (two M runs) — noisier and with markedly less headroom than
 # the pre-fix (inaccurate) numbers suggested, since this is now the real RMW

@@ -47,8 +47,6 @@ test:
   stage: test
   script:
     - cargo test --test integration
-  variables:
-    CARGO_INCREMENTAL: "1"
 
 workflow-js-test:
   stage: test
