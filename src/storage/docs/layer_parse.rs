@@ -231,10 +231,10 @@ pub struct ParsedItem {
 /// The kind of a [`ParseWarning`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseWarningKind {
-    /// A heading looks ID-like (`[A-Z]{2,}-\d+...`) but its leading uppercase
-    /// run is not an allowed prefix (§2.2, e.g. `HTTP-2`, `UTF-8`,
-    /// `ISO-26262`). The heading is treated as an ordinary (non-item)
-    /// heading.
+    /// A heading looks ID-like (`[A-Z]{2,}[A-Z0-9]*-\d+...`) but its prefix
+    /// ([`id_prefix_of`]) is not an allowed one (§2.2, e.g. `HTTP-2`,
+    /// `UTF-8`, `ISO-26262`, or `RB2-001` when only `RB` is registered). The
+    /// heading is treated as an ordinary (non-item) heading.
     IdLikeHeadingIgnored,
     /// The same ID appears twice in one document; the 2nd (and later)
     /// occurrence is ignored (§2.2).
@@ -588,8 +588,7 @@ fn prefix_layer_mismatch(
     prefix_table: &HashMap<String, Vec<String>>,
 ) -> Option<String> {
     let own = prefix_table.get(doc_layer)?;
-    let prefix_len = id.bytes().take_while(u8::is_ascii_uppercase).count();
-    let prefix = &id[..prefix_len];
+    let prefix = id_prefix_of(id);
     if own.iter().any(|p| p == prefix) {
         return None;
     }
@@ -647,6 +646,35 @@ pub fn default_prefix_table(
 
 // -- ID matching (§2.2) --
 
+/// The ID prefix at the very start of `text`: the longest run of ASCII
+/// uppercase letters and digits that begins with a letter (`RB2` in
+/// `RB2-001`, `FR` in `FR-LOGIN-01`). Empty when `text` does not start with
+/// an ASCII uppercase letter.
+///
+/// This is the one definition of the prefix grammar: heading recognition,
+/// the ID-like warning, the layer-prefix check and the config validation of
+/// `[trace.id_prefixes]` all go through it, so a prefix that can be
+/// registered is a prefix that is recognized.
+pub fn id_prefix_of(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_uppercase) {
+        return "";
+    }
+    let len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        .count();
+    &text[..len]
+}
+
+/// Whether `prefix` is one a heading can be matched against: non-empty and
+/// made up entirely of the [`id_prefix_of`] grammar. Anything else (lowercase,
+/// a leading digit, `-`/`_`/space, non-ASCII) can be written to
+/// `[trace.id_prefixes]` but never matches a heading.
+pub fn is_parseable_id_prefix(prefix: &str) -> bool {
+    !prefix.is_empty() && id_prefix_of(prefix) == prefix
+}
+
 struct IdMatch {
     id: String,
     title: String,
@@ -660,20 +688,20 @@ struct IdMatch {
 /// (no item) when the prefix is not in `allowed`, or the grammar does not
 /// match at all (the heading is then either ordinary or, per
 /// [`is_id_like_but_disallowed`], warned about as ID-like).
+///
+/// The prefix is [`id_prefix_of`] the heading — everything up to the first
+/// character that is not an uppercase letter or a digit — so it may contain
+/// digits (`RB2-001` under a registered `RB2`). That run is the longest
+/// candidate there is, and the only one: a prefix must be followed by `-`,
+/// which no shorter cut of the run is (`RB2-001` is never `RB` + `2-001`).
+/// With both `RB` and `RB2` registered each heading therefore resolves to
+/// the longer prefix whenever it is the one written.
 fn match_item_id(heading_text: &str, allowed: &HashSet<&str>) -> Option<IdMatch> {
-    let prefix_len = heading_text
-        .as_bytes()
-        .iter()
-        .take_while(|b| b.is_ascii_uppercase())
-        .count();
-    if prefix_len == 0 {
+    let prefix = id_prefix_of(heading_text);
+    if prefix.is_empty() || !allowed.contains(prefix) {
         return None;
     }
-    let prefix = &heading_text[..prefix_len];
-    if !allowed.contains(prefix) {
-        return None;
-    }
-    let rest = &heading_text[prefix_len..];
+    let rest = &heading_text[prefix.len()..];
     let after_dash = rest.strip_prefix('-')?;
 
     let bytes = after_dash.as_bytes();
@@ -740,53 +768,35 @@ fn is_final_id_segment(seg: &str) -> bool {
     }
 }
 
-/// §2.2's warning heuristic: a heading whose leading uppercase run (len >= 2)
-/// is *not* an allowed prefix but is ID-like, i.e. either
+/// §2.2's warning heuristic: a heading whose prefix ([`id_prefix_of`], with
+/// at least 2 leading uppercase letters) is *not* an allowed prefix but is
+/// ID-like, i.e. either
 ///
-/// - immediately followed by `-<digit>` (`HTTP-2`, `UTF-8`, `ISO-26262`), or
+/// - immediately followed by `-<digit>` (`HTTP-2`, `UTF-8`, `ISO-26262`,
+///   `RB2-001`), or
 /// - the heading's start matches [`match_item_id`]'s full grammar once that
-///   prefix is treated as allowed (`RQ-VGAP-001`, the multi-segment form), or
-/// - the prefix is directly followed by digits and then a dash-led segment
-///   (`RB4-P-001`, `ABC123-X-456`).
+///   prefix is treated as allowed (`RQ-VGAP-001`, `RB4-P-001`, the
+///   multi-segment form).
+///
+/// The prefix is the same one [`match_item_id`] looks up, so the two never
+/// disagree about what a heading's prefix is: `RB2-001` under a registered
+/// `RB` (but not `RB2`) is an unregistered `RB2`, and is warned about.
 ///
 /// An *allowed* prefix followed by a malformed ID body (e.g. `REQ-abc`) is
 /// left as a silent ordinary heading, not a warning, since §2.2 only calls
-/// out the "not in the allow list" case.
+/// out the "not in the allow list" case. A single leading letter (`A-1`,
+/// `X86-64`) is too common in ordinary headings to warn about.
 fn is_id_like_but_disallowed(heading_text: &str, allowed: &HashSet<&str>) -> bool {
-    let prefix_len = heading_text
-        .as_bytes()
-        .iter()
-        .take_while(|b| b.is_ascii_uppercase())
-        .count();
-    if prefix_len < 2 {
+    let prefix = id_prefix_of(heading_text);
+    let leading_letters = prefix.bytes().take_while(u8::is_ascii_uppercase).count();
+    if leading_letters < 2 || allowed.contains(prefix) {
         return false;
     }
-    let prefix = &heading_text[..prefix_len];
-    if allowed.contains(prefix) {
-        return false;
-    }
-    let digit_after_dash = heading_text[prefix_len..]
+    let digit_after_dash = heading_text[prefix.len()..]
         .strip_prefix('-')
         .and_then(|rest| rest.as_bytes().first().copied())
         .is_some_and(|b: u8| b.is_ascii_digit());
-    if digit_after_dash {
-        return true;
-    }
-    // Digits glued to the prefix (`RB4-P-001`, `ABC123-X-456`): ID-like when a
-    // dash followed by another alphanumeric segment comes right after them.
-    // Digits with no such tail (`RB4`, `AB3`) are ordinary text.
-    let rest = &heading_text[prefix_len..];
-    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits_len > 0 {
-        let dash_tail_starts_segment = rest[digits_len..]
-            .strip_prefix('-')
-            .and_then(|tail| tail.as_bytes().first().copied())
-            .is_some_and(|b: u8| b.is_ascii_alphanumeric());
-        if dash_tail_starts_segment {
-            return true;
-        }
-    }
-    match_item_id(heading_text, &HashSet::from([prefix])).is_some()
+    digit_after_dash || match_item_id(heading_text, &HashSet::from([prefix])).is_some()
 }
 
 // -- Attribute-line parsing (§2.2) --
@@ -1811,6 +1821,176 @@ mod tests {
         // Existing behavior preserved.
         assert!(is_id_like_but_disallowed("HTTP-2", &allowed));
         assert!(!is_id_like_but_disallowed("REQ-001", &allowed));
+    }
+
+    // -- t468: digit-containing prefixes (`RB2`, `NFR2`) --
+
+    fn allowed_set<'a>(prefixes: &[&'a str]) -> HashSet<&'a str> {
+        prefixes.iter().copied().collect()
+    }
+
+    #[test]
+    fn match_item_id_recognizes_a_digit_containing_prefix() {
+        let allowed = allowed_set(&["RB2"]);
+        let m = match_item_id("RB2-001 Title", &allowed).expect("RB2-001 must match");
+        assert_eq!(m.id, "RB2-001");
+        assert_eq!(m.title, "Title");
+    }
+
+    #[test]
+    fn match_item_id_recognizes_a_multi_segment_id_under_a_digit_containing_prefix() {
+        let allowed = allowed_set(&["RB2"]);
+        let m = match_item_id("RB2-001-002 Child", &allowed).expect("RB2-001-002 must match");
+        assert_eq!(m.id, "RB2-001-002");
+        assert_eq!(m.title, "Child");
+        let m = match_item_id("RB2-P-001: Alnum segment", &allowed).expect("RB2-P-001");
+        assert_eq!(m.id, "RB2-P-001");
+        assert_eq!(m.title, "Alnum segment");
+    }
+
+    #[test]
+    fn match_item_id_keeps_uppercase_only_prefixes_working() {
+        let allowed = allowed_set(&["RB", "FR"]);
+        let m = match_item_id("RB-001 Title", &allowed).expect("RB-001");
+        assert_eq!((m.id.as_str(), m.title.as_str()), ("RB-001", "Title"));
+        let m = match_item_id("FR-001", &allowed).expect("FR-001");
+        assert_eq!((m.id.as_str(), m.title.as_str()), ("FR-001", ""));
+        let m = match_item_id("FR-LOGIN-01a. Tail", &allowed).expect("FR-LOGIN-01a");
+        assert_eq!((m.id.as_str(), m.title.as_str()), ("FR-LOGIN-01a", "Tail"));
+    }
+
+    #[test]
+    fn match_item_id_recognizes_nfr2_when_registered() {
+        let allowed = allowed_set(&["NFR", "NFR2"]);
+        let m = match_item_id("NFR2-001 Latency", &allowed).expect("NFR2-001");
+        assert_eq!(m.id, "NFR2-001");
+        assert_eq!(m.title, "Latency");
+    }
+
+    #[test]
+    fn match_item_id_takes_the_longest_registered_prefix() {
+        // Both `RB` and `RB2` registered: each heading belongs to the prefix
+        // that runs up to its first `-`, never to a shorter registered one.
+        let allowed = allowed_set(&["RB", "RB2", "R2D2"]);
+        assert_eq!(match_item_id("RB2-001", &allowed).unwrap().id, "RB2-001");
+        assert_eq!(match_item_id("RB-001", &allowed).unwrap().id, "RB-001");
+        assert_eq!(match_item_id("R2D2-007", &allowed).unwrap().id, "R2D2-007");
+    }
+
+    #[test]
+    fn match_item_id_rejects_a_digit_containing_prefix_that_is_not_registered() {
+        // Only `RB` is registered: `RB2-001` is not `RB` + `2-001`.
+        let allowed = allowed_set(&["RB", "REQ"]);
+        assert!(match_item_id("RB2-001 Title", &allowed).is_none());
+        assert!(match_item_id("REQ2-001", &allowed).is_none());
+        // A prefix never starts with a digit, registered or not.
+        let allowed = allowed_set(&["3D"]);
+        assert!(match_item_id("3D-001", &allowed).is_none());
+        // Lowercase is not part of a prefix.
+        let allowed = allowed_set(&["RB2", "Rb"]);
+        assert!(match_item_id("Rb-001", &allowed).is_none());
+        assert!(match_item_id("RB2a-001", &allowed).is_none());
+    }
+
+    #[test]
+    fn id_prefix_of_follows_the_prefix_grammar() {
+        assert_eq!(id_prefix_of("RB2-001"), "RB2");
+        assert_eq!(id_prefix_of("FR-001"), "FR");
+        assert_eq!(id_prefix_of("NFR2-001-002"), "NFR2");
+        assert_eq!(id_prefix_of("R2D2-1"), "R2D2");
+        assert_eq!(id_prefix_of("RB2"), "RB2");
+        assert_eq!(id_prefix_of("3D-001"), "");
+        assert_eq!(id_prefix_of("abc-1"), "");
+        assert_eq!(id_prefix_of("要件-1"), "");
+        assert_eq!(id_prefix_of(""), "");
+    }
+
+    #[test]
+    fn is_parseable_id_prefix_accepts_uppercase_and_digits_only() {
+        for ok in ["RB", "RB2", "NFR2", "R2D2", "A", "X1"] {
+            assert!(is_parseable_id_prefix(ok), "{ok} must be parseable");
+        }
+        for bad in [
+            "", "rb", "Rb", "2RB", "RB-2", "RB_2", "RB 2", "要件", "RB２",
+        ] {
+            assert!(
+                !is_parseable_id_prefix(bad),
+                "{bad:?} must not be parseable"
+            );
+        }
+    }
+
+    #[test]
+    fn digit_containing_prefix_registered_in_config_yields_items() {
+        let mut config = HashMap::new();
+        config.insert("requirement".to_string(), vec!["RB2".to_string()]);
+        let table = default_prefix_table(&LayerRegistry::build(&[]), &config);
+        let body =
+            "## RB2-001 Parent\n本文\n\n### RB2-001-002 Child\n本文\n\n## FR-001 Plain\n本文\n";
+        let result = parse_layer_body(body, Some("requirement"), &table);
+        let ids: Vec<&str> = result.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["RB2-001", "RB2-001-002", "FR-001"]);
+        assert_eq!(result.items[0].title, "Parent");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn digit_containing_prefix_does_not_borrow_a_shorter_prefix_of_another_layer() {
+        // `ST` is system_test's prefix and `ST2` is registered for
+        // requirement: `ST2-001` in a requirement document is the document
+        // layer's own prefix, not a mismatched `ST` one.
+        let mut config = HashMap::new();
+        config.insert("requirement".to_string(), vec!["ST2".to_string()]);
+        let table = default_prefix_table(&LayerRegistry::build(&[]), &config);
+        let result = parse_layer_body("## ST2-001 Own\n本文\n", Some("requirement"), &table);
+        assert_eq!(result.items.len(), 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        // And the mismatch is still reported for a digit-containing prefix
+        // that does belong to another layer.
+        let result = parse_layer_body("## ST2-001 Other\n本文\n", Some("basic_spec"), &table);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(
+            result.warnings[0].kind,
+            ParseWarningKind::LayerPrefixMismatch
+        );
+    }
+
+    #[test]
+    fn unregistered_digit_containing_prefix_warns_as_id_like() {
+        // `RB` is registered, `RB2` is not: the heading is not an item, and
+        // the author is told so instead of losing it silently.
+        let mut config = HashMap::new();
+        config.insert("requirement".to_string(), vec!["RB".to_string()]);
+        let table = default_prefix_table(&LayerRegistry::build(&[]), &config);
+        let result = parse_layer_body("## RB2-001 Title\n本文\n", Some("requirement"), &table);
+        assert!(result.items.is_empty());
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(
+            result.warnings[0].kind,
+            ParseWarningKind::IdLikeHeadingIgnored
+        );
+    }
+
+    #[test]
+    fn is_id_like_but_disallowed_follows_the_digit_prefix_grammar() {
+        let allowed = allowed_set(&["REQ", "RB", "RB2"]);
+        // A registered digit-containing prefix is never warned about.
+        assert!(!is_id_like_but_disallowed("RB2-001", &allowed));
+        assert!(!is_id_like_but_disallowed("RB2-abc", &allowed));
+        // An unregistered one is ID-like when the full grammar matches or a
+        // digit follows the dash, like an uppercase-only prefix.
+        assert!(is_id_like_but_disallowed("RB3-001", &allowed));
+        assert!(is_id_like_but_disallowed("REQ2-001 title", &allowed));
+        assert!(is_id_like_but_disallowed("RB3-P-001", &allowed));
+        assert!(is_id_like_but_disallowed("RB3-1-x", &allowed));
+        // ...and ordinary text otherwise, like `RQ-VGAP`.
+        assert!(!is_id_like_but_disallowed("RB3-P", &allowed));
+        assert!(!is_id_like_but_disallowed("RB3-Pro Max", &allowed));
+        assert!(!is_id_like_but_disallowed("RB3", &allowed));
+        // A single leading letter stays below the heuristic's threshold.
+        assert!(!is_id_like_but_disallowed("X86-64 support", &allowed));
+        assert!(!is_id_like_but_disallowed("A4-1", &allowed));
     }
 
     #[test]

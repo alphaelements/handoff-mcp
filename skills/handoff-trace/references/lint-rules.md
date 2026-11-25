@@ -66,7 +66,7 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 | `task_ids_drift` | info | an item's or document's stored task ids disagree with the task side | item-level: run `trace_report`/`trace_slice`, which repair it from the task side. Document-level: set the list explicitly with `doc_save(task_ids=...)` |
 | `orphaned_legacy` | info | an item ended up under "(orphaned legacy items)" because its section heading no longer exists | restore the heading or remove the item |
 | `orphan_run` | info | a recorded test run refers to an item ID that no longer exists | ignore it, or re-record under the new ID |
-| `id_like_heading` | info | a heading looks like an ID but uses a prefix the layer does not allow (for example `HTTP-2`), so it was left as a plain heading | add the prefix in `[trace.id_prefixes]` or reword the heading |
+| `id_like_heading` | info | a heading looks like an ID but uses a prefix the layer does not allow (for example `HTTP-2`, or `RB2-001` when only `RB` is registered), so it was left as a plain heading | add the prefix in `[trace.id_prefixes]` or reword the heading |
 
 ### Tasks outside traceability
 

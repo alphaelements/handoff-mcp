@@ -606,3 +606,135 @@ fn unregistered_multi_segment_prefix_warns_on_doc_save_and_hints_on_update_task(
         "unresolved warning must carry the prefix hint: {unresolved}"
     );
 }
+
+/// t468: a prefix that contains digits (`RB2`) is recognized once it is
+/// registered — over the real binary's stdio transport. Before registration
+/// `RB2-001` is an ID-like heading that is ignored (even though `RB` is
+/// registered); after `handoff_update_config` adds `RB2` the same document
+/// re-syncs into items, parent and multi-segment child alike, and a task can
+/// link to one. An unparseable prefix written through the same tool is saved
+/// but flagged.
+#[test]
+fn digit_containing_prefix_is_recognized_once_registered_over_real_stdio() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "digit-prefix-e2e" }),
+    );
+
+    let registered = server.call_text(
+        "handoff_update_config",
+        json!({ "project_dir": pd, "updates": { "trace.id_prefixes.requirement": ["RB"] } }),
+    );
+    assert!(
+        !registered.contains("UNPARSEABLE_ID_PREFIX"),
+        "{registered}"
+    );
+
+    let body = "# Reqs\n\n## RB2-001 Parent\n\nBody.\n\n### RB2-001-002 Child\n\nBody.\n\n## RB-001 Plain\n\nBody.\n";
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": unique_slug("digit-prefix-e2e"),
+            "title": "Digit prefix (E2E)",
+            "layer": "requirement",
+            "body": body,
+        }),
+    );
+    let doc_id = saved["doc_id"].as_str().expect("doc_id").to_string();
+    let warnings: Vec<&str> = saved["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("ID-like heading ignored") && w.contains("RB2-001 Parent")),
+        "an unregistered RB2 must be reported, not dropped silently: {warnings:?}"
+    );
+
+    let stable_ids = |server: &mut Server| -> Vec<String> {
+        let list = server.call("handoff_doc_req_list", json!({ "project_dir": pd }));
+        list["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter_map(|i| i["stable_id"].as_str().map(String::from))
+            .collect()
+    };
+    assert_eq!(stable_ids(&mut server), vec!["RB-001".to_string()]);
+
+    // Register RB2 next to RB: digits mixed with uppercase need no warning.
+    let registered = server.call_text(
+        "handoff_update_config",
+        json!({ "project_dir": pd, "updates": { "trace.id_prefixes.requirement": ["RB", "RB2"] } }),
+    );
+    assert!(
+        !registered.contains("UNPARSEABLE_ID_PREFIX"),
+        "{registered}"
+    );
+
+    // The same body now yields all three items, with no ID-like warning left.
+    let resaved = server.call(
+        "handoff_doc_save",
+        json!({ "project_dir": pd, "doc_id": doc_id, "body": body }),
+    );
+    let warnings: Vec<&str> = resaved["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.contains("ID-like heading ignored")),
+        "{warnings:?}"
+    );
+    let mut ids = stable_ids(&mut server);
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "RB-001".to_string(),
+            "RB2-001".to_string(),
+            "RB2-001-002".to_string()
+        ]
+    );
+
+    // The item is addressable: a task links to it without a prefix hint.
+    let linked = server.call_text(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": { "id": "t1", "title": "Implement RB2-001", "requirement_ids": ["RB2-001"] },
+        }),
+    );
+    assert!(!linked.contains("Could not resolve"), "{linked}");
+    let task = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": pd, "task_id": "t1" }),
+    );
+    assert!(
+        has_requirement_link(&task_links(&task), "RB2-001"),
+        "t1 must link to RB2-001: {task}"
+    );
+
+    // A prefix no heading can match is saved, with a warning naming it.
+    let flagged = server.call_text(
+        "handoff_update_config",
+        json!({ "project_dir": pd, "updates": { "trace.id_prefixes.requirement": ["RB", "RB2", "rb3"] } }),
+    );
+    assert!(
+        flagged.contains("Warning [UNPARSEABLE_ID_PREFIX]") && flagged.contains("'rb3'"),
+        "{flagged}"
+    );
+}

@@ -1368,6 +1368,10 @@ from the **AI-effort hours** used in scheduling and metrics:
 - A task milestone (`schedule.milestone`) that has no `[milestones.<name>]`
   definition in `config.toml` is accepted with an `UNKNOWN_MILESTONE` warning.
   Check the spelling, or define the milestone with `handoff_add_milestone`.
+- Replacing the title or the notes of a task that is `done` or in `review` is
+  accepted with a `DONE_TASK_OVERWRITE` warning naming the task and the field.
+  `notes_append` adds to the notes without warning, and `force: true`
+  suppresses the warning when the overwrite is intended.
 - In a project with at least one V-model layer document, creating a task
   without `requirement_ids` is accepted, and `handoff_update_task` ends its
   response with two information lines: `Info [REQUIREMENT_LINK_MISSING]` (link

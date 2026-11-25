@@ -118,7 +118,7 @@ coverage and state (lint `layer_outside_profile`, info).
 | key | type | default | effect | example |
 |---|---|---|---|---|
 | `[trace] layers` | array of layer ids | `[]` (auto) | explicit used-layer set (highest priority, §2) | `layers = ["requirement", "acceptance"]` |
-| `[trace.id_prefixes]` `<layer> = [...]` | table of string arrays | `{}` | extra heading-ID prefixes for a layer. **Added to** the defaults, never replaces them | `requirement = ["UC", "SYS"]` |
+| `[trace.id_prefixes]` `<layer> = [...]` | table of string arrays | `{}` | extra heading-ID prefixes for a layer. **Added to** the defaults, never replaces them. A prefix is an ASCII uppercase letter followed by uppercase letters or digits (`UC`, `RB2`); any other shape is saved with `Warning [UNPARSEABLE_ID_PREFIX]` and never matches a heading | `requirement = ["UC", "SYS"]` |
 | `[[trace.layer]]` | array of tables | none | declares a custom layer (§4.2) | see §4.2 |
 | `[trace] profile` | string | unset (auto) | project default profile: a built-in name or a `[trace.profiles.<name>]` key | `profile = "standard"` |
 | `[trace] done_guard` | `"warn"` \| `"block"` \| `"off"`, or a `[trace.done_guard]` table (`mode`, `check_suspects`, `check_profile_layers`, `check_code_drift`) | `"warn"` | what happens when a task with outstanding verification moves to review/done (§5) | `done_guard = "block"` |
@@ -156,7 +156,7 @@ non-boolean value:
 | `side` | `"left"` \| `"right"` | yes | left = definition, right = verification |
 | `level` | integer ≥ 1 | yes | depth within its side (1 = top). `0` is allowed only with `verification = false` |
 | `pair` | layer id | yes, unless `verification = false` | the opposite-side layer it verifies or is verified by. Must point back. Must be empty/omitted when `verification = false` |
-| `id_prefixes` | string array | no (but needed to write items) | default heading-ID prefixes |
+| `id_prefixes` | string array | no (but needed to write items) | default heading-ID prefixes (same shape as `[trace.id_prefixes]`: uppercase letter, then uppercase letters or digits) |
 | `verification` | bool | no (default `true`) | `false` declares an origin layer with no verification pair (§4.2) |
 
 `[trace.profiles.<name>]` entry:

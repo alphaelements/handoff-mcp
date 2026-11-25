@@ -10,6 +10,7 @@ use crate::storage::config::{
 };
 use crate::storage::config_preset::plan_preset;
 use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::layer_parse::is_parseable_id_prefix;
 use crate::trace::profile::BUILTIN_PROFILE_NAMES;
 
 pub fn handle_get(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
@@ -537,6 +538,10 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
             }
         }
         validate_raw_assignee_work_hours(&doc, updates.keys().map(String::as_str))?;
+        applied.extend(unparseable_id_prefix_warnings(
+            updates.keys().map(String::as_str),
+            &rendered,
+        ));
         typed_rendered = Some(rendered);
     }
 
@@ -801,6 +806,90 @@ fn validate_trace_scalar_keys<'a>(
         }
     }
     Ok(())
+}
+
+/// Code of the warning `handoff_update_config` adds for an ID prefix the
+/// heading parser can never match.
+const UNPARSEABLE_ID_PREFIX_CODE: &str = "UNPARSEABLE_ID_PREFIX";
+
+/// One `Warning [UNPARSEABLE_ID_PREFIX]: ...` line per ID prefix written by
+/// this update that no heading can match (see [`is_parseable_id_prefix`]:
+/// lowercase, a leading digit, `-`, non-ASCII, empty, ...). Such a prefix is
+/// saved as given — it is a warning, not a rejection — but an item written
+/// under it would never be recognized, so the caller is told at the moment
+/// the prefix is registered instead of after a document comes back empty.
+///
+/// Only what the update touched is checked, like the other trace keys: a
+/// `trace.id_prefixes.<layer>` key checks that layer's list, `trace.id_prefixes`
+/// (or `trace`) every list, and `trace.layer` (or `trace`) the `id_prefixes`
+/// of each `[[trace.layer]]` declaration. A config the update left unparsable
+/// yields nothing here; it is not this check's finding.
+fn unparseable_id_prefix_warnings<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    rendered: &str,
+) -> Vec<String> {
+    const TABLE_KEY: &str = "trace.id_prefixes";
+    let (mut all_layers, mut custom_layers) = (false, false);
+    let mut touched_layers: Vec<&str> = Vec::new();
+    for key in keys {
+        match key {
+            "trace" => (all_layers, custom_layers) = (true, true),
+            TABLE_KEY => all_layers = true,
+            "trace.layer" => custom_layers = true,
+            k => {
+                if let Some(layer) = k
+                    .strip_prefix(TABLE_KEY)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                {
+                    touched_layers.push(layer);
+                }
+            }
+        }
+    }
+    if !(all_layers || custom_layers) && touched_layers.is_empty() {
+        return Vec::new();
+    }
+    let Ok(config) = toml::from_str::<Config>(rendered) else {
+        return Vec::new();
+    };
+    let trace = &config.trace;
+
+    let mut lists: Vec<(String, &[String])> = trace
+        .id_prefixes
+        .iter()
+        .filter(|(layer, _)| all_layers || touched_layers.contains(&layer.as_str()))
+        .map(|(layer, prefixes)| (format!("{TABLE_KEY}.{layer}"), prefixes.as_slice()))
+        .collect();
+    if custom_layers {
+        lists.extend(trace.layer.iter().map(|l| {
+            (
+                format!("trace.layer '{}' id_prefixes", l.id),
+                l.id_prefixes.as_slice(),
+            )
+        }));
+    }
+    lists.sort_by(|a, b| a.0.cmp(&b.0));
+
+    lists
+        .into_iter()
+        .filter_map(|(source, prefixes)| {
+            let bad: Vec<String> = prefixes
+                .iter()
+                .filter(|p| !is_parseable_id_prefix(p))
+                .map(|p| format!("'{p}'"))
+                .collect();
+            (!bad.is_empty()).then(|| {
+                format!(
+                    "Warning [{UNPARSEABLE_ID_PREFIX_CODE}]: {source} contains {}, which no \
+                     heading can match: an ID prefix starts with an ASCII uppercase letter and \
+                     continues with ASCII uppercase letters or digits only (e.g. RB, RB2, NFR2). \
+                     The value was saved as given; items written under it will not be \
+                     recognized.",
+                    bad.join(", ")
+                )
+            })
+        })
+        .collect()
 }
 
 /// Returns true when `key` matches the pattern `milestones.<name>.status`,

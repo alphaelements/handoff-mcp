@@ -359,3 +359,127 @@ fn an_invalid_orphan_guard_in_a_batch_writes_nothing() {
     );
     assert!(!config_text(&pd).contains("done_guard"));
 }
+
+// -- t468: `[trace.id_prefixes]` values the heading parser cannot match --
+
+const UNPARSEABLE_ID_PREFIX: &str = "Warning [UNPARSEABLE_ID_PREFIX]";
+
+#[test]
+fn id_prefixes_of_uppercase_letters_and_digits_are_accepted_without_a_warning() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "trace.id_prefixes.requirement": ["RB", "RB2", "NFR2", "R2D2"] }),
+    );
+    assert!(!is_error(&resp), "{}", text(&resp));
+    assert!(
+        !text(&resp).contains(UNPARSEABLE_ID_PREFIX),
+        "digits mixed with uppercase must be accepted silently: {}",
+        text(&resp)
+    );
+    assert!(config_text(&pd).contains("RB2"));
+}
+
+#[test]
+fn an_id_prefix_no_heading_can_match_is_saved_with_a_warning_naming_it() {
+    for bad in ["rb", "Rb2", "2RB", "RB-2", "RB_2", "要件", ""] {
+        let (_d, pd) = setup();
+        let resp = update(
+            &pd,
+            json!({ "trace.id_prefixes.requirement": ["RB2", bad] }),
+        );
+        let reply = text(&resp);
+        assert!(
+            !is_error(&resp),
+            "{bad:?} warns, it does not reject: {reply}"
+        );
+        let warning = reply
+            .lines()
+            .find(|l| l.starts_with(UNPARSEABLE_ID_PREFIX))
+            .unwrap_or_else(|| panic!("{bad:?} must be warned about: {reply}"));
+        assert!(
+            warning.contains("trace.id_prefixes.requirement")
+                && warning.contains(&format!("'{bad}'")),
+            "the warning names the key and the prefix: {warning}"
+        );
+        assert!(
+            !warning.contains("'RB2'"),
+            "the parseable prefix of the same list is not named: {warning}"
+        );
+        // Warn, not block: the value is written as given.
+        let cfg = get_config(&pd);
+        assert_eq!(
+            cfg["trace"]["id_prefixes"]["requirement"],
+            json!(["RB2", bad]),
+            "{cfg}"
+        );
+    }
+}
+
+#[test]
+fn a_whole_id_prefixes_table_is_checked_per_layer() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "trace.id_prefixes": { "requirement": ["UC"], "basic_spec": ["ui"] } }),
+    );
+    let reply = text(&resp);
+    assert!(!is_error(&resp), "{reply}");
+    let warnings: Vec<&str> = reply
+        .lines()
+        .filter(|l| l.starts_with(UNPARSEABLE_ID_PREFIX))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{reply}");
+    assert!(
+        warnings[0].contains("trace.id_prefixes.basic_spec") && warnings[0].contains("'ui'"),
+        "{reply}"
+    );
+}
+
+#[test]
+fn an_unparseable_prefix_already_in_the_file_does_not_warn_on_an_unrelated_update() {
+    let (_d, pd) = setup();
+    let first = update(&pd, json!({ "trace.id_prefixes.requirement": ["rb"] }));
+    assert!(
+        text(&first).contains(UNPARSEABLE_ID_PREFIX),
+        "{}",
+        text(&first)
+    );
+
+    // Neither another trace key nor another layer's prefix list repeats it.
+    let resp = update(&pd, json!({ "trace.done_guard": "warn" }));
+    assert!(
+        !text(&resp).contains(UNPARSEABLE_ID_PREFIX),
+        "{}",
+        text(&resp)
+    );
+    let resp = update(&pd, json!({ "trace.id_prefixes.basic_spec": ["UI"] }));
+    assert!(
+        !text(&resp).contains(UNPARSEABLE_ID_PREFIX),
+        "{}",
+        text(&resp)
+    );
+}
+
+#[test]
+fn a_custom_layer_declaration_with_an_unparseable_prefix_is_warned_about() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "trace.layer": [
+            { "id": "ux_spec", "side": "left", "level": 4, "pair": "ux_test", "id_prefixes": ["Ux"] },
+            { "id": "ux_test", "side": "right", "level": 4, "pair": "ux_spec", "id_prefixes": ["UXT2"] }
+        ] }),
+    );
+    let reply = text(&resp);
+    assert!(!is_error(&resp), "{reply}");
+    let warnings: Vec<&str> = reply
+        .lines()
+        .filter(|l| l.starts_with(UNPARSEABLE_ID_PREFIX))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{reply}");
+    assert!(
+        warnings[0].contains("ux_spec") && warnings[0].contains("'Ux'"),
+        "{reply}"
+    );
+}
