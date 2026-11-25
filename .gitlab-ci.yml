@@ -1,0 +1,84 @@
+# GitLab CI for handoff-mcp
+# Runner setup: see task t-build.4
+#
+# This pipeline runs on merge requests only.
+# Release builds are handled by GitHub Actions (release.yml).
+
+default:
+  interruptible: true
+
+variables:
+  CARGO_INCREMENTAL: "1"
+  CARGO_TERM_COLOR: always
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - lint
+  - test
+  - security
+
+fmt-check:
+  stage: lint
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: lint
+  script:
+    - cargo clippy --all-targets -- -D warnings
+
+clippy-bundled-typst:
+  stage: lint
+  script:
+    - cargo clippy --all-targets --features bundled-typst -- -D warnings
+
+windows-check:
+  stage: lint
+  script:
+    - rustup target add x86_64-pc-windows-msvc 2>/dev/null || true
+    - cargo clippy --target x86_64-pc-windows-msvc --lib --bins -- -D warnings
+  allow_failure: true
+
+test:
+  stage: test
+  script:
+    - cargo test --test integration
+  variables:
+    CARGO_INCREMENTAL: "1"
+
+workflow-js-test:
+  stage: test
+  script:
+    - node --test "plugin-task-loop/workflows/lib/*.test.js"
+
+npm-distribution-test:
+  stage: test
+  script:
+    - node --test "bin/*.test.js"
+
+typst-version-check:
+  stage: test
+  script:
+    - ./scripts/check-typst-versions.sh
+
+audit:
+  stage: security
+  script:
+    - cargo audit
+  allow_failure: true
+
+deny:
+  stage: security
+  script:
+    - cargo deny check
+  allow_failure: true
+
+secrets:
+  stage: security
+  script:
+    - gitleaks detect --no-banner
+  allow_failure: true

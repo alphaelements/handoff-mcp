@@ -113,18 +113,18 @@ jobs:
       # Bundled Typst compiler (wiki/390, REQ-PDF-040/041): the release binaries
       # are built with --features bundled-typst, so the PDF-related targets must
       # also pass with it, including the template compatibility gate
-      # (tests/pdf_bundled_typst_templates.rs) that proves every built-in
+      # (tests/integration/pdf_bundled_typst_templates.rs) that proves every built-in
       # template still compiles after a typst crate bump. Stable legs only: the
       # typst crates need rustc 1.92, above the declared MSRV (1.86), which is
       # why the feature is off by default and the MSRV leg skips this step.
       #
-      # Deliberately NOT the whole suite: every integration test binary links
-      # the entire Typst compiler statically (~100+ MB each), so a full
-      # `cargo test --features bundled-typst` (~145 binaries) exhausts runner
-      # disk. The default-feature `cargo test` above already covers everything
-      # that does not touch PDF export; keep this target list in sync with
+      # Deliberately NOT the whole suite: the single `integration` test binary
+      # links the entire Typst compiler statically (~100+ MB), and running every
+      # module against the bundled compiler adds nothing for tests that do not
+      # touch PDF export (the default-feature `cargo test` above covers them).
+      # The libtest name filters select the PDF modules; keep them in sync with
       # release.yml's pdf-e2e job. Debuginfo and incremental artifacts are
-      # switched off for the same disk reason (they dominate target/ size).
+      # switched off to keep target/ small.
       - name: cargo test --features bundled-typst (PDF targets)
         if: matrix.toolchain == 'stable'
         env:
@@ -132,17 +132,9 @@ jobs:
           CARGO_INCREMENTAL: "0"
         shell: bash
         run: |
-          cargo test --features bundled-typst \
-            --lib \
-            --test pdf_bundled_typst \
-            --test pdf_bundled_typst_templates \
-            --test pdf_bundled_typst_fonts \
-            --test tool_doc_export_bundled_no_cli \
-            --test pdf_fixtures \
-            --test pdf_e2e \
-            --test pdf_export_pipeline_e2e \
-            --test pdf_template_e2e \
-            --test tool_doc_export
+          cargo test --features bundled-typst --lib
+          cargo test --features bundled-typst --test integration -- \
+            pdf_ tool_doc_export
 
       # Criterion Tier 2 benches (`cargo bench`, wiki/240-performance-design.md
       # §7) are otherwise never exercised by CI (too slow for every push, and
@@ -244,10 +236,10 @@ jobs:
       # `perf_budget_scale_s`/`perf_budget_scale_m` don't share a common
       # prefix with the L/JA/ratio tests reserved for the nightly job.
       - name: perf budget — scale S
-        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_s
+        run: cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_s
 
       - name: perf budget — scale M
-        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_m
+        run: cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_m
 
   # Nightly perf gate: scales L and JA, plus the PR-9 scale-ratio checks
   # (N: 200->3,000 tasks, D: 20->100 docs). These regenerate a large fixture
@@ -276,16 +268,16 @@ jobs:
             cargo-perf-
 
       - name: perf budget — scale L
-        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_l
+        run: cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_l
 
       - name: perf budget — scale JA
-        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_ja
+        run: cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_ja
 
       - name: perf budget — scale-ratio N (200->3,000 tasks)
-        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_ratio_n
+        run: cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_ratio_n
 
       - name: perf budget — scale-ratio D (20->100 docs)
-        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_ratio_d
+        run: cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_ratio_d
 
       # Tier 2 (criterion): baseline recorded as a build artifact rather than
       # gated — criterion has no pass/fail budget of its own here, this just

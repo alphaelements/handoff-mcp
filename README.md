@@ -1692,6 +1692,43 @@ cp -r skills/* ~/.claude/skills/
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local development gates, including
 the performance budget harness for changes to the storage/handler layers.
 
+### Build and test flow
+
+All integration tests live in a single test binary, `tests/integration/main.rs`
+(one module per former `tests/<name>.rs` file), so the suite links once instead
+of ~185 times. Run everything with `cargo test --test integration`, or one
+module with `cargo test --test integration -- <module>::`.
+
+- **Pre-commit (lefthook, fast feedback, under 60s for a typical 1-3 file
+  change)**: `cargo fmt --check`, `cargo clippy` (default features), the
+  plugin/workflow/npm sync and unit checks, and only the tests *related* to the
+  staged `.rs` files (each file stem is used as a test-name filter against the
+  lib unit tests and the `integration` binary). There is no pre-push hook.
+- **CI on merge requests (`.gitlab-ci.yml`)**: the full suite
+  (`cargo test --test integration`), clippy with and without `bundled-typst`,
+  the Windows `cfg(windows)` clippy check, workflow/npm tests, the typst
+  version-alignment check, and the security scans (`cargo audit`,
+  `cargo deny`, `gitleaks`). Until the runner is connected, run these locally
+  before opening a merge request.
+- **Releases (GitHub Actions, `release.yml`)**: unchanged tag-triggered build,
+  verification, and publish; builds run with `CARGO_INCREMENTAL=0`.
+
+### Incremental builds and disk usage
+
+Local builds use cargo's incremental compilation (`scripts/cargo-env.sh` no
+longer sets `CARGO_INCREMENTAL=0`), so a one-line change re-checks in seconds
+instead of rebuilding the crate. The trade-off is that the incremental cache
+grows with every distinct source state and feature-flag combination, and cargo
+never garbage-collects old sessions. To keep disk usage bounded:
+
+- run `cargo clean` (or delete the target directory) when it grows past what
+  you are willing to spend; a typical development target directory is tens of
+  GB, and a neglected one can reach hundreds of GB;
+- to drop only the incremental caches, delete `<target-dir>/*/incremental`
+  (they are rebuilt on demand);
+- `.cargo/config.toml` can redirect `target-dir` to a larger or non-synced
+  volume, which also keeps container and host artifacts apart.
+
 ## License
 
 MIT

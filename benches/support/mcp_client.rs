@@ -1,7 +1,7 @@
 //! Minimal real-binary stdio JSON-RPC client shared by the requirement-tree
 //! bench (`benches/trace_tree.rs`) and the determinism test
-//! (`tests/trace_tree_determinism.rs`), plus the loader that saves the
-//! synthetic corpus of [`crate::tree_synth`] into a fresh project.
+//! (`tests/integration/trace_tree_determinism.rs`), plus the loader that saves the
+//! synthetic corpus of [`super::tree_synth`] into a fresh project.
 
 #![allow(dead_code)] // each including crate uses a different subset
 
@@ -110,7 +110,7 @@ impl Server {
     /// Saves every document of the synthetic corpus (upper layers first, so a
     /// `- parent:` / `- refines:` target always exists already).
     pub fn load_synthetic(&mut self) {
-        for doc in crate::tree_synth::synth_docs() {
+        for doc in super::tree_synth::synth_docs() {
             let saved = self.call(
                 "handoff_doc_save",
                 json!({"slug": doc.slug, "title": doc.slug, "body": doc.body, "layer": doc.layer}),
