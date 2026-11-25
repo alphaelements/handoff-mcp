@@ -1707,13 +1707,15 @@ fn handle_update_locked(
     })
 }
 
-/// Stable code of the warning for a `title`/`notes` overwrite of a finished
-/// task, so consumers can match on it without parsing the sentence.
+/// Stable code of the warning for an overwrite of a finished task's
+/// `title`, `notes` or list fields, so consumers can match on it without parsing the sentence.
 pub(super) const DONE_TASK_OVERWRITE_CODE: &str = "DONE_TASK_OVERWRITE";
 
 /// One `Warning [DONE_TASK_OVERWRITE]: ...` line per field of a finished task
 /// (`done` or `review` when the call arrives) that `patch` replaces: `title`,
-/// and `notes`. A finished task is a record of the work; replacing either
+/// `notes`, and the list fields `done_criteria`, `labels`, `links`,
+/// `scope_paths` and `dependencies` (each of which a patch replaces whole). A
+/// finished task is a record of the work; replacing either
 /// destroys it, most often because a task id was reused by mistake. The write
 /// is applied all the same — the caller reports the lines, it never rejects —
 /// and the title line quotes the title it replaced so it can be put back.
@@ -1724,8 +1726,8 @@ pub(super) const DONE_TASK_OVERWRITE_CODE: &str = "DONE_TASK_OVERWRITE";
 /// - the task is in any other status as stored — `current_status` is the
 ///   status before this call, so finishing a task and retitling it in one call
 ///   is silent, while reopening a finished task under a new title is not,
-/// - the value sent equals the stored one, or there are no notes to replace:
-///   nothing is lost,
+/// - the value sent equals the stored one, or there are no notes / list
+///   entries to replace: nothing is lost,
 /// - the patch uses `notes_append`, which adds to the notes and is how a
 ///   finished task is meant to be annotated.
 ///
@@ -1759,6 +1761,39 @@ pub(super) fn done_task_overwrite_warnings(
                  task {task_id}; the previous notes were replaced. Use notes_append to add to \
                  the notes without replacing them, or force=true to suppress this warning."
             ));
+        }
+    }
+
+    // The list fields are replaced whole, so any difference from a non-empty
+    // stored list loses entries (or their checked state). Compared the way the
+    // handler stores them (`extract_*`), so a malformed entry the handler
+    // would drop is not reported as a change either.
+    let mut list_overwrite = |field: &str, replaced: bool| {
+        if replaced {
+            warnings.push(format!(
+                "Warning [{DONE_TASK_OVERWRITE_CODE}]: Overwriting {field} of {current_status} \
+                 task {task_id}. Use force=true to suppress this warning."
+            ));
+        }
+    };
+    if patch.get("done_criteria").is_some() {
+        let sent = extract_done_criteria(patch);
+        let same = sent.len() == before.done_criteria.len()
+            && sent
+                .iter()
+                .zip(&before.done_criteria)
+                .all(|(a, b)| a.item == b.item && a.checked == b.checked);
+        list_overwrite("done_criteria", !before.done_criteria.is_empty() && !same);
+    }
+    for (field, stored) in [
+        ("labels", &before.labels),
+        ("links", &before.links),
+        ("scope_paths", &before.scope_paths),
+        ("dependencies", &before.dependencies),
+    ] {
+        if patch.get(field).is_some() {
+            let sent = extract_string_array(patch, field);
+            list_overwrite(field, !stored.is_empty() && &sent != stored);
         }
     }
     warnings
@@ -2180,6 +2215,66 @@ mod done_task_overwrite_tests {
         // A non-string title/notes is not applied by the handler either.
         let odd = json!({ "title": 5, "notes": null });
         assert!(warn("done", &before, odd, false).is_empty());
+    }
+
+    fn task_with_lists() -> TaskData {
+        let mut t = task("Ship the parser", None);
+        t.labels = vec!["a".into()];
+        t.links = vec!["l".into()];
+        t.scope_paths = vec!["src/".into()];
+        t.dependencies = vec!["t1".into()];
+        t.done_criteria = vec![DoneCriterion {
+            item: "x".into(),
+            checked: true,
+        }];
+        t
+    }
+
+    #[test]
+    fn replacing_a_stored_list_field_is_reported_per_field() {
+        let before = task_with_lists();
+        let patches = [
+            ("done_criteria", json!([{ "item": "x", "checked": false }])),
+            ("labels", json!([])),
+            ("links", json!(["other"])),
+            ("scope_paths", json!(["a", "b"])),
+            ("dependencies", json!(["t2"])),
+        ];
+        for (field, value) in patches {
+            let w = warn("review", &before, json!({ field: value }), false);
+            assert_eq!(
+                w,
+                vec![format!(
+                    "Warning [DONE_TASK_OVERWRITE]: Overwriting {field} of review task t467. \
+                     Use force=true to suppress this warning."
+                )]
+            );
+            assert!(warn("done", &before, json!({ field: [] }), true).is_empty());
+            assert!(warn("todo", &before, json!({ field: [] }), false).is_empty());
+        }
+    }
+
+    #[test]
+    fn unchanged_or_previously_empty_lists_lose_nothing() {
+        let before = task_with_lists();
+        let same = json!({
+            "labels": ["a"],
+            "links": ["l"],
+            "scope_paths": ["src/"],
+            "dependencies": ["t1"],
+            "done_criteria": [{ "item": "x", "checked": true }],
+        });
+        assert!(warn("done", &before, same, false).is_empty());
+
+        let empty = task("Ship the parser", None);
+        let fill = json!({
+            "labels": ["a"],
+            "links": ["l"],
+            "scope_paths": ["src/"],
+            "dependencies": ["t1"],
+            "done_criteria": [{ "item": "x" }],
+        });
+        assert!(warn("done", &empty, fill, false).is_empty());
     }
 }
 

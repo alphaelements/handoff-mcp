@@ -2,7 +2,8 @@
 //! over stdio JSON-RPC.
 //!
 //! A task in `done` or `review` is a record of finished work. Replacing its
-//! title or its notes destroys that record, most often because a task id was
+//! title, notes or list fields (done_criteria, labels, links, scope_paths,
+//! dependencies) destroys that record, most often because a task id was
 //! reused by mistake. The write is still applied (a warning, not a rejection),
 //! but the reply says which field of which task was overwritten. `force=true`
 //! states the overwrite is intended and keeps the reply quiet, and
@@ -236,19 +237,190 @@ fn resending_the_stored_value_or_filling_empty_notes_does_not_warn() {
     assert!(!reply.contains(CODE), "same notes: {reply}");
 }
 
-/// Fields other than title and notes are outside this warning.
+/// Fields outside the guarded set never warn, and a guarded list field that
+/// holds nothing yet loses nothing when it is filled in.
 #[test]
-fn other_fields_of_a_done_task_do_not_warn() {
+fn unguarded_fields_and_filling_an_empty_list_do_not_warn() {
     let (_sandbox, mut server) = project();
     task_in(&mut server, "done");
 
     for task in [
         json!({ "id": "t1", "priority": "high" }),
-        json!({ "id": "t1", "labels": ["x"] }),
         json!({ "id": "t1", "schedule": { "estimate_hours": 2 } }),
+        json!({ "id": "t1", "labels": ["x"] }),
+        json!({ "id": "t1", "links": ["https://example.com"] }),
+        json!({ "id": "t1", "scope_paths": ["src/"] }),
+        json!({ "id": "t1", "done_criteria": [{ "item": "a" }] }),
     ] {
         let reply = update(&mut server, task.clone());
         assert!(!reply.contains(CODE), "{task}: {reply}");
+    }
+}
+
+/// Creates `t1` with every list field populated, then moves it to `status`.
+fn task_with_lists_in(server: &mut Server, status: &str) {
+    server.ok(
+        "handoff_update_task",
+        json!({ "task": {
+            "title": "Original title",
+            "notes": "original notes",
+            "labels": ["a", "b"],
+            "links": ["https://example.com/old"],
+            "scope_paths": ["src/old.rs"],
+            "done_criteria": [
+                { "item": "first", "checked": true },
+                { "item": "second", "checked": true },
+            ],
+            "schedule": { "estimate_hours": 1 },
+        } }),
+    );
+    server.ok(
+        "handoff_update_task",
+        json!({ "task": { "id": "t1", "status": status } }),
+    );
+}
+
+/// `(field, replacement value)` for every list field the warning covers.
+fn list_field_patches() -> Vec<(&'static str, Value)> {
+    vec![
+        ("done_criteria", json!([{ "item": "other" }])),
+        ("labels", json!(["z"])),
+        ("links", json!(["https://example.com/new"])),
+        ("scope_paths", json!(["src/new.rs"])),
+    ]
+}
+
+#[test]
+fn overwriting_a_list_field_of_a_done_task_warns_and_still_writes() {
+    for (field, value) in list_field_patches() {
+        let (_sandbox, mut server) = project();
+        task_with_lists_in(&mut server, "done");
+
+        let reply = update(&mut server, json!({ "id": "t1", field: value.clone() }));
+        assert_eq!(
+            warnings(&reply),
+            vec![format!(
+                "Warning [DONE_TASK_OVERWRITE]: Overwriting {field} of done task t1. Use \
+                 force=true to suppress this warning."
+            )],
+            "{field}: {reply}"
+        );
+        assert_eq!(
+            stored(&mut server)[field].as_array().unwrap().len(),
+            value.as_array().unwrap().len(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn overwriting_dependencies_of_a_done_task_warns_and_still_writes() {
+    let (_sandbox, mut server) = project();
+    task_with_lists_in(&mut server, "done");
+    for title in ["Dep one", "Dep two"] {
+        server.ok("handoff_update_task", json!({ "task": { "title": title } }));
+    }
+    // Filling the empty dependency list loses nothing.
+    let reply = update(&mut server, json!({ "id": "t1", "dependencies": ["t2"] }));
+    assert!(!reply.contains(CODE), "{reply}");
+
+    let reply = update(&mut server, json!({ "id": "t1", "dependencies": ["t3"] }));
+    assert_eq!(
+        warnings(&reply),
+        vec![
+            "Warning [DONE_TASK_OVERWRITE]: Overwriting dependencies of done task t1. Use \
+             force=true to suppress this warning."
+        ],
+        "{reply}"
+    );
+    assert_eq!(stored(&mut server)["dependencies"], json!(["t3"]));
+}
+
+#[test]
+fn a_review_task_warns_for_list_fields_too() {
+    let (_sandbox, mut server) = project();
+    task_with_lists_in(&mut server, "review");
+
+    let reply = update(&mut server, json!({ "id": "t1", "labels": ["z"] }));
+    assert_eq!(warnings(&reply).len(), 1, "{reply}");
+    assert!(
+        reply.contains("Overwriting labels of review task t1"),
+        "{reply}"
+    );
+}
+
+#[test]
+fn several_overwritten_list_fields_warn_once_each() {
+    let (_sandbox, mut server) = project();
+    task_with_lists_in(&mut server, "done");
+
+    let reply = update(
+        &mut server,
+        json!({ "id": "t1", "labels": ["z"], "links": [], "done_criteria": [] }),
+    );
+    let lines = warnings(&reply);
+    assert_eq!(lines.len(), 3, "{reply}");
+    for field in ["done_criteria", "labels", "links"] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("Overwriting {field} of done"))),
+            "{field}: {reply}"
+        );
+    }
+}
+
+#[test]
+fn resending_the_stored_list_does_not_warn() {
+    let (_sandbox, mut server) = project();
+    task_with_lists_in(&mut server, "done");
+
+    let reply = update(
+        &mut server,
+        json!({
+            "id": "t1",
+            "labels": ["a", "b"],
+            "links": ["https://example.com/old"],
+            "scope_paths": ["src/old.rs"],
+            "done_criteria": [
+                { "item": "first", "checked": true },
+                { "item": "second", "checked": true },
+            ],
+        }),
+    );
+    assert!(!reply.contains(CODE), "{reply}");
+}
+
+#[test]
+fn force_suppresses_list_field_warnings_and_the_write_is_applied() {
+    let (_sandbox, mut server) = project();
+    task_with_lists_in(&mut server, "done");
+
+    let reply = forced(
+        &mut server,
+        json!({ "id": "t1", "labels": ["z"], "done_criteria": [{ "item": "other" }] }),
+    );
+    assert!(!reply.contains(CODE), "{reply}");
+    assert_eq!(stored(&mut server)["labels"], json!(["z"]));
+}
+
+#[test]
+fn list_fields_of_open_tasks_are_never_warned_about() {
+    for status in ["todo", "in_progress", "blocked"] {
+        let (_sandbox, mut server) = project();
+        task_with_lists_in(&mut server, status);
+
+        let reply = update(
+            &mut server,
+            json!({
+                "id": "t1",
+                "labels": ["z"],
+                "links": [],
+                "scope_paths": [],
+                "done_criteria": [{ "item": "other" }],
+            }),
+        );
+        assert!(!reply.contains(CODE), "{status}: {reply}");
     }
 }
 
@@ -314,4 +486,22 @@ fn bulk_update_does_not_warn_for_append_force_or_an_open_task() {
     assert_eq!(result["applied"], 1, "{result}");
     assert!(result.get("warnings").is_none(), "force: {result}");
     assert_eq!(stored(&mut server)["notes"], "replaced");
+}
+
+/// `handoff_bulk_update_tasks` does not accept the list fields at all, so it
+/// can never overwrite them: the whole update is rejected and nothing is
+/// written.
+#[test]
+fn bulk_update_rejects_list_fields_instead_of_overwriting_them() {
+    let (_sandbox, mut server) = project();
+    task_with_lists_in(&mut server, "done");
+
+    let result = bulk(
+        &mut server,
+        json!([{ "task_id": "t1", "labels": ["z"], "done_criteria": [{ "item": "x" }] }]),
+        false,
+    );
+    assert_eq!(result["applied"], 0, "{result}");
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(stored(&mut server)["labels"], json!(["a", "b"]));
 }

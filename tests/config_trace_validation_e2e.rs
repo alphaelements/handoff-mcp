@@ -483,3 +483,80 @@ fn a_custom_layer_declaration_with_an_unparseable_prefix_is_warned_about() {
         "{reply}"
     );
 }
+
+// -- t470: a bare string for `trace.id_prefixes.<layer>` must not corrupt config.toml --
+
+#[test]
+fn a_bare_string_id_prefix_is_wrapped_to_an_array_with_a_warning() {
+    let (_d, pd) = setup();
+    let resp = update(&pd, json!({ "trace.id_prefixes.requirement": "RB2" }));
+    let reply = text(&resp);
+    assert!(!is_error(&resp), "{reply}");
+    assert!(
+        reply.contains("Warning: trace.id_prefixes.requirement was a string; wrapped to array"),
+        "the wrap is reported: {reply}"
+    );
+    let raw = config_text(&pd);
+    assert!(
+        !raw.contains("requirement = \"RB2\""),
+        "a bare string must not reach config.toml: {raw}"
+    );
+    assert!(raw.contains("requirement = [\"RB2\"]"), "{raw}");
+    // The file still parses: the value reads back as the array, not as defaults.
+    assert_eq!(
+        get_config(&pd)["trace"]["id_prefixes"]["requirement"],
+        json!(["RB2"])
+    );
+}
+
+#[test]
+fn an_array_id_prefix_is_written_unchanged_and_without_a_wrap_warning() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "trace.id_prefixes.requirement": ["RB2", "UC"] }),
+    );
+    let reply = text(&resp);
+    assert!(!is_error(&resp), "{reply}");
+    assert!(!reply.contains("wrapped to array"), "{reply}");
+    assert_eq!(
+        get_config(&pd)["trace"]["id_prefixes"]["requirement"],
+        json!(["RB2", "UC"])
+    );
+}
+
+#[test]
+fn bare_strings_inside_a_whole_id_prefixes_table_are_wrapped() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "trace.id_prefixes": { "requirement": "RB2", "basic_spec": ["UI"] } }),
+    );
+    let reply = text(&resp);
+    assert!(!is_error(&resp), "{reply}");
+    assert!(
+        reply.contains("trace.id_prefixes.requirement was a string; wrapped to array"),
+        "{reply}"
+    );
+    let cfg = get_config(&pd);
+    assert_eq!(cfg["trace"]["id_prefixes"]["requirement"], json!(["RB2"]));
+    assert_eq!(cfg["trace"]["id_prefixes"]["basic_spec"], json!(["UI"]));
+}
+
+#[test]
+fn a_non_string_non_array_id_prefix_is_rejected_telling_to_pass_an_array() {
+    for bad in [json!(5), json!(true), json!(null), json!({ "a": "B" })] {
+        let (_d, pd) = setup();
+        assert_rejected(
+            &pd,
+            json!({ "trace.id_prefixes.requirement": bad }),
+            "array of strings",
+        );
+    }
+    let (_d, pd) = setup();
+    assert_rejected(
+        &pd,
+        json!({ "trace.id_prefixes.requirement": ["RB2", 5] }),
+        "array of strings",
+    );
+}

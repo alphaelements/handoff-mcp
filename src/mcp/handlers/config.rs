@@ -500,6 +500,12 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 continue;
             }
 
+            // A bare string where `[trace.id_prefixes]` wants an array would
+            // make the whole `[trace]` table unparseable on the next load.
+            let (value, wrap_warnings) = normalize_id_prefixes_value(key, value)?;
+            applied.extend(wrap_warnings);
+            let value = &value;
+
             match set_toml_value(&mut doc, &parts, value) {
                 Ok(()) => applied.push(format!("{key} = {value}")),
                 Err(e) => applied.push(format!("{key}: error ({e})")),
@@ -902,6 +908,69 @@ fn is_milestone_status_key(key: &str) -> bool {
     parts.len() == 3 && parts[0] == "milestones" && parts[2] == "status"
 }
 
+/// Dotted key of the `[trace.id_prefixes]` table (layer id -> array of prefixes).
+const ID_PREFIXES_KEY: &str = "trace.id_prefixes";
+
+/// Makes a raw update's value safe for `[trace.id_prefixes]`, whose layer
+/// entries must be arrays of strings (`HashMap<String, Vec<String>>`). A bare
+/// string is wrapped into a one-element array and reported in the returned
+/// warnings; anything else that is not an array of strings is rejected, since
+/// writing it would leave a `config.toml` whose `[trace]` table no longer
+/// parses. The check covers the layer key (`trace.id_prefixes.<layer>`), the
+/// whole table (`trace.id_prefixes`) and a whole `trace` object. Keys outside
+/// that area pass through unchanged.
+fn normalize_id_prefixes_value(key: &str, value: &Value) -> Result<(Value, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let normalized = normalize_id_prefixes_at(key, value, &mut warnings)?;
+    Ok((normalized, warnings))
+}
+
+fn normalize_id_prefixes_at(
+    path: &str,
+    value: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<Value> {
+    if path == "trace" {
+        if let Value::Object(obj) = value {
+            let mut obj = obj.clone();
+            if let Some(table) = obj.get("id_prefixes") {
+                let table = normalize_id_prefixes_at(ID_PREFIXES_KEY, table, warnings)?;
+                obj.insert("id_prefixes".to_string(), table);
+            }
+            return Ok(Value::Object(obj));
+        }
+    } else if path == ID_PREFIXES_KEY {
+        let Value::Object(obj) = value else {
+            anyhow::bail!(
+                "{ID_PREFIXES_KEY} must be a table mapping each layer to an array of \
+                 strings, e.g. {{\"requirement\": [\"RB2\"]}}"
+            );
+        };
+        let mut out = serde_json::Map::new();
+        for (layer, v) in obj {
+            let leaf = format!("{ID_PREFIXES_KEY}.{layer}");
+            out.insert(layer.clone(), normalize_id_prefixes_at(&leaf, v, warnings)?);
+        }
+        return Ok(Value::Object(out));
+    } else if path
+        .strip_prefix(ID_PREFIXES_KEY)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|layer| !layer.contains('.'))
+    {
+        match value {
+            Value::String(s) => {
+                warnings.push(format!(
+                    "Warning: {path} was a string; wrapped to array [{s:?}]"
+                ));
+                return Ok(Value::Array(vec![value.clone()]));
+            }
+            Value::Array(items) if items.iter().all(Value::is_string) => return Ok(value.clone()),
+            _ => anyhow::bail!("{path} must be an array of strings, e.g. [\"RB2\"]; got {value}"),
+        }
+    }
+    Ok(value.clone())
+}
+
 /// Deepest dotted key `handoff_update_config` accepts (`a.b.c.d`).
 const MAX_KEY_DEPTH: usize = 4;
 
@@ -969,6 +1038,52 @@ mod tests {
             handoff_dir,
         };
         (tmp, ctx)
+    }
+
+    #[test]
+    fn id_prefixes_value_wraps_a_string_and_leaves_arrays_and_other_keys_alone() {
+        let (v, w) =
+            normalize_id_prefixes_value("trace.id_prefixes.requirement", &json!("RB2")).unwrap();
+        assert_eq!(v, json!(["RB2"]));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("trace.id_prefixes.requirement") && w[0].contains("[\"RB2\"]"));
+
+        let (v, w) =
+            normalize_id_prefixes_value("trace.id_prefixes.requirement", &json!(["A", "B"]))
+                .unwrap();
+        assert_eq!((v, w.len()), (json!(["A", "B"]), 0));
+
+        let (v, w) = normalize_id_prefixes_value("trace.profile", &json!("standard")).unwrap();
+        assert_eq!((v, w.len()), (json!("standard"), 0));
+    }
+
+    #[test]
+    fn id_prefixes_value_wraps_strings_nested_in_a_trace_object() {
+        let (v, w) = normalize_id_prefixes_value(
+            "trace",
+            &json!({ "profile": "full", "id_prefixes": { "requirement": "RB2", "basic_spec": ["UI"] } }),
+        )
+        .unwrap();
+        assert_eq!(v["id_prefixes"]["requirement"], json!(["RB2"]));
+        assert_eq!(v["id_prefixes"]["basic_spec"], json!(["UI"]));
+        assert_eq!(v["profile"], json!("full"));
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn id_prefixes_value_rejects_non_array_values_naming_the_array_form() {
+        for (key, bad) in [
+            ("trace.id_prefixes.requirement", json!(5)),
+            ("trace.id_prefixes.requirement", json!(["A", 1])),
+            ("trace.id_prefixes.requirement", json!({ "a": "b" })),
+            ("trace.id_prefixes", json!("RB2")),
+            ("trace.id_prefixes", json!({ "requirement": 7 })),
+        ] {
+            let err = normalize_id_prefixes_value(key, &bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("array of strings"), "{key} {bad}: {err}");
+        }
     }
 
     #[test]
