@@ -10,6 +10,7 @@ use crate::storage::config::{
 };
 use crate::storage::config_preset::plan_preset;
 use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::layer_parse::is_parseable_id_prefix;
 use crate::trace::profile::BUILTIN_PROFILE_NAMES;
 
 pub fn handle_get(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
@@ -499,6 +500,12 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 continue;
             }
 
+            // A bare string where `[trace.id_prefixes]` wants an array would
+            // make the whole `[trace]` table unparseable on the next load.
+            let (value, wrap_warnings) = normalize_id_prefixes_value(key, value)?;
+            applied.extend(wrap_warnings);
+            let value = &value;
+
             match set_toml_value(&mut doc, &parts, value) {
                 Ok(()) => applied.push(format!("{key} = {value}")),
                 Err(e) => applied.push(format!("{key}: error ({e})")),
@@ -537,6 +544,10 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
             }
         }
         validate_raw_assignee_work_hours(&doc, updates.keys().map(String::as_str))?;
+        applied.extend(unparseable_id_prefix_warnings(
+            updates.keys().map(String::as_str),
+            &rendered,
+        ));
         typed_rendered = Some(rendered);
     }
 
@@ -803,6 +814,90 @@ fn validate_trace_scalar_keys<'a>(
     Ok(())
 }
 
+/// Code of the warning `handoff_update_config` adds for an ID prefix the
+/// heading parser can never match.
+const UNPARSEABLE_ID_PREFIX_CODE: &str = "UNPARSEABLE_ID_PREFIX";
+
+/// One `Warning [UNPARSEABLE_ID_PREFIX]: ...` line per ID prefix written by
+/// this update that no heading can match (see [`is_parseable_id_prefix`]:
+/// lowercase, a leading digit, `-`, non-ASCII, empty, ...). Such a prefix is
+/// saved as given — it is a warning, not a rejection — but an item written
+/// under it would never be recognized, so the caller is told at the moment
+/// the prefix is registered instead of after a document comes back empty.
+///
+/// Only what the update touched is checked, like the other trace keys: a
+/// `trace.id_prefixes.<layer>` key checks that layer's list, `trace.id_prefixes`
+/// (or `trace`) every list, and `trace.layer` (or `trace`) the `id_prefixes`
+/// of each `[[trace.layer]]` declaration. A config the update left unparsable
+/// yields nothing here; it is not this check's finding.
+fn unparseable_id_prefix_warnings<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    rendered: &str,
+) -> Vec<String> {
+    const TABLE_KEY: &str = "trace.id_prefixes";
+    let (mut all_layers, mut custom_layers) = (false, false);
+    let mut touched_layers: Vec<&str> = Vec::new();
+    for key in keys {
+        match key {
+            "trace" => (all_layers, custom_layers) = (true, true),
+            TABLE_KEY => all_layers = true,
+            "trace.layer" => custom_layers = true,
+            k => {
+                if let Some(layer) = k
+                    .strip_prefix(TABLE_KEY)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                {
+                    touched_layers.push(layer);
+                }
+            }
+        }
+    }
+    if !(all_layers || custom_layers) && touched_layers.is_empty() {
+        return Vec::new();
+    }
+    let Ok(config) = toml::from_str::<Config>(rendered) else {
+        return Vec::new();
+    };
+    let trace = &config.trace;
+
+    let mut lists: Vec<(String, &[String])> = trace
+        .id_prefixes
+        .iter()
+        .filter(|(layer, _)| all_layers || touched_layers.contains(&layer.as_str()))
+        .map(|(layer, prefixes)| (format!("{TABLE_KEY}.{layer}"), prefixes.as_slice()))
+        .collect();
+    if custom_layers {
+        lists.extend(trace.layer.iter().map(|l| {
+            (
+                format!("trace.layer '{}' id_prefixes", l.id),
+                l.id_prefixes.as_slice(),
+            )
+        }));
+    }
+    lists.sort_by(|a, b| a.0.cmp(&b.0));
+
+    lists
+        .into_iter()
+        .filter_map(|(source, prefixes)| {
+            let bad: Vec<String> = prefixes
+                .iter()
+                .filter(|p| !is_parseable_id_prefix(p))
+                .map(|p| format!("'{p}'"))
+                .collect();
+            (!bad.is_empty()).then(|| {
+                format!(
+                    "Warning [{UNPARSEABLE_ID_PREFIX_CODE}]: {source} contains {}, which no \
+                     heading can match: an ID prefix starts with an ASCII uppercase letter and \
+                     continues with ASCII uppercase letters or digits only (e.g. RB, RB2, NFR2). \
+                     The value was saved as given; items written under it will not be \
+                     recognized.",
+                    bad.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
 /// Returns true when `key` matches the pattern `milestones.<name>.status`,
 /// i.e. it starts with `milestones.`, ends with `.status`, and has exactly
 /// three dot-separated parts.  Such keys must be rejected by
@@ -811,6 +906,69 @@ fn validate_trace_scalar_keys<'a>(
 fn is_milestone_status_key(key: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
     parts.len() == 3 && parts[0] == "milestones" && parts[2] == "status"
+}
+
+/// Dotted key of the `[trace.id_prefixes]` table (layer id -> array of prefixes).
+const ID_PREFIXES_KEY: &str = "trace.id_prefixes";
+
+/// Makes a raw update's value safe for `[trace.id_prefixes]`, whose layer
+/// entries must be arrays of strings (`HashMap<String, Vec<String>>`). A bare
+/// string is wrapped into a one-element array and reported in the returned
+/// warnings; anything else that is not an array of strings is rejected, since
+/// writing it would leave a `config.toml` whose `[trace]` table no longer
+/// parses. The check covers the layer key (`trace.id_prefixes.<layer>`), the
+/// whole table (`trace.id_prefixes`) and a whole `trace` object. Keys outside
+/// that area pass through unchanged.
+fn normalize_id_prefixes_value(key: &str, value: &Value) -> Result<(Value, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let normalized = normalize_id_prefixes_at(key, value, &mut warnings)?;
+    Ok((normalized, warnings))
+}
+
+fn normalize_id_prefixes_at(
+    path: &str,
+    value: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<Value> {
+    if path == "trace" {
+        if let Value::Object(obj) = value {
+            let mut obj = obj.clone();
+            if let Some(table) = obj.get("id_prefixes") {
+                let table = normalize_id_prefixes_at(ID_PREFIXES_KEY, table, warnings)?;
+                obj.insert("id_prefixes".to_string(), table);
+            }
+            return Ok(Value::Object(obj));
+        }
+    } else if path == ID_PREFIXES_KEY {
+        let Value::Object(obj) = value else {
+            anyhow::bail!(
+                "{ID_PREFIXES_KEY} must be a table mapping each layer to an array of \
+                 strings, e.g. {{\"requirement\": [\"RB2\"]}}"
+            );
+        };
+        let mut out = serde_json::Map::new();
+        for (layer, v) in obj {
+            let leaf = format!("{ID_PREFIXES_KEY}.{layer}");
+            out.insert(layer.clone(), normalize_id_prefixes_at(&leaf, v, warnings)?);
+        }
+        return Ok(Value::Object(out));
+    } else if path
+        .strip_prefix(ID_PREFIXES_KEY)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|layer| !layer.contains('.'))
+    {
+        match value {
+            Value::String(s) => {
+                warnings.push(format!(
+                    "Warning: {path} was a string; wrapped to array [{s:?}]"
+                ));
+                return Ok(Value::Array(vec![value.clone()]));
+            }
+            Value::Array(items) if items.iter().all(Value::is_string) => return Ok(value.clone()),
+            _ => anyhow::bail!("{path} must be an array of strings, e.g. [\"RB2\"]; got {value}"),
+        }
+    }
+    Ok(value.clone())
 }
 
 /// Deepest dotted key `handoff_update_config` accepts (`a.b.c.d`).
@@ -880,6 +1038,52 @@ mod tests {
             handoff_dir,
         };
         (tmp, ctx)
+    }
+
+    #[test]
+    fn id_prefixes_value_wraps_a_string_and_leaves_arrays_and_other_keys_alone() {
+        let (v, w) =
+            normalize_id_prefixes_value("trace.id_prefixes.requirement", &json!("RB2")).unwrap();
+        assert_eq!(v, json!(["RB2"]));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("trace.id_prefixes.requirement") && w[0].contains("[\"RB2\"]"));
+
+        let (v, w) =
+            normalize_id_prefixes_value("trace.id_prefixes.requirement", &json!(["A", "B"]))
+                .unwrap();
+        assert_eq!((v, w.len()), (json!(["A", "B"]), 0));
+
+        let (v, w) = normalize_id_prefixes_value("trace.profile", &json!("standard")).unwrap();
+        assert_eq!((v, w.len()), (json!("standard"), 0));
+    }
+
+    #[test]
+    fn id_prefixes_value_wraps_strings_nested_in_a_trace_object() {
+        let (v, w) = normalize_id_prefixes_value(
+            "trace",
+            &json!({ "profile": "full", "id_prefixes": { "requirement": "RB2", "basic_spec": ["UI"] } }),
+        )
+        .unwrap();
+        assert_eq!(v["id_prefixes"]["requirement"], json!(["RB2"]));
+        assert_eq!(v["id_prefixes"]["basic_spec"], json!(["UI"]));
+        assert_eq!(v["profile"], json!("full"));
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn id_prefixes_value_rejects_non_array_values_naming_the_array_form() {
+        for (key, bad) in [
+            ("trace.id_prefixes.requirement", json!(5)),
+            ("trace.id_prefixes.requirement", json!(["A", 1])),
+            ("trace.id_prefixes.requirement", json!({ "a": "b" })),
+            ("trace.id_prefixes", json!("RB2")),
+            ("trace.id_prefixes", json!({ "requirement": 7 })),
+        ] {
+            let err = normalize_id_prefixes_value(key, &bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("array of strings"), "{key} {bad}: {err}");
+        }
     }
 
     #[test]

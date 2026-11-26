@@ -480,7 +480,7 @@ fn known_mode<'a>(value: Option<&'a str>, accepted: &[&str]) -> &'a str {
 /// Pipeline profiles `[session_loop] profile` accepts, cheapest first. This
 /// restates `PROFILES` in `plugin-task-loop/workflows/lib/profile.js` — the
 /// source of truth, since the workflow's `resolveProfile` is what finally
-/// accepts or rejects the value; `tests/storage_config.rs` fails if the two
+/// accepts or rejects the value; `tests/integration/storage_config.rs` fails if the two
 /// drift apart.
 pub const SESSION_LOOP_PROFILES: &[&str] = &["express", "standard", "full", "elite"];
 

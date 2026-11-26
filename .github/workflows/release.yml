@@ -24,6 +24,10 @@ env:
   # See ci.yml: unbounded parallelism OOMs the runner, and rustc reports the
   # kill as a misleading "can't find crate" error rather than an OOM.
   CARGO_BUILD_JOBS: 2
+  # Release builds start from a clean checkout, so an incremental cache would
+  # only cost disk and slow the build. (Local dev keeps incremental on; see
+  # scripts/cargo-env.sh.)
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # One prebuilt binary per published target.
@@ -325,14 +329,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --features bundled-typst \
-            --test pdf_bundled_typst_fonts \
-            --test pdf_fixtures \
-            --test pdf_e2e \
-            --test pdf_export_pipeline_e2e \
-            --test pdf_template_e2e \
-            --test tool_doc_export \
-            -- --nocapture 2>&1 | tee pdf-e2e.log
+          cargo test --features bundled-typst --test integration -- \
+            pdf_bundled_typst_fonts pdf_fixtures pdf_e2e \
+            pdf_export_pipeline_e2e pdf_template_e2e tool_doc_export \
+            --nocapture 2>&1 | tee pdf-e2e.log
           if grep -q 'SKIPPED' pdf-e2e.log; then
             echo "::error::a PDF E2E test skipped despite HANDOFF_REQUIRE_* being set"
             grep 'SKIPPED' pdf-e2e.log

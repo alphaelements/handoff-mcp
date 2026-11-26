@@ -28,7 +28,9 @@ use crate::storage::docs::code_hash;
 use crate::storage::docs::doc_type::infer_doc_type;
 use crate::storage::docs::filter::DocFilter;
 use crate::storage::docs::layer::LayerRegistry;
-use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
+use crate::storage::docs::layer_parse::{
+    default_prefix_table, id_prefix_of, parse_layer_body, ParsedItem,
+};
 use crate::storage::docs::layer_sync::{
     compute_layer_sync_stamp, resolve_doc_implicit_acceptance, sync_layer_items_with_options,
     PendingBaseline,
@@ -4086,8 +4088,8 @@ pub(crate) fn summary_compare_serialize_count(path: &Path) -> usize {
 /// (non-skipped) derived-file write appends one `"{path}\t{bytes}\n"` line
 /// to it — letting a test bracket a single request's log growth to assert
 /// the discipline directly, and read the exact byte count instead of
-/// approximating it via a `stat` before/after (`tests/perf_budget.rs`'s
-/// `measure_wchar_split`, `tests/derived_summary_write_discipline.rs`).
+/// approximating it via a `stat` before/after (`tests/integration/perf_budget.rs`'s
+/// `measure_wchar_split`, `tests/integration/derived_summary_write_discipline.rs`).
 /// A no-op (one extra `env::var` lookup, negligible next to the write it
 /// accompanies) whenever the env var is unset, i.e. always in normal
 /// operation — this never changes production behavior.
@@ -4813,8 +4815,9 @@ struct LinkMutationOutcome {
 
 /// Builds the " Possible cause: ..." suffix appended to a "Could not resolve
 /// requirement stable_id(s)" warning when at least one unresolved stable_id
-/// starts with an uppercase prefix (len >= 2) that no layer allows (t392) —
-/// e.g. `RQ-VGAP-001` when only `REQ`/`FR`/`NFR`/... are registered. Returns
+/// starts with a prefix ([`id_prefix_of`], at least 2 leading uppercase
+/// letters) that no layer allows (t392) — e.g. `RQ-VGAP-001` when only
+/// `REQ`/`FR`/`NFR`/... are registered, or `RB2-001` when only `RB` is. Returns
 /// an empty string when every prefix is allowed (the failure is then a
 /// genuinely missing item, not a prefix typo) so the caller can append it
 /// unconditionally.
@@ -4837,11 +4840,10 @@ fn unresolved_prefix_hint(
 
     let mut unknown: Vec<String> = Vec::new();
     for id in unresolved {
-        let prefix_len = id.bytes().take_while(u8::is_ascii_uppercase).count();
-        if prefix_len < 2 {
+        let prefix = id_prefix_of(id);
+        if prefix.bytes().take_while(u8::is_ascii_uppercase).count() < 2 {
             continue;
         }
-        let prefix = &id[..prefix_len];
         let allowed = per_layer
             .iter()
             .any(|(_, prefixes)| prefixes.iter().any(|p| p == prefix));
@@ -14050,6 +14052,24 @@ mod unresolved_prefix_hint_tests {
         );
         assert!(h.contains("requirement=[REQ,FR,NFR]"), "{h}");
         assert!(h.contains("[trace.id_prefixes]"), "{h}");
+    }
+
+    #[test]
+    fn digit_containing_prefix_is_reported_whole_and_accepted_once_registered() {
+        // t468: only `RB` is registered, so the unknown prefix is `RB2`, not
+        // an (allowed) `RB`.
+        let mut config = HashMap::new();
+        config.insert("requirement".to_string(), vec!["RB".to_string()]);
+        let h = hint(&["RB2-001"], &config);
+        assert!(
+            h.contains("the prefix 'RB2' is not in the allowed list"),
+            "{h}"
+        );
+        config.insert(
+            "requirement".to_string(),
+            vec!["RB".to_string(), "RB2".to_string()],
+        );
+        assert_eq!(hint(&["RB2-001"], &config), "");
     }
 
     #[test]

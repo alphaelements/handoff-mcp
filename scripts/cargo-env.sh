@@ -51,12 +51,3 @@ if [ "$_target_fs" = "fakeowner" ]; then
   export CARGO_BUILD_JOBS=1
 fi
 unset _target_dir _target_fs
-
-# Disable incremental compilation for hook-driven builds (clippy, test, fmt).
-# Incremental cache is session-scoped: only the immediately preceding session
-# with the same feature-flag combination is reused; every other session is
-# orphaned and never GC'd until `cargo clean`. With hooks running clippy twice
-# (default + bundled-typst) plus test on each push, thousands of dead sessions
-# accumulate — 178 GB was observed. Hooks are CI-like (full check, infrequent)
-# so incremental provides negligible speedup while consuming massive disk.
-export CARGO_INCREMENTAL=0

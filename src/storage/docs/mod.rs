@@ -1898,7 +1898,7 @@ mod tests {
     /// from the process-wide cache keyed by `(path, len, mtime_ns)` rather
     /// than re-parsing frontmatter and recomputing sections/content_hash —
     /// verified via the `doc_read_cache_contains` test hook rather than
-    /// timing (timing is covered by `tests/perf_budget.rs`).
+    /// timing (timing is covered by `tests/integration/perf_budget.rs`).
     #[test]
     fn read_doc_populates_process_cache_on_first_read() {
         let tmp = TempDir::new().unwrap();

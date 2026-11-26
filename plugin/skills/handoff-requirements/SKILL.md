@@ -74,7 +74,11 @@ change tracking and the full tool reference, see the `handoff-trace` skill.
   [trace.id_prefixes]
   requirement = ["SYS", "HW", "UI"]
   ```
-  These are added to the defaults, never replacing them.
+  These are added to the defaults, never replacing them. A prefix starts with
+  an ASCII uppercase letter and continues with uppercase letters or digits
+  (`SYS`, `RB2`, `NFR2`); `handoff_update_config` saves any other shape
+  (lowercase, a leading digit, `-`, non-ASCII) with a
+  `Warning [UNPARSEABLE_ID_PREFIX]`, because no heading can match it.
 
 ## 2. IDs
 
@@ -88,6 +92,9 @@ A heading is an item when its text **starts with an ID**:
 - `PREFIX` = any registered prefix (built-in or `[trace.id_prefixes]`, of
   **any** layer); segments are `-`-separated alphanumerics; the **last**
   segment is digits with at most one trailing lowercase letter.
+- The prefix is everything before the first `-`, digits included: `RB2-001`
+  needs `RB2` registered — a registered `RB` does not cover it, and the
+  heading is then reported as an ignored ID-like heading.
 - The item takes the **document's** layer regardless of its prefix: an
   `### AT-001` heading inside a requirement document silently becomes a
   requirement item. Give such an item `- layer: acceptance`, or put it in an

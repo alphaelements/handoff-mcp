@@ -168,8 +168,8 @@ stored value satisfies the requirement. Send only the fields you are changing.
   heading automatically.
 - This is safe for multi-agent/multi-step workflows — no read-modify-write
   needed, no risk of losing prior notes.
-- If both `notes` (replace) and `notes_append` are provided in the same call,
-  `notes` takes precedence and `notes_append` is ignored.
+- With both `notes` (replace) and `notes_append` in one call, `notes` takes precedence and `notes_append` is ignored.
+- Replacing the `title` or `notes` of a task that is `done` or in `review` is applied, but answers `Warning [DONE_TASK_OVERWRITE]` per field (the title line quotes the old title; bulk updates report it in `warnings[]`). Seen unexpectedly, you probably reused a task ID: restore the field and create a new task. `notes_append` never warns; `force: true` suppresses it.
 
 ### Progressive done_criteria Checking
 - **Check off `done_criteria` immediately as each item is verified** — do not

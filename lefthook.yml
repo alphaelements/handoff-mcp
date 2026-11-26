@@ -1,4 +1,10 @@
-# Lefthook — handoff-mcp pre-commit / pre-push hooks
+# Lefthook — handoff-mcp pre-commit hooks
+#
+# Pre-commit is deliberately fast (target: under 60s for a typical 1-3 file
+# change): format, clippy, and only the tests related to the staged files.
+# The full test suite, the bundled-typst clippy, the Windows cfg check and the
+# security scans run in CI on merge requests (.gitlab-ci.yml); there is no
+# pre-push hook.
 #
 # All cargo commands are routed through scripts/cargo-env.sh so the hooks work
 # across heterogeneous dev environments (local macOS, a synced Mac, Docker).
@@ -21,26 +27,28 @@ pre-commit:
       run: . scripts/cargo-env.sh && cargo clippy --all-targets -- -D warnings
       fail_text: "clippy warnings found. Fix all warnings before committing."
 
-    test:
-      glob: "**/*.rs"
-      run: . scripts/cargo-env.sh && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_QUARANTINE_PATH cargo test
-      fail_text: "Tests failed. All tests must pass before committing."
-
-    # The #[cfg(windows)] branches (src/storage/mod.rs replace_file) are invisible
-    # to the host-target clippy above, so a typo there would ship undetected.
-    # Skipped with a notice when the target isn't installed, since most
-    # contributors won't have it; add it with:
-    #   rustup target add x86_64-pc-windows-msvc
-    windows-check:
+    # Runs only the tests related to the staged .rs files: the file stems are
+    # used as libtest name filters (substring match) against the lib unit tests
+    # and the single `integration` test binary (tests/integration/<module>.rs
+    # becomes the `<module>::` test-name prefix). A filter that matches nothing
+    # runs zero tests and exits 0, so unrelated edits do not fail the hook.
+    # The full suite runs in CI.
+    related-test:
       glob: "**/*.rs"
       run: |
         . scripts/cargo-env.sh
-        if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-msvc; then
-          cargo clippy --target x86_64-pc-windows-msvc --lib --bins -- -D warnings
-        else
-          echo "NOTE: skipping Windows cfg check (target x86_64-pc-windows-msvc not installed)."
+        FILTERS=$(git diff --cached --name-only --diff-filter=d -- '*.rs' \
+          | sed 's|.*/||; s|\.rs$||' | grep -v -x -e mod -e main -e lib | sort -u)
+        if [ -z "$FILTERS" ]; then
+          echo "No related test modules for the staged .rs files, skipping."
+          exit 0
         fi
-      fail_text: "Windows target has warnings/errors. The cfg(windows) code must compile cleanly."
+        echo "Related test filters: $(echo $FILTERS | tr '\n' ' ')"
+        # Word splitting is intended: each stem is a separate libtest filter.
+        # shellcheck disable=SC2086
+        env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_QUARANTINE_PATH \
+          cargo test --lib --test integration -- $FILTERS
+      fail_text: "Related tests failed. The full suite runs in CI on merge requests."
 
     no-main-commit:
       run: |
@@ -78,58 +86,3 @@ pre-commit:
       glob: "{bin/*.js,scripts/build-npm-packages.js,package.json,.github/workflows/release.yml}"
       run: node --test "bin/*.test.js"
       fail_text: "npm distribution tests failed. The wrapper's platform table, the release build matrix, and package.json optionalDependencies must agree — a mismatch ships an install that resolves no binary."
-
-pre-push:
-  parallel: false
-  commands:
-    full-test:
-      run: . scripts/cargo-env.sh && cargo test
-      fail_text: "Tests failed."
-
-    # Unconditional (no glob): pre-commit's globbed checks can be skipped by a
-    # commit that touches no workflow file, so re-verify before the branch leaves.
-    workflow-inline-sync:
-      run: ./scripts/sync-workflow-inline.sh --check
-      fail_text: "session-execute.js is out of sync with lib/verdict-logic.js. Run './scripts/sync-workflow-inline.sh'."
-
-    workflow-js-test:
-      run: node --test "plugin-task-loop/workflows/lib/*.test.js"
-      fail_text: "Workflow verdict-logic tests failed."
-
-    npm-distribution-test:
-      run: node --test "bin/*.test.js"
-      fail_text: "npm distribution tests failed."
-
-    full-clippy:
-      run: |
-        . scripts/cargo-env.sh
-        cargo clippy --all-targets -- -D warnings
-        cargo clippy --all-targets --features bundled-typst -- -D warnings
-      fail_text: "clippy warnings found."
-
-    fmt-check:
-      run: . scripts/cargo-env.sh && cargo fmt --all -- --check
-      fail_text: "rustfmt failed."
-
-    audit:
-      run: . scripts/cargo-env.sh && cargo audit
-      fail_text: "Known vulnerabilities found in dependencies."
-
-    deny:
-      run: . scripts/cargo-env.sh && cargo deny check
-      fail_text: "License or supply-chain policy violation."
-
-    # The typst compiler crates are released in lockstep; a partial upgrade
-    # (e.g. Dependabot bumping only one of them) must not leave the branch.
-    typst-version-check:
-      run: . scripts/cargo-env.sh && ./scripts/check-typst-versions.sh
-      fail_text: "typst crate versions are not aligned (wiki/390 section 6). Bump all typst* compiler crates together."
-
-    secrets:
-      run: |
-        if command -v gitleaks >/dev/null 2>&1; then
-          gitleaks protect --staged --no-banner
-        else
-          echo "WARN: gitleaks not installed, skipping secret scan"
-        fi
-      fail_text: "Potential secrets detected. Remove before pushing."

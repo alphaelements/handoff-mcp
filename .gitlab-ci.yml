@@ -1,0 +1,117 @@
+# GitLab CI for handoff-mcp
+# Runner: shell executor on a local Mac (tag: mac-local)
+#
+# This pipeline runs on merge requests and pushes to the default branch.
+# Release builds are handled by GitHub Actions (release.yml).
+#
+# Security notes (public repo):
+#   - No host-specific paths, IPs, or hostnames in this file
+#   - Runner token and config.toml live on the runner host, never in the repo
+#   - Shell executor jobs run as the runner's OS user; the runner should be
+#     registered as a project-specific runner (not shared) with
+#     run_untagged=false so only tagged jobs execute
+
+default:
+  interruptible: true
+  tags:
+    - mac-local
+
+variables:
+  CARGO_INCREMENTAL: "1"
+  CARGO_TERM_COLOR: always
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - lint
+  - test
+  - security
+
+# --- Lint stage (parallel) ---
+
+fmt-check:
+  stage: lint
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: lint
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - cargo clippy --all-targets -- -D warnings
+
+clippy-bundled-typst:
+  stage: lint
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - cargo clippy --all-targets --features bundled-typst -- -D warnings
+
+windows-check:
+  stage: lint
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - rustup target add x86_64-pc-windows-msvc 2>/dev/null || true
+    - cargo clippy --target x86_64-pc-windows-msvc --lib --bins -- -D warnings
+  allow_failure: true
+
+# --- Test stage (parallel) ---
+
+test:
+  stage: test
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - cargo test --test integration
+  allow_failure: true
+
+workflow-js-test:
+  stage: test
+  script:
+    - node --test "plugin-task-loop/workflows/lib/*.test.js"
+  allow_failure: true
+
+npm-distribution-test:
+  stage: test
+  script:
+    - node --test "bin/*.test.js"
+  allow_failure: true
+
+typst-version-check:
+  stage: test
+  script:
+    - ./scripts/check-typst-versions.sh
+
+# --- Security stage (parallel, advisory — failures don't block merge) ---
+
+audit:
+  stage: security
+  needs: []
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - cargo audit
+  allow_failure: true
+
+deny:
+  stage: security
+  needs: []
+  before_script:
+    - . scripts/cargo-env.sh
+  script:
+    - cargo deny check
+  allow_failure: true
+
+secrets:
+  stage: security
+  needs: []
+  script:
+    - gitleaks detect --no-banner
+  allow_failure: true

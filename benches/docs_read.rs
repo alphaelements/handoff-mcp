@@ -16,11 +16,11 @@
 //! (t370.7) that returns primitive counts rather than promoting the whole
 //! `RequirementsSummary` nested type tree to `pub` just for a benchmark.
 //!
-//! Fixtures reuse the same deterministic generator as `tests/perf_budget.rs`
-//! (`tests/support/perf_fixture.rs`) so Tier 1 and Tier 2 numbers are
+//! Fixtures reuse the same deterministic generator as `tests/integration/perf_budget.rs`
+//! (`tests/integration/support/perf_fixture.rs`) so Tier 1 and Tier 2 numbers are
 //! comparable at the same declared scale.
 
-#[path = "../tests/support/perf_fixture.rs"]
+#[path = "../tests/integration/support/perf_fixture.rs"]
 mod perf_fixture;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

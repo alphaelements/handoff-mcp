@@ -1391,6 +1391,11 @@ fn handle_update_locked(
     // milestone from a re-send of the unchanged name.
     let milestone_before = data.schedule.as_ref().and_then(|s| s.milestone.clone());
 
+    // Captured before the patch is applied, while `data` still holds what
+    // the overwrite would destroy.
+    let overwrite_warnings =
+        done_task_overwrite_warnings(task_id, &current_status, &data, task_val, force);
+
     if let Some(title) = task_val.get("title").and_then(|v| v.as_str()) {
         data.title = title.to_string();
     }
@@ -1679,6 +1684,9 @@ fn handle_update_locked(
     if let Some(warning) = orphan_warning {
         msg.push_str(&format!("\n{warning}"));
     }
+    for warning in &overwrite_warnings {
+        msg.push_str(&format!("\n{warning}"));
+    }
 
     let status_changed = new_status != current_status;
     let review_transition = (status_changed
@@ -1697,6 +1705,98 @@ fn handle_update_locked(
         preloaded_doc_set,
         review_transition,
     })
+}
+
+/// Stable code of the warning for an overwrite of a finished task's
+/// `title`, `notes` or list fields, so consumers can match on it without parsing the sentence.
+pub(super) const DONE_TASK_OVERWRITE_CODE: &str = "DONE_TASK_OVERWRITE";
+
+/// One `Warning [DONE_TASK_OVERWRITE]: ...` line per field of a finished task
+/// (`done` or `review` when the call arrives) that `patch` replaces: `title`,
+/// `notes`, and the list fields `done_criteria`, `labels`, `links`,
+/// `scope_paths` and `dependencies` (each of which a patch replaces whole). A
+/// finished task is a record of the work; replacing either
+/// destroys it, most often because a task id was reused by mistake. The write
+/// is applied all the same — the caller reports the lines, it never rejects —
+/// and the title line quotes the title it replaced so it can be put back.
+///
+/// Nothing is reported when:
+///
+/// - `force` is set (the caller states the overwrite is intended),
+/// - the task is in any other status as stored — `current_status` is the
+///   status before this call, so finishing a task and retitling it in one call
+///   is silent, while reopening a finished task under a new title is not,
+/// - the value sent equals the stored one, or there are no notes / list
+///   entries to replace: nothing is lost,
+/// - the patch uses `notes_append`, which adds to the notes and is how a
+///   finished task is meant to be annotated.
+///
+/// `before` must be the task as read, before `patch` is applied. Shared with
+/// `handoff_bulk_update_tasks`.
+pub(super) fn done_task_overwrite_warnings(
+    task_id: &str,
+    current_status: &str,
+    before: &TaskData,
+    patch: &Value,
+    force: bool,
+) -> Vec<String> {
+    if force || !matches!(current_status, "done" | "review") {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    if let Some(title) = patch.get("title").and_then(|v| v.as_str()) {
+        if title != before.title {
+            warnings.push(format!(
+                "Warning [{DONE_TASK_OVERWRITE_CODE}]: Overwriting title of {current_status} \
+                 task {task_id} (was: {:?}). Use force=true to suppress this warning.",
+                before.title
+            ));
+        }
+    }
+    if let Some(notes) = patch.get("notes").and_then(|v| v.as_str()) {
+        let stored = before.notes.as_deref().unwrap_or("");
+        if !stored.is_empty() && notes != stored {
+            warnings.push(format!(
+                "Warning [{DONE_TASK_OVERWRITE_CODE}]: Overwriting notes of {current_status} \
+                 task {task_id}; the previous notes were replaced. Use notes_append to add to \
+                 the notes without replacing them, or force=true to suppress this warning."
+            ));
+        }
+    }
+
+    // The list fields are replaced whole, so any difference from a non-empty
+    // stored list loses entries (or their checked state). Compared the way the
+    // handler stores them (`extract_*`), so a malformed entry the handler
+    // would drop is not reported as a change either.
+    let mut list_overwrite = |field: &str, replaced: bool| {
+        if replaced {
+            warnings.push(format!(
+                "Warning [{DONE_TASK_OVERWRITE_CODE}]: Overwriting {field} of {current_status} \
+                 task {task_id}. Use force=true to suppress this warning."
+            ));
+        }
+    };
+    if patch.get("done_criteria").is_some() {
+        let sent = extract_done_criteria(patch);
+        let same = sent.len() == before.done_criteria.len()
+            && sent
+                .iter()
+                .zip(&before.done_criteria)
+                .all(|(a, b)| a.item == b.item && a.checked == b.checked);
+        list_overwrite("done_criteria", !before.done_criteria.is_empty() && !same);
+    }
+    for (field, stored) in [
+        ("labels", &before.labels),
+        ("links", &before.links),
+        ("scope_paths", &before.scope_paths),
+        ("dependencies", &before.dependencies),
+    ] {
+        if patch.get(field).is_some() {
+            let sent = extract_string_array(patch, field);
+            list_overwrite(field, !stored.is_empty() && &sent != stored);
+        }
+    }
+    warnings
 }
 
 /// Records a direct `schedule.actual_hours` change (`before` -> `after`) in
@@ -2017,6 +2117,165 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
 /// sentinel used by the baseline schedule fields).
 pub(super) fn non_empty(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
+}
+
+#[cfg(test)]
+mod done_task_overwrite_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn task(title: &str, notes: Option<&str>) -> TaskData {
+        TaskData {
+            id: "t467".to_string(),
+            title: title.to_string(),
+            notes: notes.map(String::from),
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        }
+    }
+
+    fn warn(status: &str, before: &TaskData, patch: Value, force: bool) -> Vec<String> {
+        done_task_overwrite_warnings("t467", status, before, &patch, force)
+    }
+
+    #[test]
+    fn a_changed_title_or_notes_of_a_finished_task_is_reported_per_field() {
+        let before = task("Ship the parser", Some("root cause: prefix grammar"));
+        for status in ["done", "review"] {
+            let w = warn(status, &before, json!({ "title": "Other" }), false);
+            assert_eq!(
+                w,
+                vec![format!(
+                    "Warning [DONE_TASK_OVERWRITE]: Overwriting title of {status} task t467 \
+                     (was: \"Ship the parser\"). Use force=true to suppress this warning."
+                )]
+            );
+            let w = warn(status, &before, json!({ "notes": "gone" }), false);
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(
+                w[0].starts_with(&format!(
+                    "Warning [DONE_TASK_OVERWRITE]: Overwriting notes of {status} task t467"
+                )),
+                "{w:?}"
+            );
+            let w = warn(
+                status,
+                &before,
+                json!({ "title": "Other", "notes": "gone" }),
+                false,
+            );
+            assert_eq!(w.len(), 2, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn the_previous_title_is_quoted_with_its_quotes_escaped() {
+        let before = task("Fix \"RB2\" 接頭辞", None);
+        let w = warn("done", &before, json!({ "title": "Other" }), false);
+        assert!(w[0].contains(r#"(was: "Fix \"RB2\" 接頭辞")"#), "{w:?}");
+    }
+
+    #[test]
+    fn force_other_statuses_and_notes_append_are_silent() {
+        let before = task("Ship the parser", Some("kept"));
+        let patch = json!({ "title": "Other", "notes": "gone" });
+        assert!(warn("done", &before, patch.clone(), true).is_empty());
+        for status in ["todo", "in_progress", "blocked", "skipped"] {
+            assert!(
+                warn(status, &before, patch.clone(), false).is_empty(),
+                "{status}"
+            );
+        }
+        assert!(warn("done", &before, json!({ "notes_append": "more" }), false).is_empty());
+        assert!(warn("done", &before, json!({ "status": "todo" }), false).is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_value_or_empty_stored_notes_lose_nothing() {
+        let before = task("Ship the parser", Some("kept"));
+        let same = json!({ "title": "Ship the parser", "notes": "kept" });
+        assert!(warn("done", &before, same, false).is_empty());
+        for empty in [None, Some("")] {
+            let before = task("Ship the parser", empty);
+            assert!(warn("done", &before, json!({ "notes": "first" }), false).is_empty());
+        }
+        // A non-string title/notes is not applied by the handler either.
+        let odd = json!({ "title": 5, "notes": null });
+        assert!(warn("done", &before, odd, false).is_empty());
+    }
+
+    fn task_with_lists() -> TaskData {
+        let mut t = task("Ship the parser", None);
+        t.labels = vec!["a".into()];
+        t.links = vec!["l".into()];
+        t.scope_paths = vec!["src/".into()];
+        t.dependencies = vec!["t1".into()];
+        t.done_criteria = vec![DoneCriterion {
+            item: "x".into(),
+            checked: true,
+        }];
+        t
+    }
+
+    #[test]
+    fn replacing_a_stored_list_field_is_reported_per_field() {
+        let before = task_with_lists();
+        let patches = [
+            ("done_criteria", json!([{ "item": "x", "checked": false }])),
+            ("labels", json!([])),
+            ("links", json!(["other"])),
+            ("scope_paths", json!(["a", "b"])),
+            ("dependencies", json!(["t2"])),
+        ];
+        for (field, value) in patches {
+            let w = warn("review", &before, json!({ field: value }), false);
+            assert_eq!(
+                w,
+                vec![format!(
+                    "Warning [DONE_TASK_OVERWRITE]: Overwriting {field} of review task t467. \
+                     Use force=true to suppress this warning."
+                )]
+            );
+            assert!(warn("done", &before, json!({ field: [] }), true).is_empty());
+            assert!(warn("todo", &before, json!({ field: [] }), false).is_empty());
+        }
+    }
+
+    #[test]
+    fn unchanged_or_previously_empty_lists_lose_nothing() {
+        let before = task_with_lists();
+        let same = json!({
+            "labels": ["a"],
+            "links": ["l"],
+            "scope_paths": ["src/"],
+            "dependencies": ["t1"],
+            "done_criteria": [{ "item": "x", "checked": true }],
+        });
+        assert!(warn("done", &before, same, false).is_empty());
+
+        let empty = task("Ship the parser", None);
+        let fill = json!({
+            "labels": ["a"],
+            "links": ["l"],
+            "scope_paths": ["src/"],
+            "dependencies": ["t1"],
+            "done_criteria": [{ "item": "x" }],
+        });
+        assert!(warn("done", &empty, fill, false).is_empty());
+    }
 }
 
 #[cfg(test)]

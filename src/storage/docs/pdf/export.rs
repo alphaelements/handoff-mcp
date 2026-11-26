@@ -629,7 +629,7 @@ fn quote_stderr(stderr: &str) -> String {
 }
 
 /// The tests drive the pipeline with a shell script standing in for `typst`,
-/// which a `bundled-typst` build never spawns; `tests/pdf_bundled_typst.rs`
+/// which a `bundled-typst` build never spawns; `tests/integration/pdf_bundled_typst.rs`
 /// covers that build against the real compiler.
 #[cfg(all(test, unix, not(feature = "bundled-typst")))]
 mod tests {

@@ -1,4 +1,4 @@
-# Performance budgets for tests/perf_budget.rs (NFR-008/NFR-009,
+# Performance budgets for tests/integration/perf_budget.rs (NFR-008/NFR-009,
 # wiki/240-performance-design.md §6-7).
 #
 # Every `ms` budget is scaled by `HANDOFF_PERF_SLACK` (env var, default 1.0;
@@ -23,7 +23,7 @@
 # every `run_ops()` result map (e.g. it depends on a fixture-provided free
 # stable_id, or it's an `io_*` pseudo-entry checked against `IoCounters`
 # directly rather than a measured latency). Any other budget whose `op` is
-# missing from the results is a hard failure in tests/perf_budget.rs, so a
+# missing from the results is a hard failure in tests/integration/perf_budget.rs, so a
 # typo/rename here or in `run_ops` cannot silently disable a gate.
 
 [[budget]]
@@ -130,7 +130,7 @@ ms = 150
 # construction* — no second file read, and
 # `reassemble::extract_section_trusted` (bounds/UTF-8-boundary checks only,
 # no tokenize-based hash recompute) is provably safe to use on it. Ranking
-# output is unchanged (`tests/tool_docs_query.rs`'s existing 22 tests still
+# output is unchanged (`tests/integration/tool_docs_query.rs`'s existing 22 tests still
 # pass verbatim). Re-measured (median of 3 full-process runs per scale,
 # HANDOFF_PERF_SLACK=1): M 30.2ms (was ~190ms), L 30.3ms (was ~188ms), JA
 # 23.6ms (was ~720ms) — all comfortably under the 150ms budget. Promoted
@@ -285,7 +285,7 @@ ms = 100
 # 25.7ms tester, borderline).
 # Needs a free stable_id the fixture may not always produce for arbitrary
 # FixtureOpts (see FixtureMeta::extra_stable_id); every scale preset in
-# tests/support/perf_fixture.rs currently does produce one, but this stays
+# tests/integration/support/perf_fixture.rs currently does produce one, but this stays
 # `optional` so a future preset without one doesn't hard-fail the suite.
 optional = true
 
@@ -302,7 +302,7 @@ op = "update_task_requirement_ids_swap"
 ms = 100
 # Needs `hot_req_ids` to be non-empty (so there is an id to drop) as well as
 # a free stable_id (`FixtureMeta::extra_stable_id`); every scale preset in
-# tests/support/perf_fixture.rs currently produces both, but this stays
+# tests/integration/support/perf_fixture.rs currently produces both, but this stays
 # `optional` so a future preset without one doesn't hard-fail the suite.
 #
 # M2-04 (wiki/260-vmodel-m2-design.md §2.3/§3.2, `TaskLink.baseline_hash`):
@@ -362,7 +362,7 @@ ms = 100
 # M3-14 (wiki/270-vmodel-m3-design.md §4.8/§10, M3-12 cleanup): the
 # `doc_verify_link_task` budget entry (and its decade of measurement notes)
 # was left behind here when M3-12 removed `doc_verify(action="link_task")`
-# entirely — `run_ops` in `tests/perf_budget.rs` dropped the matching op in
+# entirely — `run_ops` in `tests/integration/perf_budget.rs` dropped the matching op in
 # the same commit, which made every `perf_budget_scale_*` run hard-fail with
 # "budget declared ... but no matching op was measured" (a typo/rename
 # safety net this toml file's own header comment calls out; this was a real
@@ -392,7 +392,7 @@ ms = 100
 # — no `expected_fail` needed.
 #
 # Needs a real (resolvable) stable_id from FixtureMeta::hot_req_ids; every
-# scale preset in tests/support/perf_fixture.rs currently produces one, but
+# scale preset in tests/integration/support/perf_fixture.rs currently produces one, but
 # this stays `optional` so a future preset without one doesn't hard-fail.
 optional = true
 
@@ -409,7 +409,7 @@ ms = 100
 # M2-12 (wiki/260-vmodel-m2-design.md §4.7, PR-4 target ≤100ms): a
 # preview-mode handoff_trace_scaffold call against the 2,500-item trace
 # fixture's `bench-trace-req-00`/`bench-trace-at-00` — see the op's own
-# comment in tests/perf_budget.rs for exactly what this does and does not
+# comment in tests/integration/perf_budget.rs for exactly what this does and does not
 # measure (the read/scan path; `apply` mode's extra write cost is the same
 # `doc_save`(`append_body`) path already budgeted by `doc_update_section`/
 # `doc_save_layer_metadata` below).
@@ -527,7 +527,7 @@ ms = 100
 # (`SPEC-000`) of `doc_update_section_layer`'s same small, scale-independent
 # layer document — a real line-range body splice + single-document layer
 # resync + `_requirements_summary.json` refresh every rep (see
-# `tests/perf_budget.rs`'s op for the full shape). Measured p50 (release
+# `tests/integration/perf_budget.rs`'s op for the full shape). Measured p50 (release
 # build, S/M each once, this task's dev report): S 12.5ms, M 23.5ms — both
 # comfortably under the 100ms budget (well below `doc_update_section_layer`'s
 # own whole-body rewrite cost on the same fixture document), no
@@ -558,7 +558,7 @@ ms = 100
 # (~489KB against the ~361KB single-document budget of that time).
 #
 # t370.12 rework (MAJOR, integration feedback round 1): root-caused as a
-# `tests/perf_budget.rs`/`tests/support/perf_fixture.rs` budget-formula/
+# `tests/integration/perf_budget.rs`/`tests/integration/support/perf_fixture.rs` budget-formula/
 # fixture-linkage mismatch, not a production regression — `io_budget_bytes`
 # only ever budgeted for one document (`meta.doc_slug`) and one task
 # (`meta.hot_req_task`), but `propagate_dev_stage_for_task`
@@ -570,7 +570,7 @@ ms = 100
 # (`FixtureMeta::hot_colinked_tasks`), not just `hot_req_task`'s. Fixed
 # `io_budget_bytes` to sum bytes for every doc in `hot_req_doc_slugs` and
 # every task in `[hot_req_task] + hot_colinked_tasks` instead of hardcoding
-# one of each (see `tests/perf_budget.rs`'s `io_budget_bytes_tests` module
+# one of each (see `tests/integration/perf_budget.rs`'s `io_budget_bytes_tests` module
 # for the regression tests pinning this down). Re-measured JA (3 repeat
 # full-process runs): rchar 489KB against the now-correct ~496KB budget in
 # all 3 runs — within budget. `expected_fail` removed (promoted) — PR-8
@@ -598,11 +598,11 @@ optional = true
 # the single doc/task a per-item envelope is about, so it was never the
 # right thing to charge against this budget in the first place. `wchar` is
 # now measured with the derived-file rewrite excluded
-# (`tests/perf_budget.rs`'s `measure_wchar_split`, which also asserts the
+# (`tests/integration/perf_budget.rs`'s `measure_wchar_split`, which also asserts the
 # derived file is written at most once per request), and the derived
 # rewrite itself is checked separately against its own discipline — "unchanged
 # content is never rewritten, at most 1 write per request" — in
-# `tests/derived_summary_write_discipline.rs`, not a byte budget here.
+# `tests/integration/derived_summary_write_discipline.rs`, not a byte budget here.
 # Re-measured post-split at every scale: non-derived wchar tracks the (doc +
 # task) envelope like rchar does, comfortably inside budget. `expected_fail`
 # removed (promoted) — PR-8 wchar (as redefined by this task) is met at all
@@ -612,7 +612,7 @@ op = "io_wchar_update_task_status_with_links"
 ms = 0
 optional = true
 
-# PR-9 scale-ratio guards (nightly only — see tests/perf_budget.rs
+# PR-9 scale-ratio guards (nightly only — see tests/integration/perf_budget.rs
 # perf_budget_scale_ratio_n/_d).
 # M1 t360.10/t360.11 (wiki/240-performance-design.md §6 PR-7: "trace 集計・
 # スライス・lint・ギャップレポート（NFR-003: 2,500 項目 / 30 文書、JA） < 1 s").
@@ -672,7 +672,7 @@ ms = 1000
 # anything suspect (`meta.trace_slice_item_id` was never stale), so this
 # measured `load_trace_input`'s bare read cost, not a real suspect scan. The
 # fixture now seeds `perf_fixture::SUSPECT_LINK_COUNT` real, already-synced
-# suspects (`tests/perf_budget.rs`'s `run_ops`, right before this op — one
+# suspects (`tests/integration/perf_budget.rs`'s `run_ops`, right before this op — one
 # untimed `handoff_doc_save` full-body rewrite of the dedicated suspect-seed
 # requirement doc). Re-measured (release build, S/M once each, this task's
 # dev report): S p50 21.0 ms, M p50 51.4 ms — within the 1000 ms budget, no
@@ -703,7 +703,7 @@ ms = 1000
 # actually drifted, and nothing has since the one-time sync `trace_report`/
 # `trace_slice` above already paid) before `load_trace_input`; (2) this op
 # now targets one of `perf_fixture::SUSPECT_LINK_COUNT`'s real suspects per
-# call (a monotonic call counter in `tests/perf_budget.rs`, so the warm-up
+# call (a monotonic call counter in `tests/integration/perf_budget.rs`, so the warm-up
 # and all 7 timed reps each consume a distinct link — see that op's own
 # comment for why a shared/repeated target would undermeasure).
 #
@@ -711,7 +711,7 @@ ms = 1000
 # the rework round 1 fix above was itself incomplete — the fixture's
 # SPEC-99-NNN -> REQ-99-NNN links were never actually baselined at all (a
 # separate bug in how the suspect-seed docs' *first* sync raced the corpus's
-# bulk resync, see `tests/perf_budget.rs`'s `run_ops` doc comment for the
+# bulk resync, see `tests/integration/perf_budget.rs`'s `run_ops` doc comment for the
 # fix), so every prior measurement of this op — including the "52.2 ms
 # real RMW + audit write" note this replaces — silently exercised the cheap
 # `action="clear"`-finds-nothing path (no suspect ever actually matched),
@@ -719,7 +719,7 @@ ms = 1000
 # assertion that each call clears exactly 1 real link, so this can't
 # regress back to a silent no-op undetected. Re-measured (release build,
 # this task's dev report): first pass, S/M once each with another
-# developer's own `cargo test --release --test perf_budget` running
+# developer's own `cargo test --release --test integration -- perf_budget` running
 # concurrently in this shared session, gave S p50 59.8 ms / M p50
 # 93.2-95.8 ms (two M runs) — noisier and with markedly less headroom than
 # the pre-fix (inaccurate) numbers suggested, since this is now the real RMW
@@ -754,7 +754,7 @@ expected_fail = "pre-existing M2-20 risk (wiki/260 §10): RMW + audit write + re
 
 # M2-05 rework (review round 1, MAJOR, wiki/260 §6): `trace_suspect baseline`
 # is listed in the same PR-7 "< 1 s" row as `trace_report`/`trace_slice`/
-# `trace_suspect list` above, but had no `tests/perf_budget.rs` op at all
+# `trace_suspect list` above, but had no `tests/integration/perf_budget.rs` op at all
 # before this fix. `action="baseline"` (`dry_run`, the default — this probe's
 # only mode, matching `list`'s read-only-path measurement above; `dry_run=false`'s
 # extra per-link RMW is the same small, already-budgeted write shape

@@ -14,7 +14,7 @@
 //! cargo bench --bench trace_tree
 //! ```
 //!
-//! Output determinism is asserted by `tests/trace_tree_determinism.rs`.
+//! Output determinism is asserted by `tests/integration/trace_tree_determinism.rs`.
 
 #[path = "support/mcp_client.rs"]
 mod mcp_client;

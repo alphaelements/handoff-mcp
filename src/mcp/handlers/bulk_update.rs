@@ -6,8 +6,8 @@ use super::milestones::{
     frozen_assignment_warning, requested_task_milestone, unknown_milestone_warnings,
 };
 use super::update_task::{
-    done_guard_blocker_message, load_done_guard_block_check, log_direct_actual_hours_change,
-    non_empty, resolve_done_guard,
+    done_guard_blocker_message, done_task_overwrite_warnings, load_done_guard_block_check,
+    log_direct_actual_hours_change, non_empty, resolve_done_guard,
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
@@ -161,8 +161,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "errors": errors,
     });
     // Present only when a `warn`-mode guard, an actual_hours log failure, a
-    // frozen-milestone assignment or an undefined milestone name produced
-    // one, so the response shape for every other call is unchanged.
+    // frozen-milestone assignment, an undefined milestone name or a notes
+    // overwrite of a finished task produced one, so the response shape for
+    // every other call is unchanged.
     if !warnings.is_empty() {
         result["warnings"] = Value::Array(warnings);
     }
@@ -190,6 +191,11 @@ fn apply_single_update(
         validate_priority(Some(priority))?;
         data.priority = Some(priority.to_string());
     }
+
+    // Same advisory as `handoff_update_task`, taken before the notes below
+    // are replaced.
+    let overwrite_warnings =
+        done_task_overwrite_warnings(task_id, &current_status, &data, update, force);
 
     if let Some(notes) = update.get("notes").and_then(|v| v.as_str()) {
         data.notes = Some(notes.to_string());
@@ -370,6 +376,7 @@ fn apply_single_update(
         .into_iter()
         .flatten()
         .chain(unknown_milestone)
+        .chain(overwrite_warnings)
         .collect();
     Ok((!warnings.is_empty()).then(|| warnings.join("\n")))
 }

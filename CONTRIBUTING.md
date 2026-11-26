@@ -10,6 +10,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+All integration tests are modules of one test binary (`tests/integration/`);
+run a single module with `cargo test --test integration -- <module>::`. A test
+that changes process-global state (environment variables, the agent identity)
+must run through `support/isolated.rs`, because every module shares one
+process. See the README's "Build and test flow" for the hook/CI split.
+
 ### Performance gate (NFR-008 / NFR-009)
 
 If your change touches the storage layer (`src/storage/`) or the MCP
@@ -21,8 +27,8 @@ project and checks the result against the latency/I/O budgets in
 full design, and `wiki/240` §2 for what "S"/"M"/"L"/"JA" mean):
 
 ```bash
-cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_s
-cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_m
+cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_s
+cargo test --release --test integration -- --ignored --test-threads=1 --nocapture perf_budget_scale_m
 ```
 
 - `--release` is required — the budgets are calibrated against an optimized
