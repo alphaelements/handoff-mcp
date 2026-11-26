@@ -429,6 +429,11 @@ fn dash_prefixed_prompt_still_injects_memories() {
 fn run_hook_without_jq(payload: &str) -> (String, String, i32) {
     use std::io::Write;
 
+    // Build a PATH that has every tool *except* jq. When jq and sed live in
+    // the same directory (Linux /usr/bin, macOS /usr/bin) we cannot just
+    // strip that directory. Instead, create a shadow dir with symlinks to
+    // every executable in jq's directory except jq itself, then replace that
+    // directory entry in PATH.
     let jq_dir = Command::new("sh")
         .args(["-c", "command -v jq"])
         .output()
@@ -442,13 +447,36 @@ fn run_hook_without_jq(payload: &str) -> (String, String, i32) {
         });
 
     let path = std::env::var("PATH").unwrap_or_default();
-    let stripped = match jq_dir {
-        Some(d) => std::env::split_paths(&path)
-            .filter(|p| p != &d)
-            .collect::<Vec<_>>(),
-        None => std::env::split_paths(&path).collect(),
+    let new_path = match jq_dir {
+        Some(d) => {
+            let shadow = tempfile::Builder::new()
+                .prefix("no-jq-")
+                .tempdir()
+                .expect("shadow dir");
+            if let Ok(entries) = std::fs::read_dir(&d) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name == "jq" {
+                        continue;
+                    }
+                    let _ = std::os::unix::fs::symlink(entry.path(), shadow.path().join(&name));
+                }
+            }
+            let replaced: Vec<PathBuf> = std::env::split_paths(&path)
+                .map(|p| {
+                    if p == d {
+                        shadow.path().to_path_buf()
+                    } else {
+                        p
+                    }
+                })
+                .collect();
+            // Leak the shadow dir so it outlives the child process.
+            std::mem::forget(shadow);
+            std::env::join_paths(replaced).expect("join PATH")
+        }
+        None => std::ffi::OsString::from(&path),
     };
-    let new_path = std::env::join_paths(stripped).expect("join PATH");
 
     let mut child = Command::new(hook_script())
         .env("HANDOFF_MCP_BIN", binary())
