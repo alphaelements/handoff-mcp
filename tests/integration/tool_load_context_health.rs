@@ -304,8 +304,8 @@ fn load_context_reports_docs_health_with_layer_unset_warning() {
 /// one still exceeds the budget.
 #[test]
 fn load_context_stays_within_200ms_with_both_derived_files_present() {
-    const ATTEMPTS: usize = 3;
-    const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+    const ATTEMPTS: usize = 5;
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();

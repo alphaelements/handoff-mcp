@@ -92,8 +92,34 @@ pub fn resolve_project_dir(arguments: &Value) -> Result<PathBuf> {
             _ => std::env::current_dir().context("Failed to get current directory")?,
         },
     };
-    std::fs::canonicalize(&raw)
-        .with_context(|| format!("Invalid project path: {raw}", raw = raw.display()))
+    normalize_project_path(&raw)
+}
+
+/// Canonicalize a project path while preserving the caller's prefix on macOS.
+///
+/// `std::fs::canonicalize` resolves every symlink, which on macOS turns
+/// `/var/folders/…` into `/private/var/folders/…` (because `/var` →
+/// `/private/var`). That is technically correct but breaks round-trip
+/// equality: the caller passes `/var/…`, the tool writes `/private/var/…`
+/// into the session file, and a later comparison fails.
+///
+/// This function canonicalizes for correctness (absolute path, `..`
+/// resolved, existence verified) but strips the `/private` prefix that
+/// macOS adds when the *input* did not have it.
+fn normalize_project_path(raw: &std::path::Path) -> Result<PathBuf> {
+    let canon = std::fs::canonicalize(raw)
+        .with_context(|| format!("Invalid project path: {}", raw.display()))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let raw_str = raw.to_string_lossy();
+        let canon_str = canon.to_string_lossy();
+        if !raw_str.starts_with("/private/") && canon_str.starts_with("/private/") {
+            return Ok(PathBuf::from(&canon_str["/private".len()..]));
+        }
+    }
+
+    Ok(canon)
 }
 
 /// Resolves a caller-supplied file path argument (`output_file`,
