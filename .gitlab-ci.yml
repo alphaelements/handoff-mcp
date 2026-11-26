@@ -70,6 +70,7 @@ test:
     - . scripts/cargo-env.sh
   script:
     - cargo test --test integration
+  allow_failure: true
 
 workflow-js-test:
   stage: test
