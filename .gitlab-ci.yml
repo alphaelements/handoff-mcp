@@ -19,6 +19,10 @@ default:
 variables:
   CARGO_INCREMENTAL: "1"
   CARGO_TERM_COLOR: always
+  # Preserve target/ across jobs so incremental builds actually help.
+  # Shell executor runs git clean between jobs; -ffd drops untracked dirs but
+  # -e target/ keeps the build cache.
+  GIT_CLEAN_FLAGS: -ffd -e target/
 
 workflow:
   rules:
