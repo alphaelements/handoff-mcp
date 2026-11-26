@@ -297,8 +297,16 @@ fn load_context_reports_docs_health_with_layer_unset_warning() {
 /// stay within 200ms even once both derived files exist — the M4 read path
 /// must stay a lightweight `fs::read` + `from_slice`, never
 /// `aggregate_requirements`/`rebuild_trace_graph`.
+///
+/// Best of a few attempts: every integration test shares one process and one
+/// CPU pool, so a single sample can be inflated by unrelated tests running at
+/// the same time. A genuine regression slows every attempt, so the fastest
+/// one still exceeds the budget.
 #[test]
 fn load_context_stays_within_200ms_with_both_derived_files_present() {
+    const ATTEMPTS: usize = 3;
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
@@ -323,13 +331,16 @@ fn load_context_stays_within_200ms_with_both_derived_files_present() {
         }),
     );
 
-    let start = std::time::Instant::now();
-    let _ = load_context(&pd);
-    let elapsed = start.elapsed();
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..ATTEMPTS {
+        let start = std::time::Instant::now();
+        let _ = load_context(&pd);
+        best = best.min(start.elapsed());
+    }
 
     assert!(
-        elapsed.as_millis() < 200,
-        "load_context must stay within 200ms, took {elapsed:?}"
+        best < BUDGET,
+        "load_context must stay within {BUDGET:?}, best of {ATTEMPTS} was {best:?}"
     );
 }
 

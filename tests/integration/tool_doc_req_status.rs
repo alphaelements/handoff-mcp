@@ -506,8 +506,15 @@ fn req_status_filtered_response_items_are_filtered() {
 // performance: many documents
 // ---------------------------------------------------------------------
 
+/// Best of a few attempts: every integration test shares one process and one
+/// CPU pool, so a single sample can be inflated by unrelated tests running at
+/// the same time. A genuine regression slows every attempt, so the fastest
+/// one still exceeds the budget.
 #[test]
 fn req_status_responds_within_one_second_for_29_documents() {
+    const ATTEMPTS: usize = 3;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
     let (_tmp, dir) = setup_project();
     for i in 0..29 {
         make_req_doc(
@@ -521,16 +528,22 @@ fn req_status_responds_within_one_second_for_29_documents() {
         );
     }
 
-    let start = std::time::Instant::now();
-    let resp = call(&dir, "handoff_doc_req_status", json!({}));
-    let elapsed = start.elapsed();
+    let mut best = std::time::Duration::MAX;
+    let mut last_resp = None;
+    for _ in 0..ATTEMPTS {
+        let start = std::time::Instant::now();
+        let resp = call(&dir, "handoff_doc_req_status", json!({}));
+        best = best.min(start.elapsed());
+        last_resp = Some(resp);
+    }
 
+    let resp = last_resp.unwrap();
     assert!(!is_error(&resp), "{}", payload_text(&resp));
     let p = payload(&resp);
     assert_eq!(p["total"], 29);
     assert!(
-        elapsed.as_secs_f64() < 1.0,
-        "expected < 1s for 29 docs, got {elapsed:?}"
+        best < BUDGET,
+        "expected < {BUDGET:?} for 29 docs, best of {ATTEMPTS} was {best:?}"
     );
 }
 
