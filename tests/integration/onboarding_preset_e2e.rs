@@ -12,6 +12,17 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
+fn normalize_path(p: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let s = p.to_string_lossy();
+        if s.starts_with("/private/") {
+            return PathBuf::from(&s["/private".len()..]);
+        }
+    }
+    p
+}
+
 fn binary_command(project: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_handoff-mcp"));
     command
@@ -463,7 +474,7 @@ fn ac4_init_without_a_preset_writes_the_same_config_as_before() {
         format!(
             "Initialized handoff tracking for 'demo' at {}/.handoff/\n\
              Created: config.toml, sessions/, tasks/, memory/",
-            std::fs::canonicalize(dir.path()).unwrap().display()
+            normalize_path(std::fs::canonicalize(dir.path()).unwrap()).display()
         ),
         "the reply of a preset-less init is unchanged"
     );

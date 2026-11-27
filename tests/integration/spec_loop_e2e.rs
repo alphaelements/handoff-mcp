@@ -1417,6 +1417,9 @@ fn coverage_check_reports_missing_duplicate_and_unplaced() {
 
 #[test]
 fn server_rejects_bad_spec_tool_calls() {
+    if !typst_available() {
+        return;
+    }
     let mut s = Session::spawn();
     let project = init_project(&mut s);
     let pd = project.path();
