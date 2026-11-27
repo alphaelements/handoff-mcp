@@ -105,10 +105,20 @@ fn doc_req_test_sync_tool_was_removed_and_falls_into_unknown_tool_catch_all() {
         "handoff_doc_req_test_sync should no longer be listed"
     );
 
-    let call_resp = send(
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"handoff_doc_req_test_sync","arguments":{}}}"#,
-    )
-    .expect("tools/call should return a response");
+    // Supply a project_dir with .handoff/ so the router's context build
+    // succeeds and the call reaches the unknown-tool handler (without it
+    // the cwd fallback fails on CI runners that have no .handoff/).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".handoff")).unwrap();
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_doc_req_test_sync",
+            "arguments": { "project_dir": dir.path().to_string_lossy() }
+        }
+    });
+    let call_resp = send(&req.to_string()).expect("tools/call should return a response");
     assert_eq!(call_resp["result"]["isError"], true);
     let text = call_resp["result"]["content"][0]["text"]
         .as_str()

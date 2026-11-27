@@ -106,7 +106,7 @@ pub fn resolve_project_dir(arguments: &Value) -> Result<PathBuf> {
 /// This function canonicalizes for correctness (absolute path, `..`
 /// resolved, existence verified) but strips the `/private` prefix that
 /// macOS adds when the *input* did not have it.
-fn normalize_project_path(raw: &std::path::Path) -> Result<PathBuf> {
+pub(crate) fn normalize_project_path(raw: &std::path::Path) -> Result<PathBuf> {
     let canon = std::fs::canonicalize(raw)
         .with_context(|| format!("Invalid project path: {}", raw.display()))?;
 
@@ -139,7 +139,8 @@ pub fn resolve_project_path(project_dir: &std::path::Path, raw: &str) -> PathBuf
 /// Tools that work on a project with no `.handoff/` yet. For these the
 /// dispatch layers only compute where `.handoff/` would be instead of
 /// requiring it to exist.
-const TOOLS_USABLE_BEFORE_INIT: &[&str] = &["handoff_init", "handoff_load_context"];
+const TOOLS_USABLE_BEFORE_INIT: &[&str] =
+    &["handoff_init", "handoff_load_context", "handoff_dashboard"];
 
 /// Tools that find the project's `.handoff/` themselves, by reading files
 /// only. The dispatch layers must not resolve it for them: the usual

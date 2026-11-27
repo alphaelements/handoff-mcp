@@ -973,8 +973,8 @@ pub fn handle_doc_analyze(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         .unwrap_or(false);
 
     let scan_root = project_dir.join(raw_path);
-    let scan_root = std::fs::canonicalize(&scan_root)
-        .map_err(|e| anyhow::anyhow!("Invalid path '{raw_path}': {e}"))?;
+    let scan_root = super::normalize_project_path(&scan_root)
+        .map_err(|_| anyhow::anyhow!("Invalid path '{raw_path}'"))?;
     if !scan_root.starts_with(project_dir) {
         anyhow::bail!("path '{}' resolves outside the project directory", raw_path);
     }

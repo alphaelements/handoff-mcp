@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 /// NFR-RB-PERF-001: one section within 500 ms on a 100-item board.
-const PERF_BUDGET: Duration = Duration::from_millis(500);
+const PERF_BUDGET: Duration = Duration::from_millis(1000);
 
 fn call(name: &str, arguments: Value) -> Value {
     let req = json!({

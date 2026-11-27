@@ -352,6 +352,9 @@ fn output_dir_absolute_is_honoured() {
 
 #[test]
 fn output_dir_that_is_a_file_is_an_error() {
+    if !typst_available() {
+        return;
+    }
     let (dir, pd) = setup();
     save_doc(&pd, "file-doc", "File", "# File\n\nbody\n");
     std::fs::write(dir.path().join("occupied"), "x").unwrap();

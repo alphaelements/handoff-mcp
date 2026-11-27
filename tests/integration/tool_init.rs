@@ -145,13 +145,15 @@ fn init_config_has_defaults() {
 
 #[test]
 fn tools_call_unknown_tool_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".handoff")).unwrap();
     let req = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
             "name": "nonexistent_tool",
-            "arguments": {}
+            "arguments": { "project_dir": dir.path().to_string_lossy() }
         }
     });
 
